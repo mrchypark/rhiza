@@ -3615,7 +3615,7 @@ func logNodeTransportObserver(t *testing.T, observer *objmetrics.S3TransportObse
 	}
 	t.Logf("node_s3_transport_observer attempts=%d request_groups=%d error_classes=%d", total, len(requests), len(aggregates))
 	for _, request := range requests {
-		t.Logf("node_s3_transport_request_count owner=%s phase=%s method=%s count=%d", request.Owner, request.Phase, request.Method, request.Count)
+		t.Logf("node_s3_transport_request_count owner=%s phase=%s method=%s resource_class=%s conditional_presence=%s count=%d", request.Owner, request.Phase, request.Method, request.ResourceClass, request.ConditionalPresence, request.Count)
 	}
 	for _, aggregate := range aggregates {
 		t.Logf("node_s3_transport_error_count owner=%s phase=%s method=%s status_family=%s outcome=%s error_class=%s resource_class=%s conditional_presence=%s count=%d", aggregate.Owner, aggregate.Phase, aggregate.Method, aggregate.StatusFamily, aggregate.Outcome, aggregate.ErrorClass, aggregate.ResourceClass, aggregate.ConditionalPresence, aggregate.Count)

@@ -373,6 +373,54 @@ func TestS3TransportObserverClassifiesResourcePaths(t *testing.T) {
 	}
 }
 
+func TestS3TransportObserverCountsRequestsByResourceAndCondition(t *testing.T) {
+	observer, unregister, err := RegisterS3TransportObserver("http://127.0.0.1:19007", []string{"node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unregister()
+	transport := wrapTestObserver("http://127.0.0.1:19007", observerRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	}))
+	for _, item := range []struct{ path, condition string }{
+		{"/private-bucket/private-prefix/archive/head.bin", ""},
+		{"/private-bucket/private-prefix/archive/head.bin", "If-Match"},
+		{"/private-bucket/private-prefix/archive/PUBLISH_LOCK", ""},
+		{"/private-bucket/private-prefix/archive/GC_LOCK", ""},
+	} {
+		req, err := http.NewRequest(http.MethodHead, "http://127.0.0.1:19007"+item.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if item.condition != "" {
+			req.Header.Set(item.condition, "private-token")
+		}
+		if _, err := transport.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	total, requests, _, _ := observer.Snapshot()
+	if total != 4 || len(requests) != 4 {
+		t.Fatalf("total=%d requests=%+v", total, requests)
+	}
+	got := make(map[string]uint64)
+	for _, req := range requests {
+		got[req.ResourceClass+":"+req.ConditionalPresence] += req.Count
+	}
+	for _, key := range []string{"archive_head:none", "archive_head:if_match", "archive_publish_lock:none", "archive_gc_lock:none"} {
+		if got[key] != 1 {
+			t.Errorf("count %s=%d, want 1; all=%v", key, got[key], got)
+		}
+	}
+	encoded, err := json.Marshal(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "private-") {
+		t.Fatalf("private request data retained: %s", encoded)
+	}
+}
+
 func TestS3TransportObserverClassifiesConditionalPresence(t *testing.T) {
 	tests := []struct {
 		name        string
