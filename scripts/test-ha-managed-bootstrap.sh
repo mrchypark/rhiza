@@ -315,11 +315,52 @@ capture_bootstrap_logs() {
     done
   done
 }
+# Keep only diagnostic category counts, never raw API requests or object data.
+control_plane_log_summary() {
+  awk '{
+    category=""
+    if ($0 ~ /etcdserver: request timed out|context deadline exceeded/) category="timeout"
+    else if ($0 ~ /leader changed|lost leader|elected leader/) category="leader_change"
+    else if ($0 ~ /took too long|slow request|slow fdatasync/) category="slow_operation"
+    if (category != "") print category
+  }' | sort | uniq -c
+}
+capture_control_plane_failure() {
+  node="$cluster-control-plane"
+  # Do not inspect another cluster if the name was reused or ownership is uncertain.
+  [ "$(timeout 10s docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node" 2>/dev/null)" = "$cluster" ] || return 0
+  timeout 10s docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}} {{.BlockIO}}' "$node" > "$logs/control-plane-container-stats.txt" 2>&1 || :
+  timeout 10s docker exec "$node" sh -c 'uptime; df -h /var/lib/etcd; free -m' > "$logs/control-plane-resources.txt" 2>&1 || :
+  for component in etcd kube-apiserver; do
+    status="$logs/control-plane-$component-status.txt"
+    : > "$logs/control-plane-$component-summary.txt"
+    if ids=$(timeout 10s docker exec "$node" crictl ps -a --name "$component" -q 2>/dev/null); then
+      ids=$(printf '%s\n' "$ids" | head -n 3)
+      printf '%s\n' 'container_list=ok' > "$status"
+    else
+      code=$?
+      printf 'container_list=failed exit=%s\n' "$code" > "$status"
+      continue
+    fi
+    if [ -z "$ids" ]; then printf '%s\n' 'containers=none' >> "$status"; fi
+    for id in $ids; do
+      if raw=$(timeout 10s docker exec "$node" crictl logs --tail=500 "$id" 2>/dev/null); then
+        printf '%s\n' 'container_logs=ok' >> "$status"
+        printf '%s\n' "$raw" | control_plane_log_summary >> "$logs/control-plane-$component-summary.txt"
+      else
+        code=$?
+        printf 'container_logs=failed exit=%s\n' "$code" >> "$status"
+      fi
+      unset raw
+    done
+  done
+}
 cleanup() {
   result=$?
   trap - EXIT HUP INT TERM
   printf '%s\n' "$result" > "$logs/driver-original.exit"
   if [ "$owned" = 1 ]; then
+    if [ "$result" -ne 0 ]; then capture_control_plane_failure || :; fi
     if [ -n "$fault_name" ]; then
       capture_chaos_failure "$fault_name" cleanup || :
       chaos_k delete "podchaos/$fault_name" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1
