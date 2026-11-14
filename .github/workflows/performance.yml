@@ -533,6 +533,55 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  async-storage-ab:
+    needs: [cost-evidence-scope, issue185-cost-evidence, paired-go-benchmarks]
+    if: ${{ github.event_name == 'pull_request' && needs.cost-evidence-scope.outputs.required == 'true' && needs.issue185-cost-evidence.result == 'success' && needs.paired-go-benchmarks.result == 'success' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare pinned local gateway
+        run: |
+          archive="$RUNNER_TEMP/versitygw-v1.8.0-ab.tar.gz"
+          mkdir "$RUNNER_TEMP/versity-ab"
+          curl --fail --location --silent --show-error https://github.com/versity/versitygw/releases/download/v1.8.0/versitygw_v1.8.0_Darwin_arm64.tar.gz --output "$archive"
+          printf '%s  %s\n' '4953096f65a9c0d62ab184fb6b2ba7c2435229205cf00a56cb62cd4bf6b216ca' "$archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP/versity-ab"
+          test "$(uname -m)" = arm64
+          "$RUNNER_TEMP/versity-ab/versitygw_v1.8.0_Darwin_arm64/versitygw" --version | grep -F 'Version  : 1.8.0'
+      - name: Compare identical fixtures with and without batching
+        run: |
+          set -eu
+          candidate=$(git rev-parse HEAD)
+          batch=$(git rev-parse '49384b5e^{commit}')
+          baseline="$RUNNER_TEMP/rhiza-ab-baseline"
+          git merge-base --is-ancestor "$batch" "$candidate"
+          git worktree add --detach "$baseline" "$candidate"
+          cleanup() {
+            git -C "$GITHUB_WORKSPACE" worktree remove "$baseline"
+          }
+          trap cleanup EXIT
+          git -C "$baseline" revert --no-commit "$batch"
+          git -C "$baseline" -c user.name='Rhiza CI' -c user.email='rhiza-ci@users.noreply.github.com' commit -m 'CI baseline without archive batching'
+          baseline_sha=$(git -C "$baseline" rev-parse HEAD)
+          sh scripts/async-storage-ab-qualification.sh --self-test
+          sh scripts/async-storage-ab-qualification.sh "$baseline" "$baseline_sha" "$GITHUB_WORKSPACE" "$candidate" "$batch" "$RUNNER_TEMP/versity-ab/versitygw_v1.8.0_Darwin_arm64/versitygw" "$RUNNER_TEMP/async-storage-ab"
+      - name: Upload A/B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: async-storage-ab-${{ github.run_id }}
+          path: ${{ runner.temp }}/async-storage-ab
+          if-no-files-found: warn
+          retention-days: 30
+
   refresh-hiqlite-reference:
     if: ${{ inputs.refresh_hiqlite_reference }}
     runs-on: ubuntu-24.04
