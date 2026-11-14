@@ -25,6 +25,27 @@ func TestManagedResourceRequestsCanonicalQuantities(t *testing.T) {
 	}
 }
 
+func TestManagedOptionalContractFieldOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		actual   json.RawMessage
+		expected any
+		want     bool
+	}{
+		{"absent", nil, nil, true},
+		{"null", json.RawMessage(`null`), nil, true},
+		{"injected args", json.RawMessage(`["unexpected"]`), nil, false},
+		{"required absent", nil, []string{"serve"}, false},
+		{"required match", json.RawMessage(`["serve"]`), []string{"serve"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedOptionalContractFieldMatches(tc.actual, tc.expected); got != tc.want {
+				t.Fatalf("got %v", got)
+			}
+		})
+	}
+}
+
 func TestManagedCandidateCanonicalResources(t *testing.T) {
 	want := json.RawMessage(`{"template":{"metadata":{},"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"0.1","memory":"1Gi"}}}],"initContainers":[]}}}`)
 	actual := json.RawMessage(`{"template":{"metadata":{},"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"100m","memory":"1024Mi"}}}],"initContainers":[]}}}`)

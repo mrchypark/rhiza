@@ -457,8 +457,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 					return nil, fmt.Errorf("managed bootstrap must not have a liveness probe")
 				}
 				for key, raw := range map[string]json.RawMessage{"command": c.Command, "args": c.Args, "env": c.Env, "securityContext": c.SecurityContext, "readinessProbe": c.ReadinessProbe} {
-					want, _ := json.Marshal(expectedMain[key])
-					if !sameJSON(raw, want) {
+					if !managedOptionalContractFieldMatches(raw, expectedMain[key]) {
 						return nil, fmt.Errorf("invalid managed main contract")
 					}
 				}
@@ -525,6 +524,14 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		return strings.Compare(string(members[i].Member.ID), string(members[j].Member.ID)) < 0
 	})
 	return members, nil
+}
+
+func managedOptionalContractFieldMatches(actual json.RawMessage, expected any) bool {
+	if expected == nil {
+		return len(bytes.TrimSpace(actual)) == 0 || sameJSON(actual, json.RawMessage(`null`))
+	}
+	want, err := json.Marshal(expected)
+	return err == nil && sameJSON(actual, want)
 }
 
 // V1Alpha2BootstrapMember binds a public bootstrap identity to its actual Pod.
