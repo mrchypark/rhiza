@@ -508,6 +508,14 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 				}
 				return nil, err
 			}
+			// A competing catch-up may advance Tip using non-durable hints.
+			// Control validation must retain the pre-existing durability gate.
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=prefix-durability-start:node=%s:slot=%d", s.server.core.NodeID(), decision.Slot))
+			}
+			if err := s.server.core.EnsureDurableThrough(ctx, decision.Slot-1); err != nil {
+				return nil, err
+			}
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			}
@@ -515,10 +523,22 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 		}
+		accept := s.server.core.AcceptDecision
 		if decisionHasRecorder(decision, s.server.core.NodeID()) {
-			err = s.server.core.AcceptDecisionHint(decision)
-		} else {
-			err = s.server.core.AcceptDecision(decision)
+			accept = s.server.core.AcceptDecisionHint
+		}
+		err = accept(decision)
+		if errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) && !control && decision.Slot > 1 && s.server.core.Tip() < decision.Slot-1 && s.server.transport != nil {
+			// A missing certified schedule is not permission to accept the
+			// proposal. Import only independently certified history, then
+			// repeat the full original decision validation.
+			if catchupErr, _ := s.server.catchUpLearnedPrefix(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1); catchupErr != nil {
+				return nil, catchupErr
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			err = accept(decision)
 		}
 		if err != nil {
 			if localtesthooks.Enabled {

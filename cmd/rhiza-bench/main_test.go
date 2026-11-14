@@ -144,6 +144,39 @@ func TestFaultWindowIntervals(t *testing.T) {
 	}
 }
 
+func TestFaultSnapshotDiagnosticsRemainBoundedAndDoNotQualify(t *testing.T) {
+	epoch := time.Now()
+	sent := epoch.Add(time.Millisecond)
+	finished := epoch.Add(2 * time.Millisecond)
+	p := &faultProgress{epoch: epoch, active: make(map[int]*requestInterval)}
+	for i := 0; i < 40; i++ {
+		interval := &requestInterval{started: epoch}
+		interval.sent.Store(&sent)
+		p.active[i] = interval
+	}
+	p.signal = func() (time.Time, time.Time, error) {
+		for _, interval := range p.snapshot {
+			interval.finished.Store(&finished)
+		}
+		return epoch.Add(3 * time.Millisecond), epoch.Add(4 * time.Millisecond), nil
+	}
+	if err := p.inject(); err != nil {
+		t.Fatal(err)
+	}
+	w := p.window()
+	if w.SnapshotRequests != 40 || len(w.Candidates) != 32 || w.Overlap || w.Reason != "no_completed_interval_spans_signal" {
+		t.Fatalf("unexpected qualification or diagnostic bound: %+v", w)
+	}
+	for _, candidate := range w.Candidates {
+		if candidate.StartedNS == nil || *candidate.StartedNS != 0 || candidate.SentNS == nil || *candidate.SentNS != int64(time.Millisecond) || candidate.FinishedNS == nil || *candidate.FinishedNS != int64(2*time.Millisecond) {
+			t.Fatalf("unexpected diagnostic interval: %+v", candidate)
+		}
+	}
+	if w.SnapshotAtNS < 0 {
+		t.Fatal("snapshot time predates epoch")
+	}
+}
+
 func TestFaultCoordinatorSingleAttemptAndCompletedSnapshot(t *testing.T) {
 	epoch := time.Now()
 	interval := &requestInterval{}

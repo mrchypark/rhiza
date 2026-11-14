@@ -138,7 +138,7 @@ func main() {
 				var finish func(time.Time)
 				var interval *requestInterval
 				if progress != nil {
-					requestCtx, finish, interval = progress.traceRequestInterval(ctx, id)
+					requestCtx, finish, interval = progress.traceRequestInterval(ctx, id, begin)
 				}
 				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
 				var completed time.Time
@@ -328,6 +328,7 @@ type faultProgress struct {
 	signal        func() (time.Time, time.Time, error)
 	attempted     bool
 	snapshot      []*requestInterval
+	snapshotAt    time.Time
 	before, after time.Time
 	signalOK      bool
 	reason        string
@@ -340,31 +341,40 @@ type faultSample struct {
 }
 
 type requestInterval struct {
+	started  time.Time
 	sent     atomic.Pointer[time.Time]
 	finished atomic.Pointer[time.Time]
 }
 
+type faultCandidate struct {
+	StartedNS  *int64 `json:"started_ns"`
+	SentNS     *int64 `json:"sent_ns"`
+	FinishedNS *int64 `json:"finished_ns"`
+}
+
 type faultWindow struct {
-	EpochUnixNS           int64   `json:"epoch_unix_ns"`
-	Attempted             bool    `json:"attempted"`
-	SignalSucceeded       bool    `json:"signal_succeeded"`
-	Overlap               bool    `json:"overlap"`
-	Witnesses             int     `json:"witnesses"`
-	SnapshotRequests      int     `json:"snapshot_requests"`
-	SignalBeforeNS        int64   `json:"signal_before_ns"`
-	SignalAfterNS         int64   `json:"signal_after_ns"`
-	WitnessSentNS         int64   `json:"witness_sent_ns"`
-	WitnessFinishedNS     int64   `json:"witness_finished_ns"`
-	Reason                string  `json:"reason"`
-	SlowestStartNS        int64   `json:"slowest_start_ns"`
-	SlowestSentNS         *int64  `json:"slowest_sent_ns"`
-	SlowestEndNS          int64   `json:"slowest_end_ns"`
-	SlowestMeasuredEndNS  int64   `json:"slowest_measured_end_ns"`
-	SlowestOverlapsSignal bool    `json:"slowest_overlaps_signal"`
-	SlowestRetries        int     `json:"slowest_retries"`
-	SlowestSlot           uint64  `json:"slowest_slot,omitempty"`
-	PostSignalMaxMS       float64 `json:"post_signal_max_ms"`
-	PostSignalRequests    int     `json:"post_signal_requests"`
+	EpochUnixNS           int64            `json:"epoch_unix_ns"`
+	Attempted             bool             `json:"attempted"`
+	SignalSucceeded       bool             `json:"signal_succeeded"`
+	Overlap               bool             `json:"overlap"`
+	Witnesses             int              `json:"witnesses"`
+	SnapshotRequests      int              `json:"snapshot_requests"`
+	SnapshotAtNS          int64            `json:"snapshot_at_ns"`
+	Candidates            []faultCandidate `json:"candidates,omitempty"`
+	SignalBeforeNS        int64            `json:"signal_before_ns"`
+	SignalAfterNS         int64            `json:"signal_after_ns"`
+	WitnessSentNS         int64            `json:"witness_sent_ns"`
+	WitnessFinishedNS     int64            `json:"witness_finished_ns"`
+	Reason                string           `json:"reason"`
+	SlowestStartNS        int64            `json:"slowest_start_ns"`
+	SlowestSentNS         *int64           `json:"slowest_sent_ns"`
+	SlowestEndNS          int64            `json:"slowest_end_ns"`
+	SlowestMeasuredEndNS  int64            `json:"slowest_measured_end_ns"`
+	SlowestOverlapsSignal bool             `json:"slowest_overlaps_signal"`
+	SlowestRetries        int              `json:"slowest_retries"`
+	SlowestSlot           uint64           `json:"slowest_slot,omitempty"`
+	PostSignalMaxMS       float64          `json:"post_signal_max_ms"`
+	PostSignalRequests    int              `json:"post_signal_requests"`
 }
 
 func (w *faultWindow) summarizeSlowest(epoch, before, after time.Time, signalOK bool, samples []faultSample) {
@@ -399,12 +409,12 @@ func (w *faultWindow) summarizeSlowest(epoch, before, after time.Time, signalOK 
 }
 
 func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time)) {
-	ctx, finish, _ := p.traceRequestInterval(ctx, id)
+	ctx, finish, _ := p.traceRequestInterval(ctx, id, time.Now())
 	return ctx, finish
 }
 
-func (p *faultProgress) traceRequestInterval(ctx context.Context, id int) (context.Context, func(time.Time), *requestInterval) {
-	interval := &requestInterval{}
+func (p *faultProgress) traceRequestInterval(ctx context.Context, id int, started time.Time) (context.Context, func(time.Time), *requestInterval) {
+	interval := &requestInterval{started: started}
 	p.mu.Lock()
 	p.active[id] = interval
 	p.mu.Unlock()
@@ -434,6 +444,7 @@ func (p *faultProgress) inject() error {
 			p.snapshot = append(p.snapshot, interval)
 		}
 	}
+	p.snapshotAt = time.Now()
 	if len(p.snapshot) == 0 {
 		p.reason = "no_sent_request"
 		p.mu.Unlock()
@@ -464,6 +475,28 @@ func (p *faultProgress) window() faultWindow {
 	if !p.attempted {
 		result.Reason = "not_attempted"
 		return result
+	}
+	if !p.snapshotAt.IsZero() {
+		result.SnapshotAtNS = p.snapshotAt.Sub(p.epoch).Nanoseconds()
+	}
+	for i, interval := range p.snapshot {
+		if i == 32 {
+			break
+		}
+		candidate := faultCandidate{}
+		if !interval.started.IsZero() {
+			v := interval.started.Sub(p.epoch).Nanoseconds()
+			candidate.StartedNS = &v
+		}
+		if sent := interval.sent.Load(); sent != nil {
+			v := sent.Sub(p.epoch).Nanoseconds()
+			candidate.SentNS = &v
+		}
+		if finished := interval.finished.Load(); finished != nil {
+			v := finished.Sub(p.epoch).Nanoseconds()
+			candidate.FinishedNS = &v
+		}
+		result.Candidates = append(result.Candidates, candidate)
 	}
 	if !p.signalOK {
 		return result

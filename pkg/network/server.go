@@ -1267,6 +1267,22 @@ func (s *Server) catchUpLearnedPrefix(ctx context.Context, source quepaxa.NodeID
 				return nil, false
 			}
 			if err := s.core.AcceptCertifiedValues(values); err != nil {
+				if !errors.Is(err, quepaxa.ErrLeaderScheduleUnavailable) {
+					return err, true
+				}
+				// A page can cross an epoch boundary. Validate and durably
+				// install its preceding certificates first so that the next
+				// decision can be checked against its actual leader schedule.
+				for i := range values {
+					if err := ctx.Err(); err != nil {
+						return err, true
+					}
+					if err := s.core.AcceptCertifiedValues(values[i : i+1]); err != nil {
+						return err, true
+					}
+				}
+			}
+			if err := ctx.Err(); err != nil {
 				return err, true
 			}
 		}

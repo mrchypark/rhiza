@@ -456,6 +456,7 @@ func TestLearnedPrefixImportStopsAtTarget(t *testing.T) {
 			runtime.Goexit()
 		}
 	})
+	defer restore()
 	for i := 1; i <= 2; i++ {
 		id := fmt.Sprintf("bounded-prefix-%d", i)
 		item, err := types.EncodeKVBatchItem(types.KVCommand{RequestID: id, Operation: "put", Key: id, Value: []byte(id), ObservedAtUnixMS: time.Now().UnixMilli()})
@@ -512,6 +513,8 @@ func TestLearnedFetchedPageDiscardedAfterCompetingPrefix(t *testing.T) {
 			runtime.Goexit()
 		}
 	})
+	var restoreOnce sync.Once
+	defer restoreOnce.Do(restore)
 	for _, v := range values {
 		if _, err := cluster.servers["n1"].proposeOnce(ctx, v); err != nil {
 			t.Fatal(err)
@@ -525,7 +528,7 @@ func TestLearnedFetchedPageDiscardedAfterCompetingPrefix(t *testing.T) {
 		t.Fatal("learned deliveries not gated")
 	}
 	dropsOnce.Do(func() { close(releaseDrops) })
-	restore()
+	restoreOnce.Do(restore)
 	pageReady, releasePage := make(chan struct{}, 1), make(chan struct{})
 	var pageOnce sync.Once
 	defer pageOnce.Do(func() { close(releasePage) })
@@ -616,6 +619,8 @@ func testLearnedSyncGate(t *testing.T, mode string) {
 			runtime.Goexit()
 		}
 	})
+	var restoreOnce sync.Once
+	defer restoreOnce.Do(restore)
 	first := make(chan error, 1)
 	go func() { _, err := cluster.servers["n1"].proposeOnce(ctx, firstValue); first <- err }()
 	select {
@@ -632,7 +637,7 @@ func testLearnedSyncGate(t *testing.T, mode string) {
 		t.Fatal("first proposal timed out")
 	}
 	dropOnce.Do(func() { close(releaseDrop) })
-	restore()
+	restoreOnce.Do(restore)
 	if err := cluster.peerServers[2].Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +662,13 @@ func testLearnedSyncGate(t *testing.T, mode string) {
 	})
 	defer restoreSync()
 	second := make(chan error, 1)
-	go func() { _, err := cluster.servers["n1"].proposeOnce(ctx, secondValue); second <- err }()
+	proposalCtx := ctx
+	if mode == "sync-error" {
+		var cancelProposal context.CancelFunc
+		proposalCtx, cancelProposal = context.WithTimeout(ctx, 5*time.Second)
+		defer cancelProposal()
+	}
+	go func() { _, err := cluster.servers["n1"].proposeOnce(proposalCtx, secondValue); second <- err }()
 	select {
 	case <-blocked:
 	case <-ctx.Done():
@@ -703,6 +714,7 @@ func testLearnedSyncGate(t *testing.T, mode string) {
 				t.Fatal("ACK after failed WAL sync")
 			}
 		case <-ctx.Done():
+			t.Fatal("proposal did not terminate after sync error")
 		}
 		if cluster.materials["n2"].Tip() != 0 {
 			t.Fatal("applied despite failed WAL sync")
@@ -768,6 +780,8 @@ func TestLearnedCompetingRecoveryCancelsBlockedSenderFetch(t *testing.T) {
 			runtime.Goexit()
 		}
 	})
+	var restoreOnce sync.Once
+	defer restoreOnce.Do(restore)
 	first := make(chan error, 1)
 	go func() { _, err := cluster.servers["n1"].proposeOnce(ctx, firstValue); first <- err }()
 	select {
@@ -784,7 +798,7 @@ func TestLearnedCompetingRecoveryCancelsBlockedSenderFetch(t *testing.T) {
 		t.Fatal("first quorum timeout")
 	}
 	dropOnce.Do(func() { close(releaseDrop) })
-	restore()
+	restoreOnce.Do(restore)
 	unlock, err := cluster.servers["n2"].lockCatchUp(ctx, "n1")
 	if err != nil {
 		t.Fatal(err)
@@ -880,6 +894,8 @@ func TestLearnedSenderUnavailableOtherPeerRepairsPrefix(t *testing.T) {
 			runtime.Goexit()
 		}
 	})
+	var restoreOnce sync.Once
+	defer restoreOnce.Do(restore)
 	first := make(chan error, 1)
 	go func() { _, err := cluster.servers["n1"].proposeOnce(ctx, encode("alternative-first")); first <- err }()
 	select {
@@ -896,7 +912,7 @@ func TestLearnedSenderUnavailableOtherPeerRepairsPrefix(t *testing.T) {
 		t.Fatal("first quorum timeout")
 	}
 	releaseDropOnce.Do(func() { close(releaseDrop) })
-	restore()
+	restoreOnce.Do(restore)
 	started, failed, response := make(chan struct{}, 1), make(chan struct{}, 2), make(chan struct{}, 1)
 	allow := make(chan struct{})
 	var allowOnce sync.Once

@@ -283,6 +283,7 @@ jobs:
           CGO_ENABLED: 1
         run: |
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestLearned.*|TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix|TestControlLearnedRepairsScheduleAndWaitsForDurability)$' -count=1 -timeout=3m
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
@@ -302,6 +303,7 @@ jobs:
           CGO_ENABLED: 1
         run: |
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestLearned.*|TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix|TestControlLearnedRepairsScheduleAndWaitsForDurability)$' -count=1 -timeout=3m
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s

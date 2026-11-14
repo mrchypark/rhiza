@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -28,6 +29,24 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			configs, fixture := sqlClusterForProtocol(t, protocol)
+			var traceMu sync.Mutex
+			var traceSequence uint64
+			trace := func(phase string, owner int, request uint64) {
+				traceMu.Lock()
+				defer traceMu.Unlock()
+				traceSequence++
+				t.Logf("checkpoint trace event=%d phase=%s host=%d request=%d", traceSequence, phase, owner, request)
+			}
+			fixture.source.putTrace = trace
+			for i := range configs {
+				configs[i].Runtime.ObjStoreAccessKey = fmt.Sprintf("fixture-host-%d", i)
+			}
+			closeTraced := func(i int, h *Host) error {
+				trace("host-close-start", i, 0)
+				err := h.Close()
+				trace("host-close-end", i, 0)
+				return err
+			}
 			var checkpointRootPUT <-chan string
 			if protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol {
 				// Hold every SQL candidate before it can certify a checkpoint seal.
@@ -61,7 +80,7 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 				h, err := fixture.open(ctx, configs[i])
 				if h != nil {
 					t.Cleanup(func() {
-						if err := h.Close(); err != nil {
+						if err := closeTraced(i, h); err != nil {
 							t.Error(err)
 						}
 					})
@@ -235,7 +254,7 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 			}
 			before, applied := readWAL(), readApplied()
 			closeStarted = true
-			go func() { closeDone <- hosts[1].Close() }()
+			go func() { closeDone <- closeTraced(1, hosts[1]) }()
 			ticker := time.NewTicker(10 * time.Millisecond)
 			defer ticker.Stop()
 			for {

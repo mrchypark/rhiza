@@ -56,6 +56,8 @@ type sqlWireControl struct {
 	putReadErrors           chan error
 	putReadFailure          func(*http.Request, error)
 	putReadDiagnostic       func(*http.Request)
+	putTrace                func(string, int, uint64)
+	putTraceSequence        atomic.Uint64
 	ownedClose              atomic.Int64
 	// Evaluated before body reads/object-map lock. The owner must fail its
 	// test on predicate observation errors rather than silently passing them.
@@ -148,6 +150,14 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 	objects := map[string][]byte{}
 	control := &sqlWireControl{}
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var trace func(string)
+		if control.putTrace != nil && r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/checkpoint/blocks/") {
+			id := control.putTraceSequence.Add(1)
+			owner := fixtureRequestHost(r.Header.Get("Authorization"), 3)
+			trace = func(phase string) { control.putTrace(phase, owner, id) }
+			trace("request-start")
+			defer trace("handler-end")
+		}
 		if r.Method == http.MethodDelete {
 			control.deleteRequests.Add(1)
 		}
@@ -158,6 +168,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			n, err := io.ReadFull(r.Body, gatedBodyPrefix)
 			gatedBodyPrefix = gatedBodyPrefix[:n]
 			if err != nil {
+				if trace != nil {
+					trace("gate-read-error")
+				}
 				if control.putReadErrors != nil {
 					select {
 					case control.putReadErrors <- fmt.Errorf("%s: read gate: %w", r.URL.Path, err):
@@ -269,6 +282,13 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if trace != nil {
+					if errors.Is(r.Context().Err(), context.Canceled) {
+						trace("body-error-canceled")
+					} else {
+						trace("body-error")
+					}
+				}
 				if control.putReadDiagnostic != nil {
 					control.putReadDiagnostic(r)
 				}
@@ -294,6 +314,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				t.Errorf("read PUT body path=%s canceled=%t: %v", r.URL.Path, errors.Is(r.Context().Err(), context.Canceled), err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
+			}
+			if trace != nil {
+				trace("body-complete")
 			}
 			if len(gatedBodyPrefix) != 0 {
 				body = append(gatedBodyPrefix, body...)
@@ -323,6 +346,9 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				body = decoded
 			}
 			objects[key] = body
+			if trace != nil {
+				trace("object-stored")
+			}
 			if strings.HasSuffix(key, "voters/managed-sql-initialization.json") && control.dropReceiptResponse.Swap(false) {
 				conn, _, err := w.(http.Hijacker).Hijack()
 				if err == nil {

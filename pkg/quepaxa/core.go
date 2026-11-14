@@ -21,6 +21,10 @@ var ErrQuorumUnavailable = errors.New("QuePaxa quorum unavailable")
 var ErrCompacted = errors.New("QuePaxa history compacted")
 var ErrReconfigurationDrain = errors.New("reconfiguration drain is in progress")
 
+// ErrLeaderScheduleUnavailable means the certified schedule for a future
+// epoch has not yet been installed locally; it is not an invalid certificate.
+var ErrLeaderScheduleUnavailable = errors.New("QuePaxa leader schedule unavailable")
+
 // localCheckpointCrashBoundary is a package-private subprocess-test seam.
 // Production leaves it nil and it does not participate in error handling.
 var localCheckpointCrashBoundary func(string)
@@ -1234,7 +1238,7 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 			if controlSlot <= c.floor && key == c.baseFollowingEpoch && validateLeaderSchedule(cluster, c.baseFollowingOrder) {
 				return append([]NodeID(nil), c.baseFollowingOrder...), nil
 			}
-			return nil, fmt.Errorf("leader schedule unavailable for generation epoch %d", epoch)
+			return nil, fmt.Errorf("%w for generation epoch %d", ErrLeaderScheduleUnavailable, epoch)
 		}
 		order, scheduled, err := DecodeLeaderSchedule(decision.Value)
 		if err != nil || !scheduled || !validateLeaderSchedule(cluster, order) {
@@ -1255,7 +1259,7 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		if epoch == c.baseFollowingEpoch && len(c.baseFollowingOrder) != 0 {
 			return append([]NodeID(nil), c.baseFollowingOrder...), nil
 		}
-		return nil, fmt.Errorf("leader schedule unavailable for epoch %d", epoch)
+		return nil, fmt.Errorf("%w for epoch %d", ErrLeaderScheduleUnavailable, epoch)
 	}
 	order, schedule, err := DecodeLeaderSchedule(decision.Value)
 	if err != nil || !schedule || !c.validateLeaderSchedule(order) {
@@ -3461,6 +3465,14 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 
 	switch decision.Step % 4 {
 	case 0:
+		if decision.Step != 4 || decision.Proposal.Priority != highestPriority {
+			return fmt.Errorf("invalid QuePaxa fast-path decision")
+		}
+		for _, summary := range decision.Summaries {
+			if summary.FirstCurrent == nil || summary.FirstCurrent.Priority != highestPriority || !sameProposal(summary.FirstCurrent, &decision.Proposal) {
+				return fmt.Errorf("invalid QuePaxa fast-path quorum")
+			}
+		}
 		order, err := c.LeaderOrder(decision.Slot)
 		if err != nil {
 			c.mu.RLock()
@@ -3476,13 +3488,8 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 				return err
 			}
 		}
-		if decision.Step != 4 || (len(order) > 0 && decision.Proposal.ProposerID != order[0]) || decision.Proposal.Priority != highestPriority {
+		if len(order) > 0 && decision.Proposal.ProposerID != order[0] {
 			return fmt.Errorf("invalid QuePaxa fast-path decision")
-		}
-		for _, summary := range decision.Summaries {
-			if summary.FirstCurrent == nil || summary.FirstCurrent.Priority != highestPriority || !sameProposal(summary.FirstCurrent, &decision.Proposal) {
-				return fmt.Errorf("invalid QuePaxa fast-path quorum")
-			}
 		}
 	case 2:
 		if !sameProposal(maxPrior(decision.Summaries), &decision.Proposal) {
@@ -3670,9 +3677,15 @@ func (c *Core) acceptReconfigurationValues(values []DecidedValue, durable bool) 
 			}
 		}
 		slots = append(slots, decision.Slot)
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("core:certified-reconfig:after-slot:node=%s:slot=%d", c.NodeID(), decision.Slot))
+		}
 	}
 	if !durable || len(slots) == 0 {
 		return nil
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("core:certified-reconfig:before-sync:node=" + string(c.NodeID()))
 	}
 	if err := c.commits.Sync(context.Background()); err != nil {
 		return err
