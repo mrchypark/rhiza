@@ -105,7 +105,7 @@ case "$*" in *rev-parse*) printf '%040d\n' 1 ;; *grep*) exit 0 ;; *) exit 92 ;; 
 MOCK
 cat > "$scratch/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
-if [[ ${MOCK_MODE:-} == cleanup-fail || ${MOCK_MODE:-} == client-fail-cleanup-fail ]]; then
+if [[ ${MOCK_MODE:-} == cleanup-fail || ${MOCK_MODE:-} == client-fail-cleanup-fail || ${MOCK_MODE:-} == client-fail-cleanup-fail-live ]]; then
  case ${1:-} in rm) exit 44 ;; ps) printf 'owned-container\n'; exit 0 ;; esac
 fi
 exit 0
@@ -150,7 +150,7 @@ if [[ -n $control ]]; then
  fi
 fi
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
-if [[ $MOCK_MODE == client-fail || $MOCK_MODE == client-fail-cleanup-fail ]]; then exit 23; fi
+if [[ $MOCK_MODE == client-fail || $MOCK_MODE == client-fail-live || $MOCK_MODE == client-fail-cleanup-fail || $MOCK_MODE == client-fail-cleanup-fail-live ]]; then exit 23; fi
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -195,21 +195,27 @@ kill() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal ring shifted before-first after-last no-witness signal-failure signal-failure-stop-fail wait-normal wait-crash wait-error client-fail cleanup-fail client-fail-cleanup-fail copy-fail node-shutdown-fail node-timeout docker-timeout; do
+for mode in normal normal-live ring shifted before-first after-last no-witness signal-failure signal-failure-stop-fail wait-normal wait-crash wait-error client-fail client-fail-live cleanup-fail client-fail-cleanup-fail client-fail-cleanup-fail-live copy-fail node-shutdown-fail node-timeout docker-timeout; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
  diagnostic=0
+ live=0
+ [[ $mode != *-live ]] || live=1
  [[ $mode != ring ]] || diagnostic=1
- [[ $mode != shifted && $mode != client-fail && $mode != cleanup-fail && $mode != client-fail-cleanup-fail && $mode != copy-fail && $mode != node-shutdown-fail && $mode != node-timeout && $mode != docker-timeout ]] || fault=none
+ [[ $mode != shifted && $mode != client-fail && $mode != client-fail-live && $mode != cleanup-fail && $mode != client-fail-cleanup-fail && $mode != client-fail-cleanup-fail-live && $mode != copy-fail && $mode != node-shutdown-fail && $mode != node-timeout && $mode != docker-timeout ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_LIVE_PROGRESS="$live" RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == normal || $mode == ring ]]; then
+ if [[ $mode == normal || $mode == normal-live || $mode == ring ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
+  if [[ $mode == normal-live ]]; then
+   jq -e '.live_progress_requested == true' "$scratch/$mode/result.json" >/dev/null
+   grep -q -- '-live-progress-file' "$scratch/$mode/bench.args"
+  fi
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
   if [[ $mode == ring ]]; then grep -qx 'survivor_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
  else
@@ -229,7 +235,7 @@ for mode in normal ring shifted before-first after-last no-witness signal-failur
    grep -q 'benchmark client termination not verified:' "$scratch/$mode/stderr"
    while IFS= read -r pid; do kill -KILL "$pid" 2>/dev/null || true; done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
    sleep 0.2
-  elif [[ $mode == client-fail ]]; then
+  elif [[ $mode == client-fail || $mode == client-fail-live ]]; then
    [[ $status == 23 ]]
    jq -e '.requests == 4' "$scratch/$mode/result-client-result.json" >/dev/null
    grep -qx 'client_result=preserved' "$scratch/$mode/result-cleanup-status.txt"
@@ -238,7 +244,7 @@ for mode in normal ring shifted before-first after-last no-witness signal-failur
    grep -qx 'container=unverified remove_exit=44 inspect_exit=0' "$scratch/$mode/result-cleanup-status.txt"
    grep -q 'benchmark container cleanup not verified:' "$scratch/$mode/stderr"
    grep -q 'benchmark evidence retained:' "$scratch/$mode/stderr"
-  elif [[ $mode == client-fail-cleanup-fail ]]; then
+  elif [[ $mode == client-fail-cleanup-fail || $mode == client-fail-cleanup-fail-live ]]; then
    [[ $status == 23 ]]
    grep -qx 'container=unverified remove_exit=44 inspect_exit=0' "$scratch/$mode/result-cleanup-status.txt"
    jq -e '.requests == 4' "$scratch/$mode/result-client-result.json" >/dev/null
@@ -271,6 +277,7 @@ for mode in normal ring shifted before-first after-last no-witness signal-failur
  done
  if [[ $fault != none ]]; then grep -qx 'sigkill_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
+ if [[ $live == 1 ]]; then grep -Fq -- "-live-progress-file $scratch/$mode/result-live-progress.jsonl" "$scratch/$mode/bench.args"; else ! grep -q -- '-live-progress-file' "$scratch/$mode/bench.args"; fi
  if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
  if [[ $mode == ring ]]; then grep -Fq "$scratch/base-server|build -tags rhiza_latency_diag -o" "$scratch/$mode/builds"; else grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"; fi
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"

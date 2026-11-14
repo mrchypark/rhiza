@@ -325,6 +325,12 @@ object_stats() {
 object_before=$(object_stats)
 result_file="$run_dir/result.json"
 control_args=()
+progress_args=()
+live_progress_requested=false
+if [[ ${RHIZA_SERVER_BENCH_LIVE_PROGRESS:-0} == 1 ]]; then
+	progress_args=(-live-progress-file "${output_file%.json}-live-progress.jsonl")
+	live_progress_requested=true
+fi
 if [[ $failed_node != none ]]; then
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
@@ -337,7 +343,7 @@ if [[ $failed_node != none ]]; then
 fi
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
-	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${control_args[@]+${control_args[@]}}" >"$result_file" &
+	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${control_args[@]+${control_args[@]}}" "${progress_args[@]+${progress_args[@]}}" >"$result_file" &
 bench_pid=$!
 overlap='null'
 fault_exit_status=null
@@ -400,7 +406,7 @@ for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -v '^rhiza_latency ' "$log" | grep -Ei 'error|failed|timeout' | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --argjson live_progress_requested "$live_progress_requested" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
+	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,live_progress_requested:$live_progress_requested,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

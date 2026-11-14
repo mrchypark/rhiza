@@ -23,25 +23,26 @@ import (
 )
 
 type result struct {
-	Requests         int               `json:"requests"`
-	Successes        int               `json:"successes"`
-	Errors           uint64            `json:"errors"`
-	Retries          uint64            `json:"retries,omitempty"`
-	DurationMS       float64           `json:"duration_ms"`
-	OpsPerSec        float64           `json:"ops_per_sec"`
-	SuccessOpsPerSec float64           `json:"success_ops_per_sec"`
-	P50MS            float64           `json:"p50_ms"`
-	P95MS            float64           `json:"p95_ms"`
-	P99MS            float64           `json:"p99_ms"`
-	MaxMS            float64           `json:"max_ms"`
-	ErrorP50MS       float64           `json:"error_p50_ms,omitempty"`
-	ErrorP95MS       float64           `json:"error_p95_ms,omitempty"`
-	ErrorP99MS       float64           `json:"error_p99_ms,omitempty"`
-	ErrorKinds       map[string]uint64 `json:"error_kinds,omitempty"`
-	ErrorSamples     map[string]string `json:"error_samples,omitempty"`
-	ReceiptOracle    string            `json:"receipt_oracle,omitempty"`
-	FaultOverlap     bool              `json:"fault_overlap_control,omitempty"`
-	FaultWindow      *faultWindow      `json:"fault_window,omitempty"`
+	LiveProgressStatus string            `json:"live_progress_status,omitempty"`
+	Requests           int               `json:"requests"`
+	Successes          int               `json:"successes"`
+	Errors             uint64            `json:"errors"`
+	Retries            uint64            `json:"retries,omitempty"`
+	DurationMS         float64           `json:"duration_ms"`
+	OpsPerSec          float64           `json:"ops_per_sec"`
+	SuccessOpsPerSec   float64           `json:"success_ops_per_sec"`
+	P50MS              float64           `json:"p50_ms"`
+	P95MS              float64           `json:"p95_ms"`
+	P99MS              float64           `json:"p99_ms"`
+	MaxMS              float64           `json:"max_ms"`
+	ErrorP50MS         float64           `json:"error_p50_ms,omitempty"`
+	ErrorP95MS         float64           `json:"error_p95_ms,omitempty"`
+	ErrorP99MS         float64           `json:"error_p99_ms,omitempty"`
+	ErrorKinds         map[string]uint64 `json:"error_kinds,omitempty"`
+	ErrorSamples       map[string]string `json:"error_samples,omitempty"`
+	ReceiptOracle      string            `json:"receipt_oracle,omitempty"`
+	FaultOverlap       bool              `json:"fault_overlap_control,omitempty"`
+	FaultWindow        *faultWindow      `json:"fault_window,omitempty"`
 }
 
 func main() {
@@ -56,6 +57,7 @@ func main() {
 	faultControlFile := flag.String("fault-control-file", "", "optional owned file for loopback fault overlap control URL")
 	faultPID := flag.Int("fault-pid", 0, "fixed owned fault target PID, bound before requests (Linux pidfd required)")
 	faultStart := flag.String("fault-start-time", "", "Linux target start-time ticks captured by the owning parent")
+	liveProgressFile := flag.String("live-progress-file", "", "optional bounded aggregate progress output")
 	flag.Parse()
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
@@ -123,11 +125,22 @@ func main() {
 		go control.Serve(listener)
 	}
 	started := time.Now()
+	var live *liveProgress
+	if *liveProgressFile != "" {
+		live = &liveProgress{start: started}
+		live.phase.Store(progressDispatch)
+		stop := make(chan struct{})
+		defer close(stop)
+		go live.writeLiveProgress(*liveProgressFile, stop, 30*time.Second)
+	}
 	for range *concurrency {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for id := range jobs {
+				if live != nil {
+					live.started.Add(1)
+				}
 				payload := strings.ReplaceAll(*body, "{{id}}", strconv.Itoa(id))
 				method := http.MethodGet
 				if payload != "" {
@@ -141,13 +154,7 @@ func main() {
 					requestCtx, finish, interval = progress.traceRequestInterval(ctx, id, begin)
 				}
 				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
-				var completed time.Time
-				if finish != nil {
-					completed = time.Now()
-					finish(completed) // capture completion BEFORE the tracking lock
-				}
-				retries.Add(uint64(retryCount))
-				elapsed := time.Since(begin)
+				completed, elapsed := observeRequestReturn(begin, finish, &retries, retryCount, live)
 				if status < 200 || status >= 300 {
 					if text := strings.TrimSpace(string(sample)); text != "" {
 						errorSamplesMu.Lock()
@@ -158,6 +165,9 @@ func main() {
 					}
 				}
 				if requestErr != nil || status < 200 || status >= 300 {
+					if live != nil {
+						live.failed.Add(1)
+					}
 					failures.Add(1)
 					if errors.Is(requestErr, errInvalidInsertReceipt) {
 						receiptFailures.Add(1)
@@ -171,6 +181,9 @@ func main() {
 						statuses[status].Add(1)
 					}
 				} else {
+					if live != nil {
+						live.succeeded.Add(1)
+					}
 					if progress != nil {
 						faultSample := faultSample{start: begin, end: completed, measuredEnd: begin.Add(elapsed), retries: retryCount}
 						if *verifyInsert {
@@ -190,6 +203,9 @@ func main() {
 					latencies = append(latencies, elapsed)
 					latencyMu.Unlock()
 				}
+				if live != nil {
+					live.recordCompletion(time.Since(started).Nanoseconds())
+				}
 			}
 		}()
 	}
@@ -197,9 +213,15 @@ func main() {
 		jobs <- id
 	}
 	close(jobs)
+	if live != nil {
+		live.phase.Store(progressWorkerJoin)
+	}
 	workers.Wait()
 	duration := time.Since(started)
 	if control != nil {
+		if live != nil {
+			live.phase.Store(progressControlDrain)
+		}
 		// Drain an already accepted /fault response before finalizing. This is
 		// outside measured work; no request completion is held for injection.
 		shutdown, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -209,6 +231,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "fault control drain failed:", err)
 			os.Exit(1)
 		}
+	}
+	if live != nil {
+		live.phase.Store(progressSummarize)
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	sort.Slice(errorLatencies, func(i, j int) bool { return errorLatencies[i] < errorLatencies[j] })
@@ -242,6 +267,9 @@ func main() {
 		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
 		FaultOverlap: progress != nil,
 	}
+	if live != nil {
+		output.LiveProgressStatus = live.statusName()
+	}
 	if progress != nil {
 		window := progress.window()
 		window.summarizeSlowest(progress.epoch, progress.before, progress.after, progress.signalOK, faultSamples)
@@ -250,10 +278,30 @@ func main() {
 	if *verifyInsert {
 		output.ReceiptOracle = "sql-insert-id-v1"
 	}
+	if live != nil {
+		live.phase.Store(progressWriteResult)
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// Observe the original timing boundaries before optional diagnostics mutate
+// atomics; finish may wait on fault tracking, just as it did before telemetry.
+func observeRequestReturn(begin time.Time, finish func(time.Time), retries *atomic.Uint64, retryCount int, live *liveProgress) (time.Time, time.Duration) {
+	var completed time.Time
+	if finish != nil {
+		completed = time.Now()
+		finish(completed)
+	}
+	retries.Add(uint64(retryCount))
+	elapsed := time.Since(begin)
+	if live != nil {
+		live.postFaultTracking.Add(1)
+		live.retries.Add(uint64(retryCount))
+	}
+	return completed, elapsed
 }
 
 func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool) (int, []byte, int, error) {
