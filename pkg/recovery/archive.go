@@ -408,7 +408,7 @@ func (m *Manager) readStableObject(ctx context.Context, name string, known *objs
 		if sameObjectVersion(known, before.Version) {
 			return before, nil, true, nil
 		}
-		data, err := m.readObject(ctx, name, limit)
+		data, err := m.readObjectWithSizeHint(ctx, name, limit, before.Size)
 		if err != nil {
 			return objstore.ObjectAttributes{}, nil, false, err
 		}
@@ -2441,12 +2441,24 @@ func extentPrefixes(extent Extent) [][32]byte {
 }
 
 func (m *Manager) readObject(ctx context.Context, name string, limit int64) ([]byte, error) {
+	return m.readObjectWithSizeHint(ctx, name, limit, 0)
+}
+
+func (m *Manager) readObjectWithSizeHint(ctx context.Context, name string, limit, sizeHint int64) ([]byte, error) {
 	r, err := m.bucket.Get(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	var data []byte
+	if sizeHint > 0 && sizeHint <= limit && sizeHint <= 1<<20 {
+		var buf bytes.Buffer
+		buf.Grow(int(sizeHint) + 512)
+		_, err = buf.ReadFrom(io.LimitReader(r, limit+1))
+		data = buf.Bytes()
+	} else {
+		data, err = io.ReadAll(io.LimitReader(r, limit+1))
+	}
 	if err != nil {
 		return nil, err
 	}
