@@ -71,6 +71,27 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 	return err
 }
 
+// Keep diagnosis bounded: causes can contain request IDs or storage paths.
+func logKVUnknown(stage string, slot quepaxa.Slot, err error) {
+	if !errors.Is(err, ErrCommitUnknown) {
+		return
+	}
+	cause := "other"
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		cause = "deadline"
+	case errors.Is(err, context.Canceled):
+		cause = "canceled"
+	case errors.Is(err, ErrDurabilityUnavailable):
+		cause = "durability_unavailable"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		cause = "quorum_unavailable"
+	case errors.Is(err, ErrNotReady):
+		cause = "not_ready"
+	}
+	log.Printf("MANAGED_KV_UNKNOWN stage=%s slot=%d cause=%s", stage, slot, cause)
+}
+
 // Server is the HTTP server for client API.
 type Server struct {
 	expectedPolicy       sqlpolicy.MaterializationPolicy
@@ -2041,15 +2062,20 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	}
 	submitSlot, err := s.kvBatcher.submit(ctx, command, lease)
 	if err != nil {
+		logKVUnknown("batch", submitSlot, err)
 		return KVMutationResponse{}, err
 	}
 	if managedKVExecutionPolicy(s.expectedPolicy) {
 		receipt, found, matches, err := s.material.KVRequestStatusFingerprint(ctx, req.RequestID, mixedFingerprint)
 		if err != nil {
-			return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, err)
+			unknown := commitUnknown(submitSlot, req.RequestID, err)
+			logKVUnknown("receipt_lookup", submitSlot, unknown)
+			return KVMutationResponse{}, unknown
 		}
 		if !found {
-			return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, fmt.Errorf("KV mutation receipt is unavailable"))
+			unknown := commitUnknown(submitSlot, req.RequestID, fmt.Errorf("KV mutation receipt is unavailable"))
+			logKVUnknown("receipt_missing", submitSlot, unknown)
+			return KVMutationResponse{}, unknown
 		}
 		if !matches {
 			return KVMutationResponse{}, ErrRequestConflict

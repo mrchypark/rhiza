@@ -413,14 +413,20 @@ func (b *mutationBatcher[T]) releaseInflight(size int) {
 func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 	slot, err := b.propose(ctx, value)
+	stage := "propose"
 	if err == nil && b.apply != nil {
 		err = b.apply(ctx, slot)
+		stage = "apply"
 	}
 	cancel()
 	for _, item := range items {
 		itemErr := err
 		if err != nil {
 			itemErr = commitUnknown(slot, item.requestID, err)
+			var command T
+			if _, ok := any(command).(types.KVCommand); ok {
+				logKVUnknown("batch_"+stage, slot, itemErr)
+			}
 		}
 		item.finish(batchResult{slot: slot, err: itemErr})
 	}
