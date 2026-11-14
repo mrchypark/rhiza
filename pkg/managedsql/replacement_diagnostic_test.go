@@ -75,3 +75,17 @@ func TestManagedRepairCauseClassAllowlist(t *testing.T) {
 		})
 	}
 }
+
+func TestReplicaLeaveErrorStageDoesNotExposeError(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("sensitive peer: %w", context.DeadlineExceeded), "resume-leave-membership-deadline"},
+		{errors.New("private storage path"), "resume-leave-membership-other"},
+	} {
+		if got := replicaLeaveErrorStage("membership", tc.err); got != tc.want {
+			t.Fatalf("stage=%q, want %q", got, tc.want)
+		}
+	}
+}
