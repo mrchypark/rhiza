@@ -2605,13 +2605,38 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error {
+	return s.applyDecisionsWithPeerLifetime(ctx, through, nil)
+}
+
+func (s *Server) applyDecisionsWithPeerLifetime(ctx context.Context, through quepaxa.Slot, peer context.Context) error {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	if peer != nil {
+		if err := peer.Err(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 
 	if err := s.core.WaitTip(ctx, through); err != nil {
 		return err
 	}
+	// WaitTip may return immediately for an already-present prefix even when
+	// the local owner was canceled while entering that fast path.
+	if peer != nil {
+		if err := peer.Err(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	for {
+		if peer != nil && localtesthooks.Enabled {
+			localtesthooks.Hit("network:learned:before-material-tip")
+		}
 		applied := quepaxa.Slot(s.material.Tip())
 		if applied >= through {
 			return nil
@@ -2645,6 +2670,64 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 			return nil
 		}
 	}
+}
+
+// applyLearnedOwned keeps certified replay inside the peer handler while
+// transferring cancellation from the remote stream to both local lifetimes.
+func (s *Server) applyLearnedOwned(ctx context.Context, through quepaxa.Slot) error {
+	lifetime, ok := ctx.Value(peerStreamLifetimeKey{}).(peerStreamLifetime)
+	if !ok {
+		// Direct in-process handlers retain their caller-owned lifetime.
+		return s.applyDecisions(ctx, through)
+	}
+	s.handlerMu.Lock()
+	if s.handlerClosing {
+		s.handlerMu.Unlock()
+		return ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		s.handlerMu.Unlock()
+		return err
+	}
+	if err := lifetime.ctx.Err(); err != nil {
+		s.handlerMu.Unlock()
+		return err
+	}
+	if err := s.proposalCtx.Err(); err != nil {
+		s.handlerMu.Unlock()
+		return err
+	}
+	if !time.Now().Before(lifetime.deadline) {
+		s.handlerMu.Unlock()
+		return context.DeadlineExceeded
+	}
+	s.handlerWG.Add(1)
+	s.handlerMu.Unlock()
+	defer s.handlerWG.Done()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("network:learned:owned-registered:node=%s", s.core.NodeID()))
+	}
+	owned, cancel := context.WithDeadline(s.proposalCtx, lifetime.deadline)
+	defer cancel()
+	stop := context.AfterFunc(lifetime.ctx, cancel)
+	defer stop()
+	if err := lifetime.ctx.Err(); err != nil {
+		return err
+	}
+	if err := owned.Err(); err != nil {
+		return err
+	}
+	err := s.applyDecisionsWithPeerLifetime(owned, through, lifetime.ctx)
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:learned:owned-apply-returned")
+	}
+	if err != nil {
+		return err
+	}
+	if err := lifetime.ctx.Err(); err != nil {
+		return err
+	}
+	return owned.Err()
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

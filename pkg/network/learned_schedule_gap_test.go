@@ -168,10 +168,14 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 			}
 			if mode == "competing-sync-failure" {
 				entered, handlerStarted := make(chan struct{}, 1), make(chan struct{}, 1)
+				var owned atomic.Int32
 				release := make(chan struct{})
 				var once sync.Once
 				defer once.Do(func() { close(release) })
 				restore := localtesthooks.Set(func(event string) {
+					if event == "network:learned:owned-registered:node=n2" {
+						owned.Add(1)
+					}
 					if event == "core:certified-values:before-sync:node=n2" {
 						select {
 						case entered <- struct{}{}:
@@ -198,7 +202,11 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 				request.Decision = decisionToWire(decision)
 				peer := &PeerServer{server: server}
 				response := make(chan error, 1)
-				go func() { _, err := peer.handle(ctx, cluster.config.Members[0].PublicKey[:], request); response <- err }()
+				peerCtx := context.WithValue(ctx, peerStreamLifetimeKey{}, peerStreamLifetime{ctx: ctx, deadline: time.Now().Add(30 * time.Second)})
+				go func() {
+					_, err := peer.handle(peerCtx, cluster.config.Members[0].PublicKey[:], request)
+					response <- err
+				}()
 				select {
 				case <-handlerStarted:
 				case <-ctx.Done():
@@ -232,10 +240,16 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 				if mat.Tip() != 96 {
 					t.Fatalf("applied after sync failure: %d", mat.Tip())
 				}
+				if owned.Load() != 0 {
+					t.Fatal("WAL failure transferred apply ownership")
+				}
 				return
 			}
-			var fetches atomic.Int32
+			var fetches, owned atomic.Int32
 			restore := localtesthooks.Set(func(event string) {
+				if event == "network:learned:owned-registered:node=n2" {
+					owned.Add(1)
+				}
 				if event == "network:learned:prefix-page-fetched:node=n2:from=97:through=113" {
 					fetches.Add(1)
 				}
@@ -247,7 +261,8 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 			if mode == "missing-transport" {
 				server.transport = nil
 			}
-			_, err = peer.handle(ctx, cluster.config.Members[0].PublicKey[:], request)
+			peerCtx := context.WithValue(ctx, peerStreamLifetimeKey{}, peerStreamLifetime{ctx: ctx, deadline: time.Now().Add(30 * time.Second)})
+			_, err = peer.handle(peerCtx, cluster.config.Members[0].PublicKey[:], request)
 			if mode == "valid" {
 				if err != nil {
 					t.Fatalf("valid decision after prefix repair: %v", err)
@@ -259,6 +274,9 @@ func TestLearnedRepairsMissingSchedule96To114(t *testing.T) {
 					t.Fatal("no certified prefix fetch")
 				}
 			} else {
+				if owned.Load() != 0 {
+					t.Fatal("invalid or missing prefix transferred apply ownership")
+				}
 				if err == nil {
 					t.Fatal("invalid decision acknowledged")
 				}

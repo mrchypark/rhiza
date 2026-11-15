@@ -58,6 +58,21 @@ type PeerServer struct {
 	capLogged  atomic.Bool
 }
 
+type peerStreamLifetimeKey struct{}
+type peerStreamLifetime struct {
+	ctx      context.Context
+	deadline time.Time
+}
+
+// Qualification remains stream-owned while respecting the same absolute
+// deadline and both local shutdown lifetimes as the later owned apply.
+func learnedQualificationContext(stream, peer, server context.Context, deadline time.Time) (context.Context, func()) {
+	ctx, cancel := context.WithDeadline(stream, deadline)
+	stopPeer := context.AfterFunc(peer, cancel)
+	stopServer := context.AfterFunc(server, cancel)
+	return ctx, func() { stopPeer(); stopServer(); cancel() }
+}
+
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
 	return startPeerServerOnAddr(ctx, addr, server, members, peerToken, adminToken, nil)
 }
@@ -259,7 +274,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 				if latencydiag.Enabled {
 					latencydiag.Observe("peer_stream_schedule", 0, accepted)
 				}
-				s.serveStream(conn, stream, accepted)
+				s.serveStream(ctx, conn, stream, accepted)
 			}()
 		default:
 			stream.CancelRead(1)
@@ -268,9 +283,10 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
-func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream, streamStart time.Time) {
+func (s *PeerServer) serveStream(peerCtx context.Context, conn *quic.Conn, stream *quic.Stream, streamStart time.Time) {
 	defer stream.CancelRead(0)
-	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
+	deadline := time.Now().Add(30 * time.Second)
+	_ = stream.SetDeadline(deadline)
 	response := &peerfb.ResponseT{}
 	var learnedSlot quepaxa.Slot
 	var learnedSender quepaxa.NodeID
@@ -314,6 +330,7 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream, streamSta
 				learnedSender = quepaxa.NodeID(request.SenderId)
 				if localtesthooks.Enabled {
 					localtesthooks.Hit(fmt.Sprintf("network:learned:phase=received:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), learnedSender, learnedSlot))
+					observeLearnedStreamForTest(s.server.core.NodeID(), learnedSender, learnedSlot, stream.Context())
 				}
 			}
 			if request.Operation == peerfb.OperationPrepareCheckpoint {
@@ -321,6 +338,12 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream, streamSta
 			}
 			handleStart := latencydiag.Start()
 			handleCtx := stream.Context()
+			if learned {
+				var finish func()
+				handleCtx, finish = learnedQualificationContext(handleCtx, peerCtx, s.server.proposalCtx, deadline)
+				defer finish()
+				handleCtx = context.WithValue(handleCtx, peerStreamLifetimeKey{}, peerStreamLifetime{ctx: peerCtx, deadline: deadline})
+			}
 			if latencydiag.Enabled && isSync {
 				handleCtx = latencydiag.WithSync(handleCtx, syncID)
 			}
@@ -597,11 +620,30 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 				}
 			}
 		}
+		// The handoff is only safe for the exact validated, contiguous and
+		// locally durable prefix; acceptance of a recorder hint is not enough.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := s.server.core.WaitTip(ctx, decision.Slot); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !s.server.core.LocalMode() {
+			if err := s.server.core.EnsureDurableThrough(ctx, decision.Slot); err != nil {
+				return nil, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if localtesthooks.Enabled {
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 		}
-		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {
+		if err := s.server.applyLearnedOwned(ctx, decision.Slot); err != nil {
 			if localtesthooks.Enabled {
 				localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
 			}

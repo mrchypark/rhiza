@@ -286,6 +286,8 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/materializer -run '^TestUserPolicyRestoreFailureCleanup$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/materializer -run '^TestReceiptInterruptedTransactionProbe$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/materializer -run '^TestReceiptInterruptedTransactionProbe$' -count=1 -timeout=60s
+          go test -tags 'rhiza_local_testhooks rhiza_receipt_quorum_fixture' ./pkg/network -run '^TestLearned(QuorumOwnsCertifiedReceiptApplyAfterStreamCancel|OwnedApply(ServerCloseDuringReceipt|PeerCloseDuringReceipt))$' -count=1 -timeout=90s
+          go test -race -tags 'rhiza_local_testhooks rhiza_receipt_quorum_fixture' ./pkg/network -run '^TestLearned(QuorumOwnsCertifiedReceiptApplyAfterStreamCancel|OwnedApply(ServerCloseDuringReceipt|PeerCloseDuringReceipt))$' -count=1 -timeout=90s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestLearned.*|TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix|TestControlLearnedRepairsScheduleAndWaitsForDurability)$' -count=1 -timeout=3m
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
