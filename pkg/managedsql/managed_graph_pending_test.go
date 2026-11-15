@@ -194,11 +194,18 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 			backgroundOnce.Do(func() { close(background) })
 			<-release
 		}
-		if cancelAtNative.Load() && event == "materializer:graph:after-native-before-sqlite" {
-			nativeOnce.Do(func() { close(native); cancelObservation() })
-		}
 	})
 	t.Cleanup(func() { held.Store(false); releaseOnce.Do(func() { close(release) }); restore() })
+	restoreGraphContext := localtesthooks.SetGraphApplyContext(func(applyCtx context.Context) context.Context {
+		if !cancelAtNative.CompareAndSwap(true, false) {
+			return applyCtx
+		}
+		nativeOnce.Do(func() { close(native) })
+		interrupted, cancel := context.WithCancel(applyCtx)
+		cancel()
+		return interrupted
+	})
+	t.Cleanup(restoreGraphContext)
 	held.Store(true)
 	select {
 	case <-background:
@@ -233,6 +240,8 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 	}
 	// Both other replicas have applied this command. No new application command
 	// is submitted after this point, so the armed native boundary is target1.
+	// Cancel the apply context at that boundary: caller cancellation now leaves
+	// certified read replay running under the server's lifetime.
 	cancelAtNative.Store(true)
 	_, err = hosts[1].GraphQuery(observation, query)
 	cancelAtNative.Store(false)

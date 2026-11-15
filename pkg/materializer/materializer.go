@@ -1516,6 +1516,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		if graph && graphProtocol(m.managedProtocol) {
 			if localtesthooks.Enabled {
 				localtesthooks.Hit("materializer:graph:after-native-before-sqlite")
+				ctx = localtesthooks.GraphApplyContext(ctx)
 			}
 			if err := foldSQLiteGraphHistory(ctx, tx, slot, hash); err != nil {
 				return err
