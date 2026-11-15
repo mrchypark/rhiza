@@ -2026,7 +2026,7 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 			return fmt.Errorf("SQL statement has no valid leading keyword")
 		}
 		switch keyword {
-		case "PRAGMA", "ATTACH", "DETACH", "VACUUM", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE":
+		case "PRAGMA", "ATTACH", "DETACH", "VACUUM", "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
 			return fmt.Errorf("%s is not allowed on the replicated write API", keyword)
 		}
 	}

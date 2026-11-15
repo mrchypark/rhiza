@@ -3,6 +3,7 @@ package materializer
 import (
 	"database/sql"
 	"errors"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/ncruces/go-sqlite3"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 	"strings"
@@ -44,6 +45,9 @@ func sqlAuthorizer(conn *sqlite3.Conn, writer, readOnly bool) (func(bool, bool) 
 		alterTarget := ""
 		mainDrop := false
 		return conn.SetAuthorizer(func(action sqlite3.AuthorizerActionCode, object, name, database, inner string) sqlite3.AuthorizerReturnCode {
+			if writer && user && (action == sqlite3.AUTH_TRANSACTION || action == sqlite3.AUTH_SAVEPOINT) {
+				return sqlite3.AUTH_DENY
+			}
 			if (writer || readOnly) && (action == sqlite3.AUTH_ATTACH || action == sqlite3.AUTH_DETACH) {
 				return sqlite3.AUTH_DENY
 			}
@@ -117,6 +121,9 @@ func beginUserSQL(conn *sql.Conn, maintenance bool) (func() error, error) {
 		return nil, errors.Join(errSQLPolicyState, cause, err)
 	}
 	return func() error {
+		if localtesthooks.Enabled && failUserPolicyRestoreForTest() {
+			return errors.Join(errSQLPolicyState, errors.New("injected authorizer restore failure"))
+		}
 		var cause error
 		err := conn.Raw(func(any) error {
 			cause = set(false, false)
