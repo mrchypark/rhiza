@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,6 +28,55 @@ func TestLiveProgressCompletionTimestampNeverMovesBackward(t *testing.T) {
 	}
 	if got := p.completed.Load(); got != 2 {
 		t.Fatalf("completed=%d, want 2", got)
+	}
+}
+
+func TestLiveProgressSlowestBoundedAndNoRegression(t *testing.T) {
+	p := &liveProgress{start: time.Now()}
+	p.recordSlowest(slowestProgress{StartUnixNS: 10, EndUnixNS: 110, LatencyNS: 100, Retries: 1, Succeeded: true, SlotKnown: true, Slot: 7})
+	const workers = 32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p.recordSlowest(slowestProgress{StartUnixNS: 20, EndUnixNS: int64(220 + i), LatencyNS: int64(200 + i), Retries: 2})
+		}(i)
+	}
+	wg.Wait()
+	s := p.sample(0, time.Now()).Slowest
+	if s == nil || s.LatencyNS != 231 || s.Retries != 2 || s.SlotKnown || s.Slot != 0 || s.Succeeded {
+		t.Fatalf("unexpected slowest: %+v", s)
+	}
+	encoded, err := json.Marshal(p.sample(0, time.Now()))
+	if err != nil || strings.Contains(string(encoded), "SECRET_SENTINEL") {
+		t.Fatalf("diagnostic JSON: %q, %v", encoded, err)
+	}
+}
+
+func TestSlowestRequestReceiptScope(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		succeeded, verified bool
+		response            string
+		wantKnown           bool
+	}{
+		{"committed", true, true, `{"slot":7}`, true},
+		{"failed", false, true, `{"slot":7}`, false},
+		{"unverified", true, false, `{"slot":7}`, false},
+		{"missing", true, true, `{}`, false},
+		{"invalid", true, true, `SECRET_SENTINEL`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := slowestRequest(time.Unix(10, 0), time.Second, 2, tc.succeeded, tc.verified, []byte(tc.response))
+			if s.SlotKnown != tc.wantKnown || (s.SlotKnown && s.Slot != 7) || (!s.SlotKnown && s.Slot != 0) {
+				t.Fatalf("unexpected sample: %+v", s)
+			}
+			encoded, err := json.Marshal(s)
+			if err != nil || strings.Contains(string(encoded), "SECRET_SENTINEL") {
+				t.Fatalf("sample leaked response: %q %v", encoded, err)
+			}
+		})
 	}
 }
 

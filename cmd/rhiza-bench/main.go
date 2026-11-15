@@ -58,6 +58,7 @@ func main() {
 	faultPID := flag.Int("fault-pid", 0, "fixed owned fault target PID, bound before requests (Linux pidfd required)")
 	faultStart := flag.String("fault-start-time", "", "Linux target start-time ticks captured by the owning parent")
 	liveProgressFile := flag.String("live-progress-file", "", "optional bounded aggregate progress output")
+	liveSlowest := flag.Bool("live-progress-slowest", false, "include the slowest completed request in diagnostic progress")
 	flag.Parse()
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
@@ -127,7 +128,7 @@ func main() {
 	started := time.Now()
 	var live *liveProgress
 	if *liveProgressFile != "" {
-		live = &liveProgress{start: started}
+		live = &liveProgress{start: started, captureSlowest: *liveSlowest}
 		live.phase.Store(progressDispatch)
 		stop := make(chan struct{})
 		defer close(stop)
@@ -155,6 +156,9 @@ func main() {
 				}
 				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
 				completed, elapsed := observeRequestReturn(begin, finish, &retries, retryCount, live)
+				if live != nil && live.captureSlowest && (live.slowest.Load() == nil || elapsed.Nanoseconds() > live.slowest.Load().LatencyNS) {
+					live.recordSlowest(slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample))
+				}
 				if status < 200 || status >= 300 {
 					if text := strings.TrimSpace(string(sample)); text != "" {
 						errorSamplesMu.Lock()

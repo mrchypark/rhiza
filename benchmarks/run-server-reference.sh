@@ -330,6 +330,9 @@ live_progress_requested=false
 if [[ ${RHIZA_SERVER_BENCH_LIVE_PROGRESS:-0} == 1 ]]; then
 	progress_args=(-live-progress-file "${output_file%.json}-live-progress.jsonl")
 	live_progress_requested=true
+	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_LIVE_SLOWEST:-0} == 1 ]]; then
+		progress_args+=(-live-progress-slowest)
+	fi
 fi
 if [[ $failed_node != none ]]; then
 	failed_index=${failed_node#n}

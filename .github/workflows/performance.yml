@@ -297,6 +297,8 @@ jobs:
         timeout-minutes: 15
         env:
           RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS: 1
+          RHIZA_SERVER_BENCH_LIVE_PROGRESS: 1
+          RHIZA_SERVER_BENCH_LIVE_SLOWEST: 1
           RHIZA_SERVER_BENCH_REQUESTS: 100000
           RHIZA_SERVER_BENCH_CONCURRENCY: 16
         run: |
@@ -634,6 +636,8 @@ jobs:
       - name: Run bounded n0 fault diagnostics
         env:
           RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS: 1
+          RHIZA_SERVER_BENCH_LIVE_PROGRESS: 1
+          RHIZA_SERVER_BENCH_LIVE_SLOWEST: 1
           RHIZA_SERVER_BENCH_FAILED_NODE: n0
           RHIZA_SERVER_BENCH_TARGET_NODE: n1
           RHIZA_SERVER_BENCH_DURABILITY: async

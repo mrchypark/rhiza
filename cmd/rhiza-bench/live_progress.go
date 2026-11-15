@@ -23,6 +23,41 @@ type liveProgress struct {
 	retries           atomic.Uint64
 	lastCompletedNS   atomic.Int64
 	writerStatus      atomic.Uint32
+	captureSlowest    bool
+	slowest           atomic.Pointer[slowestProgress]
+}
+
+// slowestProgress is one completed logical request, not a p99 estimate.
+// A missing or failed receipt must never be interpreted as a known slot.
+type slowestProgress struct {
+	StartUnixNS int64  `json:"start_unix_ns"`
+	EndUnixNS   int64  `json:"measured_end_unix_ns"`
+	LatencyNS   int64  `json:"latency_ns"`
+	Retries     int    `json:"retries"`
+	Succeeded   bool   `json:"succeeded"`
+	SlotKnown   bool   `json:"slot_known"`
+	Slot        uint64 `json:"slot"`
+}
+
+func slowestRequest(begin time.Time, elapsed time.Duration, retries int, succeeded, verified bool, response []byte) slowestProgress {
+	s := slowestProgress{StartUnixNS: begin.UnixNano(), EndUnixNS: begin.Add(elapsed).UnixNano(), LatencyNS: elapsed.Nanoseconds(), Retries: retries, Succeeded: succeeded}
+	if succeeded && verified {
+		var receipt struct {
+			Slot uint64 `json:"slot"`
+		}
+		if json.Unmarshal(response, &receipt) == nil && receipt.Slot != 0 {
+			s.Slot, s.SlotKnown = receipt.Slot, true
+		}
+	}
+	return s
+}
+
+func (p *liveProgress) recordSlowest(sample slowestProgress) {
+	for previous := p.slowest.Load(); previous == nil || sample.LatencyNS > previous.LatencyNS; previous = p.slowest.Load() {
+		if p.slowest.CompareAndSwap(previous, &sample) {
+			return
+		}
+	}
 }
 
 const (
@@ -34,17 +69,18 @@ const (
 )
 
 type liveProgressSample struct {
-	Sequence            int    `json:"sequence"`
-	CaptureStatus       string `json:"capture_status"`
-	ElapsedMS           int64  `json:"elapsed_ms"`
-	MainPhase           uint32 `json:"main_phase"`
-	Started             uint64 `json:"started"`
-	PostFaultTracking   uint64 `json:"post_fault_tracking"`
-	Completed           uint64 `json:"completed"`
-	Succeeded           uint64 `json:"succeeded"`
-	Failed              uint64 `json:"failed"`
-	Retries             uint64 `json:"retries"`
-	LastCompletionAgeMS int64  `json:"last_completion_age_ms"`
+	Sequence            int              `json:"sequence"`
+	CaptureStatus       string           `json:"capture_status"`
+	ElapsedMS           int64            `json:"elapsed_ms"`
+	MainPhase           uint32           `json:"main_phase"`
+	Started             uint64           `json:"started"`
+	PostFaultTracking   uint64           `json:"post_fault_tracking"`
+	Completed           uint64           `json:"completed"`
+	Succeeded           uint64           `json:"succeeded"`
+	Failed              uint64           `json:"failed"`
+	Retries             uint64           `json:"retries"`
+	LastCompletionAgeMS int64            `json:"last_completion_age_ms"`
+	Slowest             *slowestProgress `json:"slowest_completed,omitempty"`
 }
 
 const liveProgressSampleLimit = 120
@@ -91,7 +127,7 @@ func (p *liveProgress) sample(seq int, now time.Time) liveProgressSample {
 	if last > 0 && elapsed >= last {
 		age = (elapsed - last) / int64(time.Millisecond)
 	}
-	return liveProgressSample{Sequence: seq, ElapsedMS: elapsed / int64(time.Millisecond), MainPhase: p.phase.Load(), Started: p.started.Load(), PostFaultTracking: p.postFaultTracking.Load(), Completed: p.completed.Load(), Succeeded: p.succeeded.Load(), Failed: p.failed.Load(), Retries: p.retries.Load(), LastCompletionAgeMS: age}
+	return liveProgressSample{Sequence: seq, ElapsedMS: elapsed / int64(time.Millisecond), MainPhase: p.phase.Load(), Started: p.started.Load(), PostFaultTracking: p.postFaultTracking.Load(), Completed: p.completed.Load(), Succeeded: p.succeeded.Load(), Failed: p.failed.Load(), Retries: p.retries.Load(), LastCompletionAgeMS: age, Slowest: p.slowest.Load()}
 }
 
 // writeLiveProgress never blocks request handlers on a diagnostic file.
