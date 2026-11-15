@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/internal/peertest"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
 
 func requireS3E2E(t *testing.T) (endpoint, bucket string) {
@@ -33,14 +36,54 @@ func e2eS3Config(t *testing.T, clusterID, nodeID, peerAddr string, members []rhi
 	}
 }
 
+func reserveE2EPeer(t *testing.T) (string, *quic.Transport) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &quic.Transport{Conn: conn}
+	t.Cleanup(func() {
+		_ = transport.Close()
+		_ = conn.Close()
+	})
+	return conn.LocalAddr().String(), transport
+}
+
+func TestS3MembershipPeerReservationLifecycle(t *testing.T) {
+	var addresses []string
+	t.Run("held", func(t *testing.T) {
+		for range 3 {
+			addr, _ := reserveE2EPeer(t)
+			addresses = append(addresses, addr)
+		}
+		for _, addr := range addresses {
+			if conn, err := net.ListenPacket("udp", addr); err == nil {
+				_ = conn.Close()
+				t.Fatalf("reserved peer address %s was available", addr)
+			}
+		}
+	})
+	for _, addr := range addresses {
+		conn, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			t.Fatalf("peer address %s not released: %v", addr, err)
+		}
+		_ = conn.Close()
+	}
+}
+
 func e2eVoters(t *testing.T, ctx context.Context, clusterID string, count int, durability ...rhiza.ObjectStoreDurability) ([]*rhiza.DB, []rhiza.Member) {
 	t.Helper()
 	names := []string{"voter-1", "voter-2", "voter-3"}
 	tokens := []string{"voter-token-1", "voter-token-2", "voter-token-3"}
 	members := make([]rhiza.Member, count)
+	transports := make([]*quic.Transport, count)
 	for i := range members {
+		addr, transport := reserveE2EPeer(t)
+		transports[i] = transport
 		members[i] = rhiza.Member{
-			ID: quepaxa.NodeID(names[i]), PeerURL: "quic://" + freeUDPAddr(t),
+			ID: quepaxa.NodeID(names[i]), PeerURL: "quic://" + addr,
 			PublicKey: rhiza.PeerPublicKey(clusterID, names[i], tokens[i]),
 		}
 	}
@@ -51,7 +94,8 @@ func e2eVoters(t *testing.T, ctx context.Context, clusterID string, count int, d
 		if len(durability) != 0 {
 			config.ObjStoreDurability = durability[0]
 		}
-		db, err := rhiza.Open(ctx, config)
+		peerCtx := peertest.WithTransport(ctx, clusterID, string(m.ID), config.PeerAddr, transports[i])
+		db, err := rhiza.Open(peerCtx, config)
 		if err != nil {
 			t.Fatalf("open voter %s: %v", m.ID, err)
 		}

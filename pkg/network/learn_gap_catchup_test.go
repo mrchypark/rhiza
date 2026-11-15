@@ -1039,15 +1039,27 @@ func TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix(t *testing.T) {
 		dropped := make(chan string, len(nodes))
 		stopped := make(chan string, len(nodes))
 		release := make(chan struct{})
+		observed := make(chan struct{})
 		var releaseOnce sync.Once
+		var observedOnce sync.Once
 		releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
 		restore := localtesthooks.Set(func(event string) {
 			if !strings.Contains(event, "network:learned:phase=received:") || !strings.Contains(event, fmt.Sprintf(":slot=%d", slot)) {
 				return
 			}
+			// The single-laggard control needs n3 to receive before n2 can ACK
+			// and cancel the outstanding quorum RPC.
+			if slot == lower && len(nodes) == 1 && nodes[0] == "n3" && strings.Contains(event, "node=n2:") {
+				select {
+				case <-observed:
+				case <-ctx.Done():
+				case <-release:
+				}
+			}
 			for _, node := range nodes {
 				if strings.Contains(event, "node="+node+":") {
 					dropped <- event
+					observedOnce.Do(func() { close(observed) })
 					<-release // Hold this real handler until the sender's outcome is known.
 					stopped <- event
 					runtime.Goexit() // Drop before Core.AcceptDecision, after explicit observation.

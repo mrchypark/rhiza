@@ -3,17 +3,20 @@
 package materializer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/applydiag"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	sqlite3 "github.com/ncruces/go-sqlite3"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
@@ -49,10 +52,32 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 		}
 		return v
 	}
-	if err := m.Apply(ctx, 1, encode("schema", "CREATE TABLE probe(id INTEGER PRIMARY KEY)")); err != nil {
+	wal, err := qlog.Open(filepath.Join(os.Getenv("RHIZA_RECEIPT_PROBE_DIR"), "wal"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(ctx, 2, encode("baseline", "INSERT INTO probe VALUES(1)")); err != nil {
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := [][]byte{encode("schema", "CREATE TABLE probe(id INTEGER PRIMARY KEY)"), encode("baseline", "INSERT INTO probe VALUES(1)"), encode("first", "INSERT INTO probe VALUES(2)"), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})}
+	for i, input := range inputs {
+		if slot, _, err := core.Propose(ctx, input); err != nil || slot != quepaxa.Slot(i+1) {
+			t.Fatalf("certify decision %d: slot=%d err=%v", i+1, slot, err)
+		}
+	}
+	if err := core.EnsureDurableThrough(ctx, 4); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := core.DecisionsFrom(3, 2)
+	if err != nil || tip != 4 || len(values) != 2 || values[0].Slot != 3 || values[1].Slot != 4 || len(values[0].Certificate) == 0 || len(values[1].Certificate) == 0 || !bytes.Equal(values[0].Value, inputs[2]) || !bytes.Equal(values[1].Value, inputs[3]) {
+		t.Fatalf("certified suffix unavailable: tip=%d count=%d err=%v", tip, len(values), err)
+	}
+	if err := m.Apply(ctx, 1, inputs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 2, inputs[1]); err != nil {
 		t.Fatal(err)
 	}
 	started, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -81,7 +106,8 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 		if err := native.SetAuthorizer(nil); err != nil {
 			return err
 		}
-		return native.CreateFunction("receipt_gate", 0, 0, func(out sqlite3.Context, _ ...sqlite3.Value) {
+		// This test-only function is deliberately permitted inside the fixture trigger.
+		return native.CreateFunction("receipt_gate", 0, sqlite3.INNOCUOUS, func(out sqlite3.Context, _ ...sqlite3.Value) {
 			startedOnce.Do(func() { close(started) })
 			<-release
 			out.ResultInt(1)
@@ -104,7 +130,6 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	var recorder applydiag.Recorder
-	values := []quepaxa.DecidedValue{{Slot: 3, Value: encode("first", "INSERT INTO probe VALUES(2)")}, {Slot: 4, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})}}
 	result := make(chan error, 1)
 	running = true
 	go func() {
@@ -118,7 +143,12 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 		running = false
 		var sqliteCode sqlite3.ErrorCode
 		known := errors.As(earlyErr, &sqliteCode)
-		t.Fatalf("apply returned before receipt gate: success=%t site=%s sqlite_code_known=%t sqlite_code=%d canceled=%t deadline=%t unknown=%t", earlyErr == nil, recorder.Site(), known, sqliteCode, errors.Is(earlyErr, context.Canceled), errors.Is(earlyErr, context.DeadlineExceeded), errors.Is(earlyErr, ErrGraphCommitUnknown))
+		detail := "unavailable"
+		var sqliteErr *sqlite3.Error
+		if errors.As(earlyErr, &sqliteErr) && strings.Contains(sqliteErr.Error(), "unsafe use of receipt_gate()") {
+			detail = "unsafe_receipt_gate"
+		}
+		t.Fatalf("apply returned before receipt gate: success=%t site=%s sqlite_code_known=%t sqlite_code=%d sqlite_fixture_detail=%q canceled=%t deadline=%t unknown=%t", earlyErr == nil, recorder.Site(), known, sqliteCode, detail, errors.Is(earlyErr, context.Canceled), errors.Is(earlyErr, context.DeadlineExceeded), errors.Is(earlyErr, ErrGraphCommitUnknown))
 	case <-ctx.Done():
 		t.Fatal("receipt trigger not reached")
 	}
@@ -155,5 +185,28 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 	}
 	if receipt, found, err := reopened.MutationReceipt(ctx, types.MutationSQL, "baseline"); err != nil || !found || receipt.Status != types.MutationCommitted {
 		t.Fatalf("baseline receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+	// Remove only the test fixture trigger before replaying the original suffix.
+	if _, err := reopened.writer.ExecContext(ctx, "DROP TRIGGER receipt_gate_trigger"); err != nil {
+		t.Fatal(err)
+	}
+	replay, replayTip, err := core.DecisionsFrom(3, 2)
+	if err != nil || replayTip != 4 || len(replay) != len(values) {
+		t.Fatalf("replay source: tip=%d count=%d err=%v", replayTip, len(replay), err)
+	}
+	for i := range values {
+		if replay[i].Slot != values[i].Slot || !bytes.Equal(replay[i].Value, values[i].Value) || !bytes.Equal(replay[i].Certificate, values[i].Certificate) {
+			t.Fatalf("certified replay changed at index %d", i)
+		}
+	}
+	if err := reopened.ApplyBatch(ctx, replay); err != nil {
+		t.Fatalf("apply certified replay: %v", err)
+	}
+	if receipt, found, err := reopened.MutationReceipt(ctx, types.MutationSQL, "first"); err != nil || !found || receipt.Status != types.MutationCommitted || receipt.Slot != 3 {
+		t.Fatalf("replayed receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+	rows, err = reopened.QueryResult(ctx, "SELECT id FROM probe ORDER BY id", nil)
+	if err != nil || len(rows.Rows) != 2 || rows.Rows[0][0] != int64(1) || rows.Rows[1][0] != int64(2) || reopened.Tip() != 4 {
+		t.Fatalf("replayed state=%+v tip=%d err=%v", rows, reopened.Tip(), err)
 	}
 }
