@@ -2602,6 +2602,7 @@ type catchUpDiagnosticError struct {
 	stage           string
 	replayPhase     string
 	applySite       applydiag.Site
+	poisonOrigin    applydiag.PoisonOrigin
 	from, remoteTip quepaxa.Slot
 	remoteTipKnown  bool
 	cause           error
@@ -2690,6 +2691,7 @@ func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catc
 		stage, from, remoteTip, known := "unknown", quepaxa.Slot(0), quepaxa.Slot(0), false
 		replayPhase := "unknown"
 		applySite := applydiag.Unknown
+		poisonOrigin := applydiag.PoisonOrigin{}
 		var failure *catchUpDiagnosticError
 		if errors.As(attempt.err, &failure) {
 			switch failure.stage {
@@ -2704,6 +2706,7 @@ func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catc
 				}
 				if replayPhase == "materialize" {
 					applySite = failure.applySite
+					poisonOrigin = failure.poisonOrigin
 				}
 			}
 		}
@@ -2728,7 +2731,7 @@ func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catc
 		if class == "sqlite" || class == "filesystem" {
 			code, extended, codeKnown, fileOp = catchUpCauseCode(attempt.err)
 		}
-		emit(fmt.Sprintf("operation sync deferred: error_class=%s error_code_known=%t error_code=%d error_extended=%d file_op=%s node_hash=%x round=%d attempt=%d count=%d source_hash=%x start_tip=%d end_tip=%d elapsed_us=%d stage=%s from=%d remote_tip_known=%t remote_tip=%d rpc_known=%t rpc_phase=%s rpc_elapsed_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d rpc_total_known=%t rpc_total_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d replay_phase=%s cause_commit_unknown=%t cause_graph_apply_pending=%t cause_sql_conn_done=%t apply_site=%s", class, codeKnown, code, extended, fileOp, sha256.Sum256([]byte(local)), round, i+1, len(attempts), sha256.Sum256([]byte(attempt.source)), attempt.startTip, attempt.endTip, attempt.elapsed.Microseconds(), stage, from, known, remoteTip, rpcKnown, rpc.Phase, rpc.Elapsed.Microseconds(), rpc.ConnectionKnown, rpc.ConnectionElapsed.Microseconds(), rpc.RequestKnown, rpc.RequestElapsed.Microseconds(), rpc.TotalKnown, rpc.TotalElapsed.Microseconds(), rpc.GateWaitKnown, rpc.GateWait.Microseconds(), rpc.MutexWaitKnown, rpc.MutexWait.Microseconds(), rpc.DialMeasured, rpc.DialElapsed.Microseconds(), rpc.DialDeadlineKnown, rpc.DialRemaining.Microseconds(), replayPhase, errors.Is(attempt.err, materializer.ErrGraphCommitUnknown), errors.Is(attempt.err, materializer.ErrGraphApplyPending), errors.Is(attempt.err, sql.ErrConnDone), applySite.String()))
+		emit(fmt.Sprintf("operation sync deferred: error_class=%s error_code_known=%t error_code=%d error_extended=%d file_op=%s node_hash=%x round=%d attempt=%d count=%d source_hash=%x start_tip=%d end_tip=%d elapsed_us=%d stage=%s from=%d remote_tip_known=%t remote_tip=%d rpc_known=%t rpc_phase=%s rpc_elapsed_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d rpc_total_known=%t rpc_total_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d replay_phase=%s cause_commit_unknown=%t cause_graph_apply_pending=%t cause_sql_conn_done=%t apply_site=%s", class, codeKnown, code, extended, fileOp, sha256.Sum256([]byte(local)), round, i+1, len(attempts), sha256.Sum256([]byte(attempt.source)), attempt.startTip, attempt.endTip, attempt.elapsed.Microseconds(), stage, from, known, remoteTip, rpcKnown, rpc.Phase, rpc.Elapsed.Microseconds(), rpc.ConnectionKnown, rpc.ConnectionElapsed.Microseconds(), rpc.RequestKnown, rpc.RequestElapsed.Microseconds(), rpc.TotalKnown, rpc.TotalElapsed.Microseconds(), rpc.GateWaitKnown, rpc.GateWait.Microseconds(), rpc.MutexWaitKnown, rpc.MutexWait.Microseconds(), rpc.DialMeasured, rpc.DialElapsed.Microseconds(), rpc.DialDeadlineKnown, rpc.DialRemaining.Microseconds(), replayPhase, errors.Is(attempt.err, materializer.ErrGraphCommitUnknown), errors.Is(attempt.err, materializer.ErrGraphApplyPending), errors.Is(attempt.err, sql.ErrConnDone), applySite.String()), fmt.Sprintf(" poison_origin_known=%t poison_trigger=%s poison_primary_site=%s poison_slot_known=%t poison_slot=%d", poisonOrigin.Known, poisonOrigin.Trigger, poisonOrigin.PrimarySite, poisonOrigin.FailedSlotKnown, poisonOrigin.FailedSlot))
 	}
 }
 
@@ -2892,7 +2895,7 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 	var remoteTipKnown bool
 	defer func() {
 		if result != nil {
-			result = &catchUpDiagnosticError{stage: stage, replayPhase: replayPhase, applySite: applyRecorder.Site(), from: from, remoteTip: remoteTip, remoteTipKnown: remoteTipKnown, cause: result}
+			result = &catchUpDiagnosticError{stage: stage, replayPhase: replayPhase, applySite: applyRecorder.Site(), poisonOrigin: applyRecorder.Origin(), from: from, remoteTip: remoteTip, remoteTipKnown: remoteTipKnown, cause: result}
 		}
 	}()
 	for {

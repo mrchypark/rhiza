@@ -86,6 +86,7 @@ type Materializer struct {
 	managedProtocol          string
 	materializationPolicy    sqlpolicy.MaterializationPolicy
 	commitUnknown            bool
+	firstSQLitePoison        applydiag.PoisonOrigin
 	sqlReceiptRetention      sqlReceiptRetentionUsage
 	afterApplyCommitError    func() error
 	recentSQLReceipts        map[string]storedReceipt
@@ -1207,7 +1208,10 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
 	diagnostic := applydiag.FromContext(ctx)
-	diagnostic.Set(applydiag.Unknown)
+	if diagnostic == nil {
+		diagnostic = &applydiag.Recorder{}
+	}
+	diagnostic.Reset()
 	for _, decision := range decisions {
 		if err := m.validateExecutionPolicy(decision.Value); err != nil {
 			diagnostic.Set(applydiag.Policy)
@@ -1217,6 +1221,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if len(decisions) == 0 {
 		return nil
 	}
+	var newPoison applydiag.PoisonOrigin
+	// Registered before the owner unlock: the sink runs only after every
+	// existing rollback, connection close and m.mu unlock defer.
+	defer func() {
+		if newPoison.Known {
+			logFirstSQLitePoison(newPoison)
+		}
+	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.writer == nil {
@@ -1225,6 +1237,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	}
 	if err := m.fatalHealthLocked(); err != nil {
 		diagnostic.Set(applydiag.Health)
+		if m.commitUnknown {
+			diagnostic.SetOrigin(m.firstSQLitePoison)
+		}
 		return err
 	}
 	if err := m.validateGraphHistoryLocked(ctx, false); err != nil {
@@ -1257,13 +1272,25 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
 	oldRetention := m.sqlReceiptRetention
 	commitAttempted := false
+	var failedSlot, tipBeforeReset uint64
+	var failedSlotKnown, tipKnown bool
+	makePoison := func(trigger applydiag.PoisonTrigger, primary, cleanup error) applydiag.PoisonOrigin {
+		primaryClass, primaryKnown, primaryCode := poisonErrorClass(primary)
+		cleanupClass, cleanupKnown, cleanupCode := poisonErrorClass(cleanup)
+		return applydiag.PoisonOrigin{Known: true, Trigger: trigger, PrimarySite: diagnostic.Site(), FailedSlotKnown: failedSlotKnown, FailedSlot: failedSlot, TipKnown: tipKnown, TipBeforeReset: tipBeforeReset, BatchFirst: uint64(decisions[0].Slot), BatchLast: uint64(decisions[len(decisions)-1].Slot), PrimaryClass: primaryClass, PrimaryCodeKnown: primaryKnown, PrimaryCode: primaryCode, CleanupClass: cleanupClass, CleanupCodeKnown: cleanupKnown, CleanupCode: cleanupCode}
+	}
 	defer func() {
 		rollbackErr := tx.Rollback()
 		if applyErr != nil {
 			m.sqlReceiptRetention = oldRetention
 			if !commitAttempted {
 				if rollbackErr != nil {
+					if !m.commitUnknown && !m.firstSQLitePoison.Known {
+						m.firstSQLitePoison = makePoison(applydiag.PoisonRollback, applyErr, rollbackErr)
+						newPoison = m.firstSQLitePoison
+					}
 					m.commitUnknown = true
+					diagnostic.SetOrigin(m.firstSQLitePoison)
 					if m.graph != nil {
 						m.graph.mu.Lock()
 						m.graph.poisonCommitOutcome()
@@ -1304,6 +1331,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		hash := sha256.Sum256(decision.Value)
 		if slot <= m.tip {
 			if slot == m.tip && hash != m.tipHash {
+				failedSlotKnown, failedSlot, tipKnown, tipBeforeReset = true, slot, true, m.tip
 				m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 				diagnostic.Set(applydiag.SlotConflict)
 				return fmt.Errorf("applied slot %d hash conflict", slot)
@@ -1311,12 +1339,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			continue
 		}
 		if slot != m.tip+1 {
+			failedSlotKnown, failedSlot, tipKnown, tipBeforeReset = true, slot, true, m.tip
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			diagnostic.Set(applydiag.SlotGap)
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
 		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
+			failedSlotKnown, failedSlot, tipKnown, tipBeforeReset = true, slot, true, m.tip
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			diagnostic.Set(applydiag.ApplyValue)
 			return err
@@ -1324,16 +1354,19 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.tipHash = slot, hash
 	}
 	if err := m.flushPendingSQLReceipts(ctx, tx, nil); err != nil {
+		tipKnown, tipBeforeReset = true, m.tip
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		diagnostic.Set(applydiag.Receipts)
 		return err
 	}
 	if err := m.persistSQLReceiptRetention(ctx, tx); err != nil {
+		tipKnown, tipBeforeReset = true, m.tip
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		diagnostic.Set(applydiag.Retention)
 		return err
 	}
 	if err := ctx.Err(); err != nil {
+		tipKnown, tipBeforeReset = true, m.tip
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		diagnostic.Set(applydiag.Context)
 		return err
@@ -1346,7 +1379,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	}
 	if commitErr != nil {
 		diagnostic.Set(applydiag.Commit)
+		tipKnown, tipBeforeReset = true, m.tip
+		if !m.commitUnknown && !m.firstSQLitePoison.Known {
+			m.firstSQLitePoison = makePoison(applydiag.PoisonCommit, commitErr, nil)
+			// No rollback is claimed for a commit-attempted failure.
+			m.firstSQLitePoison.CleanupClass = applydiag.ErrorUnknown
+			newPoison = m.firstSQLitePoison
+		}
 		m.commitUnknown = true
+		diagnostic.SetOrigin(m.firstSQLitePoison)
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		if m.graph != nil {
 			m.graph.mu.Lock()
