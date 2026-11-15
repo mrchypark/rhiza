@@ -23,6 +23,8 @@ import (
 
 type observedConditionalResponse struct {
 	next               http.RoundTripper
+	responseSeen       chan struct{}
+	responseSeenOnce   sync.Once
 	putResponses       atomic.Int64
 	put412             atomic.Int64
 	putTransportErrors atomic.Int64
@@ -99,6 +101,9 @@ func (t *observedConditionalResponse) RoundTrip(r *http.Request) (*http.Response
 			t.putResponses.Add(1)
 			if response.StatusCode == http.StatusPreconditionFailed {
 				t.put412.Add(1)
+				if t.responseSeen != nil {
+					t.responseSeenOnce.Do(func() { close(t.responseSeen) })
+				}
 			}
 		}
 		if err != nil {
@@ -109,13 +114,16 @@ func (t *observedConditionalResponse) RoundTrip(r *http.Request) (*http.Response
 }
 
 func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
-	for _, mode := range []string{"early-412", "early-412-close", "truncated-412", "partial-body-reset", "committed-response-lost", "committed-loss-then-412"} {
+	for _, mode := range []string{"early-412", "early-412-close", "continued-then-412", "truncated-412", "partial-body-reset", "committed-response-lost", "committed-loss-then-412"} {
 		t.Run(mode, func(t *testing.T) {
 			old := bytes.Repeat([]byte("old-value-"), 200)
 			attempted := bytes.Repeat([]byte{0x5a}, 7<<20)
 			objects := map[string][]byte{"existing": bytes.Clone(old)}
 			var mu sync.Mutex
 			var putCount, bodyRead atomic.Int64
+			var attemptedBodyMatches atomic.Bool
+			responseSeen := make(chan struct{})
+			truncatedServerDone := make(chan error, 1)
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				key := strings.TrimPrefix(r.URL.Path, "/rhiza-test-bucket/")
 				if r.Method == http.MethodGet {
@@ -138,11 +146,40 @@ func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
 					return
 				}
 				attempt := putCount.Add(1)
+				if mode == "continued-then-412" {
+					// Reading an Expect request emits a real 100 Continue. Consume
+					// the body fully before the final 412 so this is not a reset
+					// or partial-response test.
+					body, err := io.ReadAll(r.Body)
+					bodyRead.Store(int64(len(body)))
+					attemptedBodyMatches.Store(bytes.Equal(body, attempted))
+					if err != nil {
+						return
+					}
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusPreconditionFailed)
+					_, _ = io.WriteString(w, `<Error><Code>PreconditionFailed</Code><Message>condition failed</Message></Error>`)
+					return
+				}
 				if mode == "truncated-412" {
 					conn, _, hijackErr := w.(http.Hijacker).Hijack()
-					if hijackErr == nil {
-						_, _ = io.WriteString(conn, "HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/xml\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n<Error>")
-						_ = conn.Close()
+					if hijackErr != nil {
+						truncatedServerDone <- hijackErr
+						return
+					}
+					defer conn.Close()
+					if _, err := io.WriteString(conn, "HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/xml\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n<Error>"); err != nil {
+						truncatedServerDone <- err
+						return
+					}
+					// The server must not close the TLS connection before the actual
+					// client transport has accepted the 412 headers. Otherwise an
+					// OS-dependent TCP reset can erase the response under test.
+					select {
+					case <-responseSeen:
+						truncatedServerDone <- nil
+					case <-time.After(5 * time.Second):
+						truncatedServerDone <- errors.New("client did not receive truncated response headers")
 					}
 					return
 				}
@@ -186,10 +223,14 @@ func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
 			transport.Proxy = nil
 			defer transport.CloseIdleConnections()
 			var next http.RoundTripper = transport
-			if strings.HasPrefix(mode, "early-412") || mode == "truncated-412" || mode == "committed-loss-then-412" {
-				next = conditionalExpectContinueRoundTripper{next: transport}
+			trace := newConditionalPutHTTPTrace()
+			if strings.HasPrefix(mode, "early-412") || mode == "continued-then-412" || mode == "truncated-412" || mode == "committed-loss-then-412" {
+				next = conditionalExpectContinueRoundTripper{next: transport, trace: trace}
 			}
 			observed := &observedConditionalResponse{next: next}
+			if mode == "truncated-412" {
+				observed.responseSeen = responseSeen
+			}
 			metrics := &bucketMetrics{}
 			maxRetries := 1
 			if mode == "committed-loss-then-412" {
@@ -212,7 +253,18 @@ func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			err = bucket.Upload(ctx, key, bytes.NewReader(attempted), thanosobjstore.WithIfNotExists())
+			if mode == "truncated-412" {
+				select {
+				case serverErr := <-truncatedServerDone:
+					if serverErr != nil {
+						t.Fatalf("truncated 412 server: %v", serverErr)
+					}
+				case <-ctx.Done():
+					t.Fatalf("truncated 412 server did not finish: %v", ctx.Err())
+				}
+			}
 			condition := bucket.IsConditionNotMetErr(err)
+			traceSnapshot := trace.closeAndSnapshot()
 			if mode != "committed-loss-then-412" && putCount.Load() != 1 {
 				t.Fatalf("PUT attempts=%d", putCount.Load())
 			}
@@ -223,6 +275,10 @@ func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
 			} else if strings.HasPrefix(mode, "early-412") {
 				if err == nil || !condition || observed.putResponses.Load() != 1 || observed.put412.Load() != 1 || observed.putTransportErrors.Load() != 0 || bodyRead.Load() != 0 {
 					t.Fatalf("early 412 condition=%v response=%d status412=%d transport=%d body=%d err=%v", condition, observed.putResponses.Load(), observed.put412.Load(), observed.putTransportErrors.Load(), bodyRead.Load(), err)
+				}
+			} else if mode == "continued-then-412" {
+				if err == nil || !condition || observed.putResponses.Load() != 1 || observed.put412.Load() != 1 || observed.putTransportErrors.Load() != 0 || bodyRead.Load() != int64(len(attempted)) || !attemptedBodyMatches.Load() || !hasConditionalPutHTTPTraceEvent(traceSnapshot, 1, "got_100_continue", http.StatusContinue) {
+					t.Fatalf("100 then 412 condition=%v response=%d status412=%d transport=%d body=%d body_matches=%v trace=%+v err=%v", condition, observed.putResponses.Load(), observed.put412.Load(), observed.putTransportErrors.Load(), bodyRead.Load(), attemptedBodyMatches.Load(), traceSnapshot, err)
 				}
 			} else if mode == "truncated-412" {
 				if err == nil || condition || observed.putResponses.Load() != 1 || observed.put412.Load() != 1 || observed.putTransportErrors.Load() != 0 {
@@ -256,7 +312,7 @@ func TestS3ConditionalPutOutcomeAmbiguityActualSDK(t *testing.T) {
 					t.Fatalf("SDK readback %s len=%d want=%d read=%v close=%v", name, len(got), len(expected), readErr, closeErr)
 				}
 			}
-			if strings.HasPrefix(mode, "early-412") {
+			if strings.HasPrefix(mode, "early-412") || mode == "continued-then-412" {
 				if err := bucket.DrainMutations(ctx); err != nil {
 					t.Fatalf("observed rejection drain=%v", err)
 				}

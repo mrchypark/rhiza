@@ -16,6 +16,112 @@ import (
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 )
 
+func TestQuiescedInternalFixtureSettlesHostTwoBeforeAnyClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	checked := make(chan error, 1)
+	passed := t.Run("cleanup", func(t *testing.T) {
+		var outage, enabled atomic.Bool
+		var attempts atomic.Int64
+		ready := make(chan string, 1)
+		owner := make(chan int, 1)
+		release := make(chan struct{})
+		permit := make(chan struct{})
+		started := make(chan struct{}, 1)
+		var releaseOnce, permitOnce sync.Once
+		gate := newInternalPublisherGate()
+		_, hosts, _ := openInternalRequestHostsQuiesced(t, &outage, &attempts, gate, func(i int, workerCtx context.Context) {
+			if i != 2 {
+				return
+			}
+			started <- struct{}{}
+			select {
+			case <-permit:
+			case <-workerCtx.Done():
+			}
+		}, func(c *sqlWireControl) {
+			c.putEnabled, c.putReady, c.putRelease = &enabled, ready, release
+			c.putReadyOwner = owner
+			c.putReadGateBytes = 1
+			c.putPrefix, c.putSuffix = "/checkpoint/blocks/", ".block"
+		})
+		t.Cleanup(func() {
+			if t.Failed() {
+				permitOnce.Do(func() { close(permit) })
+				releaseOnce.Do(func() { close(release) })
+			}
+		})
+		for i := 0; i < 2; i++ {
+			awaitPublicInternalReady(t, ctx, hosts[i])
+			select {
+			case err := <-gate.settled[i]:
+				if err != nil {
+					t.Fatal(err)
+				}
+				gate.settled[i] <- err
+			case <-ctx.Done():
+				t.Fatal("initial host publisher did not settle", ctx.Err())
+			}
+		}
+		if _, err := hosts[0].Execute(ctx, ExecuteRequest{RequestID: "host-two-checkpoint", SQL: "CREATE TABLE host_two_checkpoint(id INTEGER)"}); err != nil {
+			t.Fatal(err)
+		}
+		awaitPublicInternalReady(t, ctx, hosts[2])
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("Host 2 publisher did not start", ctx.Err())
+		}
+		enabled.Store(true)
+		permitOnce.Do(func() { close(permit) })
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			t.Fatal("Host 2 PUT did not enter wire gate", ctx.Err())
+		}
+		select {
+		case got := <-owner:
+			if got != 2 {
+				t.Fatalf("gated publisher host=%d, want 2", got)
+			}
+		case <-ctx.Done():
+			t.Fatal("missing PUT owner", ctx.Err())
+		}
+		go func() {
+			defer releaseOnce.Do(func() { close(release) })
+			select {
+			case <-gate.quiesceStarted:
+				for i, host := range hosts {
+					if host.admissionLifetime.Err() != nil {
+						checked <- fmt.Errorf("Host %d closed before all publishers settled", i)
+						return
+					}
+				}
+				select {
+				case err := <-gate.settled[2]:
+					checked <- fmt.Errorf("Host 2 settled while PUT was gated: %v", err)
+					return
+				default:
+				}
+				checked <- nil
+			case <-ctx.Done():
+				checked <- ctx.Err()
+			}
+		}()
+	})
+	if !passed {
+		t.Fatal("quiesced fixture subtest failed")
+	}
+	select {
+	case err := <-checked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("cleanup observer did not finish", ctx.Err())
+	}
+}
+
 func TestInternalRequestAllAdmittedPublishersParkBeforeClose(t *testing.T) {
 	var outage atomic.Bool
 	var attempts atomic.Int64

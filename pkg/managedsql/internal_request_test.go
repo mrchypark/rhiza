@@ -380,6 +380,30 @@ func openInternalRequestHosts(t *testing.T, outage *atomic.Bool, attempts *atomi
 	return openInternalRequestHostsObserved(t, outage, attempts, nil, nil, nil, setup...)
 }
 
+// Opt in only for fixtures whose background publishers must settle before
+// teardown. Other tests exercise close/cancellation and must keep their own
+// publication lifecycle unchanged.
+func openInternalRequestHostsQuiesced(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, gate *internalPublisherGate, before func(int, context.Context), setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
+	t.Helper()
+	// Also register after a partial-open Fatal/Goexit. testing.T's LIFO cleanup
+	// then quiesces admitted publishers before any opened Host begins closing.
+	defer func() {
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := gate.quiesce(ctx); err != nil {
+				t.Errorf("before Host cleanup: %v", err)
+			}
+		})
+	}()
+	return openInternalRequestHostsObserved(t, outage, attempts, gate.start, func(i int, ctx context.Context) {
+		gate.before(i, ctx)
+		if before != nil {
+			before(i, ctx)
+		}
+	}, gate.after, setup...)
+}
+
 func openInternalRequestHostsObserved(t *testing.T, outage *atomic.Bool, attempts *atomic.Int64, started func(int), before func(int, context.Context), observe func(int, context.Context, error), setup ...func(*sqlWireControl)) ([]Config, []*Host, *sqlStatusFixture) {
 	t.Helper()
 	configs, fixture := sqlClusterForProtocol(t, sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol)

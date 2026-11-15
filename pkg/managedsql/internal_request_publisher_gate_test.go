@@ -10,16 +10,17 @@ import (
 // Workers registered after quiescence wait only on their own lifetime and do
 // not enter a publication attempt; previously registered workers settle first.
 type internalPublisherGate struct {
-	mu        sync.Mutex
-	quiescing bool
-	started   [3]bool
-	late      [3]bool
-	settled   [3]chan error
-	parked    [3]chan struct{}
+	mu             sync.Mutex
+	quiescing      bool
+	quiesceStarted chan struct{}
+	started        [3]bool
+	late           [3]bool
+	settled        [3]chan error
+	parked         [3]chan struct{}
 }
 
 func newInternalPublisherGate() *internalPublisherGate {
-	g := &internalPublisherGate{}
+	g := &internalPublisherGate{quiesceStarted: make(chan struct{})}
 	for i := range g.started {
 		g.settled[i] = make(chan error, 1)
 		g.parked[i] = make(chan struct{}, 1)
@@ -57,7 +58,10 @@ func (g *internalPublisherGate) after(i int, ctx context.Context, err error) {
 
 func (g *internalPublisherGate) quiesce(ctx context.Context) error {
 	g.mu.Lock()
-	g.quiescing = true
+	if !g.quiescing {
+		g.quiescing = true
+		close(g.quiesceStarted)
+	}
 	started := g.started
 	g.mu.Unlock()
 	for i, yes := range started {

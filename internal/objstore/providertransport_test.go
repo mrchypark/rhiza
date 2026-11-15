@@ -580,6 +580,9 @@ func TestS3ConditionalExpectContinueEarlyDecision(t *testing.T) {
 				if err == nil || !bucket.IsConditionNotMetErr(err) {
 					t.Fatalf("conditional rejection error=%v, condition=%t", err, bucket.IsConditionNotMetErr(err))
 				}
+				if hasConditionalPutHTTPTraceEvent(traceSnapshot, 1, "got_100_continue", http.StatusContinue) {
+					t.Fatal("early-final test unexpectedly received 100 Continue")
+				}
 				if got := bodyCounter.bytes.Load(); got != 0 {
 					t.Fatalf("HTTP request body bytes=%d after early conditional rejection, want 0", got)
 				}

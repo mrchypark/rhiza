@@ -41,7 +41,8 @@ func TestInternalRequestFirstKVWithoutPrivateAdmissionOrReady(t *testing.T) {
 func TestInternalRequestAdditionalOperationsWithoutKube(t *testing.T) {
 	var outage atomic.Bool
 	var attempts atomic.Int64
-	configs, hosts, _ := openInternalRequestHosts(t, &outage, &attempts)
+	gate := newInternalPublisherGate()
+	configs, hosts, _ := openInternalRequestHostsQuiesced(t, &outage, &attempts, gate, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	for _, host := range hosts {
