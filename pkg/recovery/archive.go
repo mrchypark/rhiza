@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -130,6 +131,7 @@ type source interface {
 }
 
 type syncBatch struct {
+	archiveBatchTrace
 	target            quepaxa.Slot
 	done              chan struct{}
 	err               error
@@ -860,7 +862,27 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 
 // SyncThrough publishes all decisions through the requested slot. Concurrent
 // callers share a bounded delay and one immutable block/head publication.
-func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) error {
+func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) (retErr error) {
+	var requestID uint64
+	if latencydiag.Enabled && through != 0 {
+		requestID = latencydiag.NextBatch()
+		started := latencydiag.Start()
+		defer func() {
+			outcome := "error"
+			if retErr == nil {
+				outcome = "success_tip_unknown"
+				if m.Tip() >= through {
+					outcome = "success_tip_covered"
+				}
+			}
+			// The final result may span multiple batches; do not infer a batch ID.
+			latencydiag.TraceArchive("archive_slot_result", 0, requestID, 0, uint64(through), outcome, started)
+		}()
+	}
+	return m.syncThrough(ctx, core, through, requestID)
+}
+
+func (m *Manager) syncThrough(ctx context.Context, core source, through quepaxa.Slot, requestID uint64) error {
 	if through == 0 {
 		return nil
 	}
@@ -870,14 +892,28 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 			batch.target = through
 		}
 		m.batchMu.Unlock()
+		var waitStart time.Time
+		if latencydiag.Enabled {
+			waitStart = latencydiag.Start()
+		}
 		select {
 		case <-ctx.Done():
+			if latencydiag.Enabled {
+				latencydiag.TraceArchive("archive_batch_wait", batch.traceID(), requestID, 0, uint64(through), "cancelled", waitStart)
+			}
 			return ctx.Err()
 		case <-batch.done:
+			if latencydiag.Enabled {
+				outcome := "ok"
+				if batch.err != nil {
+					outcome = "error"
+				}
+				latencydiag.TraceArchive("archive_batch_wait", batch.traceID(), requestID, 0, uint64(through), outcome, waitStart)
+			}
 			if batch.err != nil {
 				return batch.err
 			}
-			return m.SyncThrough(ctx, core, through)
+			return m.syncThrough(ctx, core, through, requestID)
 		}
 	}
 	if !m.unverified && m.Tip() >= through {
@@ -889,14 +925,29 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 		return ErrArchiveClosed
 	}
 	batch := &syncBatch{target: through, done: make(chan struct{}), requireValidation: m.unverified}
+	batch.initTrace()
 	m.batch = batch
 	m.batchWG.Add(1)
 	m.batchMu.Unlock()
 	go m.flushBatch(batch, core)
+	var waitStart time.Time
+	if latencydiag.Enabled {
+		waitStart = latencydiag.Start()
+	}
 	select {
 	case <-ctx.Done():
+		if latencydiag.Enabled {
+			latencydiag.TraceArchive("archive_batch_wait", batch.traceID(), requestID, 0, uint64(through), "cancelled", waitStart)
+		}
 		return ctx.Err()
 	case <-batch.done:
+		if latencydiag.Enabled {
+			outcome := "ok"
+			if batch.err != nil {
+				outcome = "error"
+			}
+			latencydiag.TraceArchive("archive_batch_wait", batch.traceID(), requestID, 0, uint64(through), outcome, waitStart)
+		}
 		return batch.err
 	}
 }
@@ -915,9 +966,18 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		if tip := core.Tip(); tip > target {
 			target = tip
 		}
+		if latencydiag.Enabled {
+			latencydiag.TraceBatch("archive_batch_target", batch.traceID(), uint64(target), 0, "provisional", latencydiag.Start())
+		}
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
+		if latencydiag.Enabled {
+			ctx = latencydiag.WithSync(ctx, batch.traceID())
+		}
 		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
+	}
+	if latencydiag.Enabled {
+		latencydiag.TraceSync("archive_batch_result", batch.traceID(), uint64(m.Tip()), 0, "", batch.err, latencydiag.Start())
 	}
 	m.batchMu.Lock()
 	m.unverified = batch.err != nil
@@ -989,6 +1049,9 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			m.batchMu.Unlock()
 			if tip := core.Tip(); tip > through {
 				through = tip
+			}
+			if latencydiag.Enabled {
+				latencydiag.TraceBatch("archive_batch_target", batch.traceID(), uint64(through), 0, "final", latencydiag.Start())
 			}
 		}
 		return m.syncNowLocked(ctx, core, through)
@@ -1077,7 +1140,21 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 			options = append(options, objstore.WithIfMatch(headCAS))
 		}
 	}
-	return m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
+	var started time.Time
+	var attempt uint64
+	if latencydiag.Enabled {
+		started = latencydiag.Start()
+		attempt = latencydiag.NextBatch()
+	}
+	err = m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
+	if latencydiag.Enabled {
+		outcome := "ok"
+		if err != nil {
+			outcome = "error"
+		}
+		latencydiag.TraceArchive("archive_head_upload", latencydiag.SyncID(ctx), 0, attempt, 0, outcome, started)
+	}
+	return err
 }
 
 func (m *Manager) confirmPublicationLease(ctx context.Context) error {
@@ -1107,7 +1184,20 @@ func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, 
 	if m.cas {
 		options = append(options, objstore.WithIfNotExists())
 	}
+	var started time.Time
+	var attempt uint64
+	if latencydiag.Enabled {
+		started = latencydiag.Start()
+		attempt = latencydiag.NextBatch()
+	}
 	err := m.bucket.Upload(ctx, m.key(extentObjectKey(hash, generation)), bytes.NewReader(data), options...)
+	if latencydiag.Enabled {
+		outcome := "ok"
+		if err != nil {
+			outcome = "error"
+		}
+		latencydiag.TraceArchive("archive_extent_upload", latencydiag.SyncID(ctx), 0, attempt, 0, outcome, started)
+	}
 	typed := m.cas && err != nil && m.bucket.IsConditionNotMetErr(err)
 	guard := "not_attempted"
 	if attribution != nil {

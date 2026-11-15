@@ -62,7 +62,7 @@ func TestSlotSamplesBoundedAndUnknown(t *testing.T) {
 		p.recordSlotSample(slowestProgress{SlotKnown: true, Slot: 16, LatencyNS: int64(i)})
 	}
 	s := p.sample(0, time.Now())
-	if !s.SlotSamplesEnabled || len(s.SlotSamples) != 64 || s.SlotSamplesDropped != 1 || s.SlotUnknown != 1 || s.SlotSamples[0].Slot != 16 || s.SlotSamples[63].LatencyNS != 63 {
+	if !s.SlotSamplesEnabled || len(s.SlotSamples) != 64 || s.SlotSamplesDropped != 1 || s.SlotUnknown != 1 || s.SlotSamples[0].Slot != 16 || s.SlotSamples[0].LatencyNS != 64 || s.SlotSamples[63].LatencyNS != 63 {
 		t.Fatalf("unexpected samples: %+v", s)
 	}
 	p.sampleMu.Lock()

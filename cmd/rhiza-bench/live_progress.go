@@ -34,8 +34,8 @@ type liveProgress struct {
 	sampleUnknown      atomic.Uint64
 }
 
-// Samples use fixed slot modulo rather than request IDs; requests sharing one
-// slot remain separate records. A full or busy buffer drops without waiting.
+// Samples use fixed slot modulo rather than request IDs; retain the slowest
+// completed samples seen without blocking the workload. Drops include eviction.
 func (p *liveProgress) recordSlotSample(s slowestProgress) {
 	if !s.SlotKnown {
 		p.sampleUnknown.Add(1)
@@ -51,6 +51,15 @@ func (p *liveProgress) recordSlotSample(s slowestProgress) {
 	defer p.sampleMu.Unlock()
 	if p.sampleCount == len(p.sampleItems) {
 		p.sampleDropped.Add(1)
+		min := 0
+		for i := 1; i < p.sampleCount; i++ {
+			if p.sampleItems[i].LatencyNS < p.sampleItems[min].LatencyNS {
+				min = i
+			}
+		}
+		if s.LatencyNS > p.sampleItems[min].LatencyNS {
+			p.sampleItems[min] = s
+		}
 		return
 	}
 	p.sampleItems[p.sampleCount] = s

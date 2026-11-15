@@ -33,6 +33,8 @@ type event struct {
 	stage, outcome string
 	slot           uint64
 	batch          uint64
+	request        uint64
+	attempt        uint64
 	count          int
 	peer           [8]byte
 	start, end     time.Time
@@ -45,6 +47,7 @@ type eventRing struct {
 }
 
 var ring eventRing
+var testLossless atomic.Bool
 var startWriter sync.Once
 var nextBatch atomic.Uint64
 var flushMu sync.Mutex
@@ -59,8 +62,15 @@ func TraceBatch(stage string, batch, slot uint64, count int, outcome string, beg
 	ring.add(event{stage: stage, batch: batch, slot: slot, count: count, outcome: outcome, start: begin, end: time.Now()})
 }
 
+func TraceArchive(stage string, batch, request, attempt, slot uint64, outcome string, begin time.Time) {
+	start()
+	ring.add(event{stage: stage, batch: batch, request: request, attempt: attempt, slot: slot, outcome: outcome, start: begin, end: time.Now()})
+}
+
 func (r *eventRing) add(e event) {
-	if !r.mu.TryLock() {
+	if testLossless.Load() {
+		r.mu.Lock()
+	} else if !r.mu.TryLock() {
 		r.dropped.Add(1)
 		return
 	}
@@ -104,7 +114,7 @@ func Flush() {
 		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
 	}
 	for _, e := range events {
-		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds())
+		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt)
 	}
 }
 func Observe(stage string, slot uint64, start time.Time) { observe(stage, slot, "", nil, start) }
