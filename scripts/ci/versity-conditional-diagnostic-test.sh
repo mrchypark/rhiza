@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+unset RHIZA_DIAGNOSTIC_MODES
 scope_pattern=$(sed -n "s/.*grep -Eq '\(.*\)'; then/\1/p" .github/workflows/performance.yml)
 [ -n "$scope_pattern" ]
 for changed_file in internal/objstore/providertransport_test.go internal/objstore/versity_conditional_put_test.go internal/objstore/conditional_put_ambiguity_test.go internal/objstore/versityfixture/fixture.go scripts/ci/versity-conditional-diagnostic.sh scripts/ci/versity-conditional-diagnostic-test.sh scripts/ci/versity-conditional-cleanup-gate.sh .github/workflows/performance.yml; do
@@ -104,4 +105,22 @@ if sh scripts/ci/versity-conditional-cleanup-gate.sh >/dev/null; then exit 1; fi
 printf '%s\n' 'gateway_reaped=true' 'child_status=0' 'forced=0' >"$RHIZA_DIAGNOSTIC_RAW_DIR/baseline/versity-fixture/gateway-complete"
 rm "$RHIZA_DIAGNOSTIC_DIR/expect/cleanup-exit-code.txt"
 if sh scripts/ci/versity-conditional-cleanup-gate.sh >/dev/null; then exit 1; fi
+for scenario in baseline-only baseline-only-failure; do
+    export RHIZA_DIAGNOSTIC_DIR="$test_dir/$scenario/output"
+    export RHIZA_DIAGNOSTIC_RAW_DIR="$test_dir/$scenario/raw"
+    export GITHUB_OUTPUT="$test_dir/$scenario-github-output"
+    export RHIZA_DIAGNOSTIC_MODES=baseline
+    : >"$GITHUB_OUTPUT"
+    : >"$MOCK_CALLS"
+    MOCK_FAIL= MOCK_MISSING_TRACE= MOCK_BAD_CLEANUP= MOCK_UNWRITABLE_STATUS=
+    [ "$scenario" != baseline-only-failure ] || MOCK_FAIL=baseline
+    export MOCK_FAIL MOCK_MISSING_TRACE MOCK_BAD_CLEANUP MOCK_UNWRITABLE_STATUS
+    if sh scripts/ci/versity-conditional-diagnostic.sh >"$test_dir/$scenario.log" 2>&1; then status=0; else status=$?; fi
+    [ "$(cat "$MOCK_CALLS")" = baseline ]
+    [ ! -e "$RHIZA_DIAGNOSTIC_DIR/expect" ]
+    if [ "$scenario" = baseline-only ]; then [ "$status" = 0 ]; else [ "$status" = 1 ] && [ "$(cat "$RHIZA_DIAGNOSTIC_DIR/baseline/exit-code.txt")" = 42 ]; fi
+    CURRENT_CLEANUP_CONFIRMED=$(sed -n 's/^cleanup_confirmed=//p' "$GITHUB_OUTPUT")
+    export CURRENT_CLEANUP_CONFIRMED
+    sh scripts/ci/versity-conditional-cleanup-gate.sh >/dev/null
+done
 printf '%s\n' 'versity conditional diagnostic mock: PASS'

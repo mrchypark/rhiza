@@ -10,8 +10,10 @@ set -u
 aggregate=0
 gate_ok=1
 completed=0
+modes=${RHIZA_DIAGNOSTIC_MODES:-baseline expect}
+case "$modes" in baseline) expected_completed=1 ;; 'baseline expect') expected_completed=2 ;; *) printf '%s\n' 'unsupported diagnostic modes' >&2; exit 1 ;; esac
 mkdir -p "$RHIZA_DIAGNOSTIC_DIR" "$RHIZA_DIAGNOSTIC_RAW_DIR" || exit 1
-for mode in baseline expect; do
+for mode in $modes; do
     case "$mode" in
         baseline) selector=TestVersityConditionalLargePutEvidence; enabled=0; expect=false ;;
         expect) selector=TestVersityConditionalLargePutExpectEvidence; enabled=1; expect=true ;;
@@ -88,7 +90,7 @@ for mode in baseline expect; do
     fi
     completed=$((completed + 1))
 done
-if [ "$gate_ok" -eq 1 ] && [ "$completed" -eq 2 ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
+if [ "$gate_ok" -eq 1 ] && [ "$completed" -eq "$expected_completed" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
     if ! printf '%s\n' 'cleanup_confirmed=true' >>"$GITHUB_OUTPUT"; then
         printf '%s\n' 'could not record current-run cleanup confirmation' >&2
         aggregate=1

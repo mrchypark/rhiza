@@ -5,7 +5,9 @@ set -eu
 : "${RHIZA_DIAGNOSTIC_DIR:?missing diagnostic directory}"
 : "${RHIZA_DIAGNOSTIC_RAW_DIR:?missing raw directory}"
 [ "${CURRENT_CLEANUP_CONFIRMED:-}" = true ] || exit 1
-for mode in baseline expect; do
+modes=${RHIZA_DIAGNOSTIC_MODES:-baseline expect}
+case "$modes" in baseline|'baseline expect') ;; *) exit 1 ;; esac
+for mode in $modes; do
     output=$RHIZA_DIAGNOSTIC_DIR/$mode
     raw=$RHIZA_DIAGNOSTIC_RAW_DIR/$mode
     for file in exit-code.txt verification-exit-code.txt cleanup-exit-code.txt; do
@@ -28,4 +30,4 @@ for mode in baseline expect; do
     done
     [ "$count" -eq 1 ] || exit 1
 done
-printf '%s\n' 'Both diagnostic gateways are confirmed reaped.'
+printf '%s\n' 'Requested diagnostic gateways are confirmed reaped.'

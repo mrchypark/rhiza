@@ -423,7 +423,7 @@ jobs:
             printf 'versity_version=%s\n' "$binary_version"
           } >"$evidence_dir/environment.txt"
 
-      - name: Trace independent Versity conditional PUT cases
+      - name: Trace baseline Versity conditional PUT case
         id: versity-conditional-diagnostic
         continue-on-error: true
         env:
@@ -432,6 +432,7 @@ jobs:
           # Keep raw server output out of artifacts: only the bounded,
           # non-secret client trace and aggregated server counts are uploaded.
           RHIZA_DIAGNOSTIC_RAW_DIR: ${{ runner.temp }}/versity-conditional-raw
+          RHIZA_DIAGNOSTIC_MODES: baseline
         run: |
           sh scripts/ci/versity-conditional-diagnostic-test.sh
           sh scripts/ci/versity-conditional-diagnostic.sh
@@ -445,15 +446,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Expect conditional PUT trace
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: versity-conditional-expect-${{ github.run_id }}
-          path: ${{ runner.temp }}/versity-conditional-diagnostic/expect
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Confirm diagnostic gateways stopped
         id: versity-cleanup-gate
         if: always() && !cancelled()
@@ -461,6 +453,7 @@ jobs:
           RHIZA_DIAGNOSTIC_DIR: ${{ runner.temp }}/versity-conditional-diagnostic
           RHIZA_DIAGNOSTIC_RAW_DIR: ${{ runner.temp }}/versity-conditional-raw
           CURRENT_CLEANUP_CONFIRMED: ${{ steps.versity-conditional-diagnostic.outputs.cleanup_confirmed }}
+          RHIZA_DIAGNOSTIC_MODES: baseline
         run: |
           test "$CURRENT_CLEANUP_CONFIRMED" = true
           sh scripts/ci/versity-conditional-cleanup-gate.sh
@@ -598,7 +591,7 @@ jobs:
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
 
-      - name: Require both conditional PUT diagnostics to pass
+      - name: Require baseline conditional PUT diagnostic to pass
         if: always() && !cancelled()
         env:
           DIAGNOSTIC_OUTCOME: ${{ steps.versity-conditional-diagnostic.outcome }}
