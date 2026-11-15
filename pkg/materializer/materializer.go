@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/applydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -1205,8 +1206,11 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
+	diagnostic := applydiag.FromContext(ctx)
+	diagnostic.Set(applydiag.Unknown)
 	for _, decision := range decisions {
 		if err := m.validateExecutionPolicy(decision.Value); err != nil {
+			diagnostic.Set(applydiag.Policy)
 			return err
 		}
 	}
@@ -1216,12 +1220,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.writer == nil {
+		diagnostic.Set(applydiag.Writer)
 		return sql.ErrConnDone
 	}
 	if err := m.fatalHealthLocked(); err != nil {
+		diagnostic.Set(applydiag.Health)
 		return err
 	}
 	if err := m.validateGraphHistoryLocked(ctx, false); err != nil {
+		diagnostic.Set(applydiag.GraphHistory)
 		return err
 	}
 	if m.graph != nil {
@@ -1229,11 +1236,13 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		commitUnknown := m.graph.commitUnknown
 		m.graph.mu.RUnlock()
 		if commitUnknown {
+			diagnostic.Set(applydiag.Health)
 			return ErrGraphCommitUnknown
 		}
 	}
 	conn, err := m.writer.Conn(ctx)
 	if err != nil {
+		diagnostic.Set(applydiag.Connection)
 		return fmt.Errorf("acquire apply connection: %w", err)
 	}
 	defer conn.Close()
@@ -1242,6 +1251,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	// still use ctx, and cancellation is checked again before committing.
 	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
+		diagnostic.Set(applydiag.Begin)
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
@@ -1276,6 +1286,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	}()
 	if m.managedProtocol != "" {
 		if err := checkManagedPolicy(ctx, tx, m.managedProtocol, m.idempotencyWindow); err != nil {
+			diagnostic.Set(applydiag.ManagedPolicy)
 			return err
 		}
 	}
@@ -1294,31 +1305,37 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		if slot <= m.tip {
 			if slot == m.tip && hash != m.tipHash {
 				m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+				diagnostic.Set(applydiag.SlotConflict)
 				return fmt.Errorf("applied slot %d hash conflict", slot)
 			}
 			continue
 		}
 		if slot != m.tip+1 {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+			diagnostic.Set(applydiag.SlotGap)
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
 		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+			diagnostic.Set(applydiag.ApplyValue)
 			return err
 		}
 		m.tip, m.tipHash = slot, hash
 	}
 	if err := m.flushPendingSQLReceipts(ctx, tx, nil); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		diagnostic.Set(applydiag.Receipts)
 		return err
 	}
 	if err := m.persistSQLReceiptRetention(ctx, tx); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		diagnostic.Set(applydiag.Retention)
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		diagnostic.Set(applydiag.Context)
 		return err
 	}
 	commitAttempted = true
@@ -1328,6 +1345,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		commitErr = m.afterApplyCommitError()
 	}
 	if commitErr != nil {
+		diagnostic.Set(applydiag.Commit)
 		m.commitUnknown = true
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		if m.graph != nil {

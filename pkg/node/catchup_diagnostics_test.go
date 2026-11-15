@@ -14,10 +14,73 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/applydiag"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	sqlite3 "github.com/ncruces/go-sqlite3"
 )
+
+func TestOperationSyncDiagnosticsApplySiteIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		stage, phase string
+		site         applydiag.Site
+		want         string
+	}{
+		{"local-replay", "materialize", applydiag.SlotGap, "slot-gap"},
+		{"local-replay", "materialize", applydiag.Site(999), "unknown"},
+		{"fetch", "materialize", applydiag.SlotGap, "unknown"},
+		{"local-replay", "durability", applydiag.SlotGap, "unknown"},
+	} {
+		err := &catchUpDiagnosticError{stage: tc.stage, replayPhase: tc.phase, applySite: tc.site, cause: context.Canceled}
+		logOperationSyncFailure("node", 1, []catchUpAttempt{{source: "peer", err: err}}, func(args ...any) {
+			line := fmt.Sprint(args...)
+			if !strings.Contains(line, "apply_site="+tc.want) || len(line) > 1024 || strings.ContainsAny(line, "\r\n") {
+				t.Fatalf("invalid bounded site: %q", line)
+			}
+		})
+	}
+}
+
+func TestOperationSyncDiagnosticsMaterializerSentinelBits(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		cause                   error
+		class                   string
+		commit, pending, closed bool
+	}{
+		{name: "commit-unknown", cause: fmt.Errorf("private SQL: %w", materializer.ErrGraphCommitUnknown), class: "unknown", commit: true},
+		{name: "apply-pending", cause: fmt.Errorf("private slot: %w", materializer.ErrGraphApplyPending), class: "unknown", pending: true},
+		{name: "writer-closed", cause: fmt.Errorf("private path: %w", sql.ErrConnDone), class: "unknown", closed: true},
+		{name: "joined-canceled-unknown", cause: errors.Join(context.Canceled, materializer.ErrGraphCommitUnknown), class: "canceled", commit: true},
+		{name: "joined-all", cause: errors.Join(context.DeadlineExceeded, materializer.ErrGraphCommitUnknown, materializer.ErrGraphApplyPending, sql.ErrConnDone), class: "deadline", commit: true, pending: true, closed: true},
+		{name: "unrelated", cause: errors.New("private\nSQL credential"), class: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapped := &catchUpDiagnosticError{stage: "local-replay", replayPhase: "materialize", from: 5, cause: tc.cause}
+			var actual *catchUpDiagnosticError
+			if !errors.Is(wrapped, tc.cause) || !errors.As(wrapped, &actual) || actual != wrapped {
+				t.Fatal("original error identity changed")
+			}
+			var line string
+			logOperationSyncFailure("private-node", 3, []catchUpAttempt{{source: "private-peer", err: wrapped}}, func(args ...any) { line = fmt.Sprint(args...) })
+			for _, field := range []string{
+				"error_class=" + tc.class,
+				fmt.Sprintf("cause_commit_unknown=%t", tc.commit),
+				fmt.Sprintf("cause_graph_apply_pending=%t", tc.pending),
+				fmt.Sprintf("cause_sql_conn_done=%t", tc.closed),
+				"replay_phase=materialize",
+			} {
+				if !strings.Contains(line, field) {
+					t.Fatalf("missing %q: %s", field, line)
+				}
+			}
+			if len(line) > 1024 || strings.ContainsAny(line, "\r\n") || strings.Contains(line, "private") || strings.Contains(line, "credential") || !regexp.MustCompile(`(?i)error|failed|timeout`).MatchString(line) {
+				t.Fatalf("unsafe, oversized, or failure-gate-invisible record: %q", line)
+			}
+		})
+	}
+}
 
 func TestOperationSyncDiagnosticsTypedLocalCauses(t *testing.T) {
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "typed.db"))

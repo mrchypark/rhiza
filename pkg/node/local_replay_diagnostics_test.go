@@ -64,7 +64,7 @@ func TestLocalReplayDiagnosticsActualDurabilityAndMaterialization(t *testing.T) 
 	}
 	logOperationSyncFailure("private-node", 0, []catchUpAttempt{{source: "private-peer", err: err}}, func(args ...any) {
 		line := fmt.Sprint(args...)
-		if !strings.Contains(line, "replay_phase=materialize") || strings.Contains(line, "private-node") || strings.Contains(line, "private-peer") || strings.Contains(line, sql.ErrConnDone.Error()) {
+		if !strings.Contains(line, "replay_phase=materialize") || !strings.Contains(line, "cause_sql_conn_done=true") || !strings.Contains(line, "apply_site=writer") || strings.Contains(line, "private-node") || strings.Contains(line, "private-peer") || strings.Contains(line, sql.ErrConnDone.Error()) {
 			t.Fatalf("unsafe or missing diagnostic: %s", line)
 		}
 	})
@@ -198,7 +198,7 @@ func TestLocalReplayPhaseLocalSkipsDurabilityAndFetchDoesNotInheritPhase(t *test
 	}
 	logOperationSyncFailure("n1", 0, []catchUpAttempt{{source: "absent-peer", err: err}}, func(args ...any) {
 		line := fmt.Sprint(args...)
-		if !strings.Contains(line, "stage=fetch from=2") || !strings.Contains(line, "replay_phase=unknown") {
+		if !strings.Contains(line, "stage=fetch from=2") || !strings.Contains(line, "replay_phase=unknown") || !strings.Contains(line, "apply_site=unknown") {
 			t.Fatalf("fetch inherited replay phase: %s", line)
 		}
 	})
