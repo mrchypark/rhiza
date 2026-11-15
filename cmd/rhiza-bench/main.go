@@ -23,26 +23,27 @@ import (
 )
 
 type result struct {
-	LiveProgressStatus string            `json:"live_progress_status,omitempty"`
-	Requests           int               `json:"requests"`
-	Successes          int               `json:"successes"`
-	Errors             uint64            `json:"errors"`
-	Retries            uint64            `json:"retries,omitempty"`
-	DurationMS         float64           `json:"duration_ms"`
-	OpsPerSec          float64           `json:"ops_per_sec"`
-	SuccessOpsPerSec   float64           `json:"success_ops_per_sec"`
-	P50MS              float64           `json:"p50_ms"`
-	P95MS              float64           `json:"p95_ms"`
-	P99MS              float64           `json:"p99_ms"`
-	MaxMS              float64           `json:"max_ms"`
-	ErrorP50MS         float64           `json:"error_p50_ms,omitempty"`
-	ErrorP95MS         float64           `json:"error_p95_ms,omitempty"`
-	ErrorP99MS         float64           `json:"error_p99_ms,omitempty"`
-	ErrorKinds         map[string]uint64 `json:"error_kinds,omitempty"`
-	ErrorSamples       map[string]string `json:"error_samples,omitempty"`
-	ReceiptOracle      string            `json:"receipt_oracle,omitempty"`
-	FaultOverlap       bool              `json:"fault_overlap_control,omitempty"`
-	FaultWindow        *faultWindow      `json:"fault_window,omitempty"`
+	LiveProgressStatus string              `json:"live_progress_status,omitempty"`
+	Requests           int                 `json:"requests"`
+	Successes          int                 `json:"successes"`
+	Errors             uint64              `json:"errors"`
+	Retries            uint64              `json:"retries,omitempty"`
+	DurationMS         float64             `json:"duration_ms"`
+	OpsPerSec          float64             `json:"ops_per_sec"`
+	SuccessOpsPerSec   float64             `json:"success_ops_per_sec"`
+	P50MS              float64             `json:"p50_ms"`
+	P95MS              float64             `json:"p95_ms"`
+	P99MS              float64             `json:"p99_ms"`
+	MaxMS              float64             `json:"max_ms"`
+	ErrorP50MS         float64             `json:"error_p50_ms,omitempty"`
+	ErrorP95MS         float64             `json:"error_p95_ms,omitempty"`
+	ErrorP99MS         float64             `json:"error_p99_ms,omitempty"`
+	ErrorKinds         map[string]uint64   `json:"error_kinds,omitempty"`
+	ErrorSamples       map[string]string   `json:"error_samples,omitempty"`
+	ReceiptOracle      string              `json:"receipt_oracle,omitempty"`
+	FaultOverlap       bool                `json:"fault_overlap_control,omitempty"`
+	FaultWindow        *faultWindow        `json:"fault_window,omitempty"`
+	SlotEvidence       *liveProgressSample `json:"slot_evidence,omitempty"`
 }
 
 func main() {
@@ -59,6 +60,7 @@ func main() {
 	faultStart := flag.String("fault-start-time", "", "Linux target start-time ticks captured by the owning parent")
 	liveProgressFile := flag.String("live-progress-file", "", "optional bounded aggregate progress output")
 	liveSlowest := flag.Bool("live-progress-slowest", false, "include the slowest completed request in diagnostic progress")
+	liveSlots := flag.Bool("live-progress-slot-samples", false, "include bounded completed slot samples in diagnostic progress")
 	flag.Parse()
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
@@ -128,7 +130,7 @@ func main() {
 	started := time.Now()
 	var live *liveProgress
 	if *liveProgressFile != "" {
-		live = &liveProgress{start: started, captureSlowest: *liveSlowest}
+		live = &liveProgress{start: started, captureSlowest: *liveSlowest, captureSlotSamples: *liveSlots}
 		live.phase.Store(progressDispatch)
 		stop := make(chan struct{})
 		defer close(stop)
@@ -156,6 +158,9 @@ func main() {
 				}
 				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
 				completed, elapsed := observeRequestReturn(begin, finish, &retries, retryCount, live)
+				if live != nil && live.captureSlotSamples {
+					live.recordSlotSample(slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample))
+				}
 				if live != nil && live.captureSlowest && (live.slowest.Load() == nil || elapsed.Nanoseconds() > live.slowest.Load().LatencyNS) {
 					live.recordSlowest(slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample))
 				}
@@ -273,6 +278,11 @@ func main() {
 	}
 	if live != nil {
 		output.LiveProgressStatus = live.statusName()
+		if live.captureSlotSamples {
+			evidence := live.sample(-1, time.Now())
+			evidence.CaptureStatus = "completed"
+			output.SlotEvidence = &evidence
+		}
 	}
 	if progress != nil {
 		window := progress.window()

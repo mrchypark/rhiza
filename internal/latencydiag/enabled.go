@@ -48,6 +48,7 @@ var ring eventRing
 var startWriter sync.Once
 var nextBatch atomic.Uint64
 var flushMu sync.Mutex
+var sampleSlots = os.Getenv("RHIZA_LATENCY_SAMPLE_SLOTS") == "1"
 
 // Batch IDs are unique within a process lifetime; node log boundaries identify
 // the process. Slot zero means the caller did not provide a slot.
@@ -149,7 +150,7 @@ func syncEvent(stage string, batch, slot uint64, count int, peer string, err err
 }
 func observe(stage string, slot uint64, peer string, err error, begin time.Time) {
 	end := time.Now()
-	if end.Sub(begin) < 100*time.Millisecond {
+	if !observeSlot(end.Sub(begin), slot, sampleSlots) {
 		return
 	}
 	start()
@@ -162,4 +163,8 @@ func observe(stage string, slot uint64, peer string, err error, begin time.Time)
 		copy(e.peer[:], sum[:8])
 	}
 	ring.add(e)
+}
+
+func observeSlot(duration time.Duration, slot uint64, sampled bool) bool {
+	return duration >= 100*time.Millisecond || (sampled && slot != 0 && slot%16 == 0)
 }

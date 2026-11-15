@@ -9,6 +9,38 @@ import (
 	"time"
 )
 
+func TestObserveSlotSampling(t *testing.T) {
+	for _, tc := range []struct {
+		duration      time.Duration
+		slot          uint64
+		enabled, want bool
+	}{
+		{time.Millisecond, 16, true, true},
+		{time.Millisecond, 16, false, false},
+		{time.Millisecond, 0, true, false},
+		{time.Millisecond, 15, true, false},
+		{100 * time.Millisecond, 15, false, true},
+	} {
+		if got := observeSlot(tc.duration, tc.slot, tc.enabled); got != tc.want {
+			t.Fatalf("sample=%+v got=%t", tc, got)
+		}
+	}
+}
+
+func TestObserveSampledSub100msEvent(t *testing.T) {
+	flushMu.Lock()
+	defer flushMu.Unlock()
+	ring.drain()
+	old := sampleSlots
+	sampleSlots = true
+	defer func() { sampleSlots = old }()
+	observe("before_ack_wait", 16, "", nil, time.Now())
+	events, dropped := ring.drain()
+	if dropped != 0 || len(events) != 1 || events[0].stage != "before_ack_wait" || events[0].slot != 16 || events[0].outcome != "ok" {
+		t.Fatalf("events=%+v dropped=%d", events, dropped)
+	}
+}
+
 func TestSlotAndBoundedSlowEvents(t *testing.T) {
 	ctx := WithSlot(context.Background(), 42)
 	if Slot(ctx) != 42 || Slot(context.Background()) != 0 {

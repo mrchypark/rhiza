@@ -246,6 +246,14 @@ if command -v sha256sum >/dev/null; then
 else
 	client_sha256=$(shasum -a 256 "$run_dir/rhiza-bench" | awk '{print $1}')
 fi
+if [[ ${RHIZA_SERVER_BENCH_RECORD_BUILD_ID:-0} == 1 ]]; then
+	server_sha256=$(sha256sum "$run_dir/rhiza" | awk '{print $1}')
+	{
+		printf 'source_sha=%s\n' "$(git -C "$source_dir" rev-parse HEAD)"
+		printf 'client_sha256=%s\nserver_sha256=%s\n' "$client_sha256" "$server_sha256"
+		printf 'tagged=%s\nslot_samples=%s\n' "${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0}" "${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0}"
+	} > "${output_file%.json}-build.txt"
+fi
 
 mkdir -p "$run_dir/s3-data"
 container_started=1 # docker run can create the container before returning an error.
@@ -281,7 +289,10 @@ fi
 for i in 0 1 2; do
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
+	latency_sample=0
+	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0} == 1 ]]; then latency_sample=1; fi
 	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
+		RHIZA_LATENCY_SAMPLE_SLOTS="$latency_sample" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
@@ -332,6 +343,9 @@ if [[ ${RHIZA_SERVER_BENCH_LIVE_PROGRESS:-0} == 1 ]]; then
 	live_progress_requested=true
 	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_LIVE_SLOWEST:-0} == 1 ]]; then
 		progress_args+=(-live-progress-slowest)
+	fi
+	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0} == 1 ]]; then
+		progress_args+=(-live-progress-slot-samples)
 	fi
 fi
 if [[ $failed_node != none ]]; then

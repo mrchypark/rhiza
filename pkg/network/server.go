@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -544,7 +545,15 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 	if s.durability == nil {
 		return nil
 	}
-	if err := s.durability(ctx, slot); err != nil {
+	var started time.Time
+	if latencydiag.Enabled {
+		started = latencydiag.Start()
+	}
+	err := s.durability(ctx, slot)
+	if latencydiag.Enabled {
+		latencydiag.ObserveError("before_ack_wait", uint64(slot), err, started)
+	}
+	if err != nil {
 		if s.localMode {
 			return fmt.Errorf("local durability wait: %w", err)
 		}

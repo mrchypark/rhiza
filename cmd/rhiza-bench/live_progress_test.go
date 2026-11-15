@@ -54,6 +54,42 @@ func TestLiveProgressSlowestBoundedAndNoRegression(t *testing.T) {
 	}
 }
 
+func TestSlotSamplesBoundedAndUnknown(t *testing.T) {
+	p := &liveProgress{start: time.Now(), captureSlotSamples: true}
+	p.recordSlotSample(slowestProgress{})
+	p.recordSlotSample(slowestProgress{SlotKnown: true, Slot: 15})
+	for i := 0; i < 65; i++ {
+		p.recordSlotSample(slowestProgress{SlotKnown: true, Slot: 16, LatencyNS: int64(i)})
+	}
+	s := p.sample(0, time.Now())
+	if !s.SlotSamplesEnabled || len(s.SlotSamples) != 64 || s.SlotSamplesDropped != 1 || s.SlotUnknown != 1 || s.SlotSamples[0].Slot != 16 || s.SlotSamples[63].LatencyNS != 63 {
+		t.Fatalf("unexpected samples: %+v", s)
+	}
+	p.sampleMu.Lock()
+	p.recordSlotSample(slowestProgress{SlotKnown: true, Slot: 16})
+	p.sampleMu.Unlock()
+	if p.sampleDropped.Load() != 2 {
+		t.Fatal("busy drop not counted")
+	}
+}
+
+func TestSlotSamplesConcurrentAccounting(t *testing.T) {
+	p := &liveProgress{start: time.Now(), captureSlotSamples: true}
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p.recordSlotSample(slowestProgress{SlotKnown: true, Slot: 16, LatencyNS: int64(i)})
+		}(i)
+	}
+	wg.Wait()
+	s := p.sample(0, time.Now())
+	if len(s.SlotSamples) == 0 || uint64(len(s.SlotSamples))+s.SlotSamplesDropped != 100 {
+		t.Fatalf("samples=%d dropped=%d", len(s.SlotSamples), s.SlotSamplesDropped)
+	}
+}
+
 func TestSlowestRequestReceiptScope(t *testing.T) {
 	for _, tc := range []struct {
 		name                string

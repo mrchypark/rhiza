@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -13,18 +14,47 @@ import (
 // it does not count HTTP responses independently. Success and failure are
 // logical outcomes, not HTTP-attempt counts. Independent atomic reads can skew.
 type liveProgress struct {
-	start             time.Time
-	phase             atomic.Uint32
-	started           atomic.Uint64
-	postFaultTracking atomic.Uint64
-	completed         atomic.Uint64
-	succeeded         atomic.Uint64
-	failed            atomic.Uint64
-	retries           atomic.Uint64
-	lastCompletedNS   atomic.Int64
-	writerStatus      atomic.Uint32
-	captureSlowest    bool
-	slowest           atomic.Pointer[slowestProgress]
+	start              time.Time
+	phase              atomic.Uint32
+	started            atomic.Uint64
+	postFaultTracking  atomic.Uint64
+	completed          atomic.Uint64
+	succeeded          atomic.Uint64
+	failed             atomic.Uint64
+	retries            atomic.Uint64
+	lastCompletedNS    atomic.Int64
+	writerStatus       atomic.Uint32
+	captureSlowest     bool
+	slowest            atomic.Pointer[slowestProgress]
+	captureSlotSamples bool
+	sampleMu           sync.Mutex
+	sampleItems        [64]slowestProgress
+	sampleCount        int
+	sampleDropped      atomic.Uint64
+	sampleUnknown      atomic.Uint64
+}
+
+// Samples use fixed slot modulo rather than request IDs; requests sharing one
+// slot remain separate records. A full or busy buffer drops without waiting.
+func (p *liveProgress) recordSlotSample(s slowestProgress) {
+	if !s.SlotKnown {
+		p.sampleUnknown.Add(1)
+		return
+	}
+	if s.Slot%16 != 0 {
+		return
+	}
+	if !p.sampleMu.TryLock() {
+		p.sampleDropped.Add(1)
+		return
+	}
+	defer p.sampleMu.Unlock()
+	if p.sampleCount == len(p.sampleItems) {
+		p.sampleDropped.Add(1)
+		return
+	}
+	p.sampleItems[p.sampleCount] = s
+	p.sampleCount++
 }
 
 // slowestProgress is one completed logical request, not a p99 estimate.
@@ -69,18 +99,22 @@ const (
 )
 
 type liveProgressSample struct {
-	Sequence            int              `json:"sequence"`
-	CaptureStatus       string           `json:"capture_status"`
-	ElapsedMS           int64            `json:"elapsed_ms"`
-	MainPhase           uint32           `json:"main_phase"`
-	Started             uint64           `json:"started"`
-	PostFaultTracking   uint64           `json:"post_fault_tracking"`
-	Completed           uint64           `json:"completed"`
-	Succeeded           uint64           `json:"succeeded"`
-	Failed              uint64           `json:"failed"`
-	Retries             uint64           `json:"retries"`
-	LastCompletionAgeMS int64            `json:"last_completion_age_ms"`
-	Slowest             *slowestProgress `json:"slowest_completed,omitempty"`
+	Sequence            int               `json:"sequence"`
+	CaptureStatus       string            `json:"capture_status"`
+	ElapsedMS           int64             `json:"elapsed_ms"`
+	MainPhase           uint32            `json:"main_phase"`
+	Started             uint64            `json:"started"`
+	PostFaultTracking   uint64            `json:"post_fault_tracking"`
+	Completed           uint64            `json:"completed"`
+	Succeeded           uint64            `json:"succeeded"`
+	Failed              uint64            `json:"failed"`
+	Retries             uint64            `json:"retries"`
+	LastCompletionAgeMS int64             `json:"last_completion_age_ms"`
+	Slowest             *slowestProgress  `json:"slowest_completed,omitempty"`
+	SlotSamples         []slowestProgress `json:"slot_samples,omitempty"`
+	SlotSamplesDropped  uint64            `json:"slot_samples_dropped,omitempty"`
+	SlotUnknown         uint64            `json:"slot_unknown,omitempty"`
+	SlotSamplesEnabled  bool              `json:"slot_samples_enabled,omitempty"`
 }
 
 const liveProgressSampleLimit = 120
@@ -127,7 +161,16 @@ func (p *liveProgress) sample(seq int, now time.Time) liveProgressSample {
 	if last > 0 && elapsed >= last {
 		age = (elapsed - last) / int64(time.Millisecond)
 	}
-	return liveProgressSample{Sequence: seq, ElapsedMS: elapsed / int64(time.Millisecond), MainPhase: p.phase.Load(), Started: p.started.Load(), PostFaultTracking: p.postFaultTracking.Load(), Completed: p.completed.Load(), Succeeded: p.succeeded.Load(), Failed: p.failed.Load(), Retries: p.retries.Load(), LastCompletionAgeMS: age, Slowest: p.slowest.Load()}
+	s := liveProgressSample{Sequence: seq, ElapsedMS: elapsed / int64(time.Millisecond), MainPhase: p.phase.Load(), Started: p.started.Load(), PostFaultTracking: p.postFaultTracking.Load(), Completed: p.completed.Load(), Succeeded: p.succeeded.Load(), Failed: p.failed.Load(), Retries: p.retries.Load(), LastCompletionAgeMS: age, Slowest: p.slowest.Load()}
+	if p.captureSlotSamples {
+		s.SlotSamplesEnabled = true
+		p.sampleMu.Lock()
+		s.SlotSamples = append(s.SlotSamples, p.sampleItems[:p.sampleCount]...)
+		p.sampleMu.Unlock()
+		s.SlotSamplesDropped = p.sampleDropped.Load()
+		s.SlotUnknown = p.sampleUnknown.Load()
+	}
+	return s
 }
 
 // writeLiveProgress never blocks request handlers on a diagnostic file.

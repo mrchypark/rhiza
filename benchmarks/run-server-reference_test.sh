@@ -86,6 +86,73 @@ for ownership in unowned stale; do
 done
 # Exercise the complete runner wiring with only tiny shell stand-ins. The fake
 # go command copies these fixtures; it never invokes a compiler.
+for sample in '{"error_samples":{"http_500":"SECRET_SENTINEL"},"object_store_delta":{"gets":2,"private_count":918273645},"result":{"requests":1}}' '{"object_store_delta":{"gets":2,"private_count":918273645},"result":{"error_samples":{"http_500":"SECRET_SENTINEL"},"requests":1,"p99_ms":{"secret":"SECRET_SENTINEL"},"slot_evidence":{"private":"SECRET_SENTINEL","slot_samples":[{"slot":16,"latency_ns":{"secret":"SECRET_SENTINEL"},"secret":"SECRET_SENTINEL"}]}}}'; do
+ sanitized=$(jq -f "$here/../scripts/ci/sanitize-before-ack-diagnostic.jq" <<<"$sample")
+ [[ $sanitized != *SECRET_SENTINEL* && $sanitized != *918273645* ]]
+ jq -e '.object_store_delta.gets == 2 and (.object_store_delta | has("private_count") | not) and .result.requests == 1' <<<"$sanitized" >/dev/null
+done
+# The upload allowlist must not accidentally include raw logs or arbitrary text.
+workflow="$here/../.github/workflows/performance.yml"
+! grep -Fq 'before-ack-sampled-diagnostics/*.txt' "$workflow"
+! grep -Fq 'before-ack-sampled-diagnostics/*.log' "$workflow"
+grep -Fq 'before-ack-sampled-diagnostics/*-sanitized.json' "$workflow"
+grep -Fq 'before-ack-sampled-diagnostics/concurrency-after.json' "$workflow"
+grep -Fq '"$dir/.runs-after.ndjson" >/dev/null' "$workflow"
+overlap_filter="$here/../scripts/ci/assess-performance-overlap.jq"
+run_assessment() {
+ jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter"
+}
+no_overlap='{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"id":2,"status":"completed","created_at":"2026-01-01T08:00:00Z","run_started_at":"2026-01-01T08:00:00Z","updated_at":"2026-01-01T09:59:59Z"}'
+run_assessment <<<"$no_overlap" | jq -e '.overlaps | length == 0' >/dev/null
+for bad in '2026-99-99T99:99:99Z' '2026-02-30T10:00:00Z'; do
+ if jq -s -e --arg own 1 --arg start "$bad" --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+  printf 'impossible start timestamp accepted\n' >&2; exit 1
+ fi
+ if jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end "$bad" -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+  printf 'impossible end timestamp accepted\n' >&2; exit 1
+ fi
+done
+if jq -s -e --arg own 1 --arg start '2026-01-01T10:05:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+ printf 'reversed measurement interval accepted\n' >&2; exit 1
+fi
+jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" | jq -e '.overlaps | length == 0' >/dev/null
+if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-02-30T10:00:00Z","run_started_at":"2026-02-30T10:00:00Z","updated_at":"2026-03-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'impossible run timestamp accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'run start later than update accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:30:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'run created later than start accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T10:00:01Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'queued run created later than update accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":1,"status":"completed","created_at":"2026-01-01T10:00:02Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'started run created later than update accepted\n' >&2; exit 1
+fi
+run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"id":1,"status":"completed","created_at":"2026-01-01T10:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T10:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T09:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"id":2,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+ printf 'another run start later than update accepted\n' >&2; exit 1
+fi
+overlap='{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}'
+run_assessment <<<"$overlap" | jq -e '.overlaps | length == 1 and .[0].id == 3' >/dev/null
+if run_assessment </dev/null >/dev/null 2>&1; then
+ printf 'empty overlap inventory accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}' >/dev/null 2>&1; then
+ printf 'overlap inventory without own run accepted\n' >&2; exit 1
+fi
+if run_assessment <<<'{"id":4,"status":"SENTINEL_PRIVATE"}' >/dev/null 2>&1; then
+ printf 'malformed overlap inventory accepted\n' >&2; exit 1
+fi
 mkdir -p "$scratch/bin" "$scratch/base-server"
 cat > "$scratch/bin/go" <<'MOCK'
 #!/usr/bin/env bash
@@ -120,6 +187,7 @@ MOCK
 cat > "$scratch/node" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$$" >> "$MOCK_HOME/nodes"
+printf '%s\n' "${RHIZA_LATENCY_SAMPLE_SLOTS:-unset}" >> "$MOCK_HOME/node-sampling"
 if [[ ${MOCK_MODE:-} == node-timeout ]]; then trap '' TERM; else
 trap 'printf "node-shutdown-flushed\n"; if [[ ${MOCK_MODE:-} == node-shutdown-fail ]]; then exit 42; fi; exit 0' TERM
 fi
@@ -195,21 +263,23 @@ kill() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal normal-live ring shifted before-first after-last no-witness signal-failure signal-failure-stop-fail wait-normal wait-crash wait-error client-fail client-fail-live cleanup-fail client-fail-cleanup-fail client-fail-cleanup-fail-live copy-fail node-shutdown-fail node-timeout docker-timeout; do
+for mode in normal normal-live ring sampled shifted before-first after-last no-witness signal-failure signal-failure-stop-fail wait-normal wait-crash wait-error client-fail client-fail-live cleanup-fail client-fail-cleanup-fail client-fail-cleanup-fail-live copy-fail node-shutdown-fail node-timeout docker-timeout; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
  diagnostic=0
  live=0
+ slot_samples=0
  [[ $mode != *-live ]] || live=1
  [[ $mode != ring ]] || diagnostic=1
+ [[ $mode != sampled ]] || { diagnostic=1; live=1; slot_samples=1; }
  [[ $mode != shifted && $mode != client-fail && $mode != client-fail-live && $mode != cleanup-fail && $mode != client-fail-cleanup-fail && $mode != client-fail-cleanup-fail-live && $mode != copy-fail && $mode != node-shutdown-fail && $mode != node-timeout && $mode != docker-timeout ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_LIVE_PROGRESS="$live" RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_RECORD_BUILD_ID="$slot_samples" RHIZA_SERVER_BENCH_LIVE_PROGRESS="$live" RHIZA_SERVER_BENCH_SLOT_SAMPLES="$slot_samples" RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == normal || $mode == normal-live || $mode == ring ]]; then
+ if [[ $mode == normal || $mode == normal-live || $mode == ring || $mode == sampled ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
   if [[ $mode == normal-live ]]; then
@@ -218,6 +288,16 @@ for mode in normal normal-live ring shifted before-first after-last no-witness s
   fi
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
   if [[ $mode == ring ]]; then grep -qx 'survivor_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
+  if [[ $mode == sampled ]]; then
+   grep -q -- '-live-progress-slot-samples' "$scratch/$mode/bench.args"
+   [[ $(grep -c '^1$' "$scratch/$mode/node-sampling") == 3 ]]
+   grep -qx 'tagged=1' "$scratch/$mode/result-build.txt"
+   grep -qx 'slot_samples=1' "$scratch/$mode/result-build.txt"
+   grep -Eq '^server_sha256=[a-f0-9]{64}$' "$scratch/$mode/result-build.txt"
+   grep -Eq '^client_sha256=[a-f0-9]{64}$' "$scratch/$mode/result-build.txt"
+  else
+   [[ $(grep -c '^0$' "$scratch/$mode/node-sampling") == 3 ]]
+  fi
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -279,7 +359,7 @@ for mode in normal normal-live ring shifted before-first after-last no-witness s
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
  if [[ $live == 1 ]]; then grep -Fq -- "-live-progress-file $scratch/$mode/result-live-progress.jsonl" "$scratch/$mode/bench.args"; else ! grep -q -- '-live-progress-file' "$scratch/$mode/bench.args"; fi
  if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
- if [[ $mode == ring ]]; then grep -Fq "$scratch/base-server|build -tags rhiza_latency_diag -o" "$scratch/$mode/builds"; else grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"; fi
+ if [[ $mode == ring || $mode == sampled ]]; then grep -Fq "$scratch/base-server|build -tags rhiza_latency_diag -o" "$scratch/$mode/builds"; else grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"; fi
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
