@@ -232,7 +232,7 @@ jobs:
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
           printf 'n0 n1 async\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"
-          RHIZA_SERVER_BENCH_FAILED_NODE=n0 RHIZA_SERVER_BENCH_TARGET_NODE=n1 benchmarks/run-server-reference.sh \
+          RHIZA_SERVER_BENCH_LIVE_PROGRESS=1 RHIZA_SERVER_BENCH_FAILED_NODE=n0 RHIZA_SERVER_BENCH_TARGET_NODE=n1 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n0-failed.json"
           printf 'n1 n2 async\n' > "$RUNNER_TEMP/rhiza-performance/fault-diagnostic-lane.txt"

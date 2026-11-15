@@ -113,6 +113,12 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 	}()
 	select {
 	case <-started:
+	case earlyErr := <-result:
+		<-exited
+		running = false
+		var sqliteCode sqlite3.ErrorCode
+		known := errors.As(earlyErr, &sqliteCode)
+		t.Fatalf("apply returned before receipt gate: success=%t site=%s sqlite_code_known=%t sqlite_code=%d canceled=%t deadline=%t unknown=%t", earlyErr == nil, recorder.Site(), known, sqliteCode, errors.Is(earlyErr, context.Canceled), errors.Is(earlyErr, context.DeadlineExceeded), errors.Is(earlyErr, ErrGraphCommitUnknown))
 	case <-ctx.Done():
 		t.Fatal("receipt trigger not reached")
 	}
