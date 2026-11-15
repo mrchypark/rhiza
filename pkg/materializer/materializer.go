@@ -3081,6 +3081,9 @@ func recoverRestore(dbPath string) error {
 func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("materializer:restore:locked")
+	}
 	if err := m.sqlReceiptReadLocked(); err != nil {
 		return err
 	}
@@ -3288,6 +3291,16 @@ func (m *Materializer) Tip() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.tip
+}
+
+// TryTip reports the current applied tip only when the state lock is available.
+// A busy lock yields no observation and must not authorize a read.
+func (m *Materializer) TryTip() (uint64, bool) {
+	if !m.mu.TryRLock() {
+		return 0, false
+	}
+	defer m.mu.RUnlock()
+	return m.tip, true
 }
 
 // StateTip returns the last slot that changed user-visible state.

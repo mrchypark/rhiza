@@ -763,6 +763,11 @@ func (w *WAL) syncWithDiagnosticBatch(batch uint64) error {
 	}
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
+	if localtesthooks.Enabled {
+		if err := injectedSyncError(w); err != nil {
+			return err
+		}
+	}
 	var syncStart time.Time
 	if latencydiag.Enabled {
 		syncStart = latencydiag.Start()

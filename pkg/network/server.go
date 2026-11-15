@@ -145,6 +145,7 @@ type Server struct {
 	handlerWG            sync.WaitGroup
 	handlerClosing       bool
 	syncLimit            chan struct{}
+	readReplayLimit      chan struct{}
 	syncMu               sync.Mutex
 	syncSources          map[quepaxa.NodeID]chan struct{}
 	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
@@ -376,6 +377,7 @@ func newServerForProfile(core *quepaxa.Core, material *materializer.Materializer
 		localCap:         make(chan struct{}, localLimit),
 		localMode:        localMode,
 		syncLimit:        make(chan struct{}, 2),
+		readReplayLimit:  make(chan struct{}, 2),
 	}
 	for i := range s.requestLocks {
 		s.requestLocks[i] = make(chan struct{}, 1)
@@ -1814,6 +1816,9 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err := s.readBarrier(ctx, req.Consistency); err != nil {
 		return QueryResponse{}, err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:read:after-barrier")
+	}
 	result, appliedSlot, err := s.material.QueryResultAt(ctx, req.SQL, req.Args)
 	if err != nil {
 		logManagedQueryFailure(ctx, "server_materialize", err)
@@ -2256,9 +2261,83 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 				return err
 			}
 		}
-		return logManagedQueryFailure(ctx, "server_apply", s.applyDecisions(ctx, index))
+		return logManagedQueryFailure(ctx, "server_apply", s.applyReadBarrierOwned(ctx, index))
 	default:
 		return errConsistency
+	}
+}
+
+// applyReadBarrierOwned retains a bounded worker until certified replay ends.
+// The caller may leave after cancellation; shutdown still cancels and joins the
+// worker. applyDecisions verifies and persists each certified page before use.
+func (s *Server) applyReadBarrierOwned(ctx context.Context, through quepaxa.Slot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if tip, known := s.material.TryTip(); known && tip >= uint64(through) {
+		return ctx.Err()
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:read:before-replay-admission")
+	}
+	select {
+	case s.readReplayLimit <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.proposalCtx.Done():
+		return ErrNotReady
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:read:after-replay-admission")
+	}
+	s.handlerMu.Lock()
+	if s.handlerClosing || s.proposalCtx.Err() != nil {
+		s.handlerMu.Unlock()
+		<-s.readReplayLimit
+		return ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		s.handlerMu.Unlock()
+		<-s.readReplayLimit
+		return err
+	}
+	if tip, known := s.material.TryTip(); known && tip >= uint64(through) {
+		s.handlerMu.Unlock()
+		<-s.readReplayLimit
+		return ctx.Err()
+	}
+	s.handlerWG.Add(1)
+	s.handlerMu.Unlock()
+	owned, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
+	done := make(chan error, 1)
+	go func() {
+		defer s.handlerWG.Done()
+		defer func() { <-s.readReplayLimit }()
+		defer cancel()
+		err := s.applyDecisionsWithPeerLifetime(owned, through, s.proposalCtx)
+		if err == nil {
+			err = owned.Err()
+		}
+		done <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-owned.Done():
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		default:
+			return owned.Err()
+		}
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
 	}
 }
 
