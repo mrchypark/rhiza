@@ -645,11 +645,12 @@ jobs:
           mkdir -p "$dir"
           start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           snapshot() {
-            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/performance.yml/runs?per_page=100" --jq '.workflow_runs[] | {id,status,created_at,run_started_at,updated_at}'
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/performance.yml/runs?per_page=100" |
+              jq -e -c -f scripts/ci/flatten-performance-pages.jq
           }
           printf '%s\n' 'invalid: preflight inventory unavailable or malformed; no measurement started' > "$dir/concurrency-status.txt"
           snapshot > "$dir/.runs-before.ndjson"
-          jq -s -e --arg own "$GITHUB_RUN_ID" --arg start "$start" --arg end "$start" -f scripts/ci/assess-performance-overlap.jq "$dir/.runs-before.ndjson" > "$dir/concurrency-before.json"
+          jq -s -e --slurpfile before /dev/null --arg phase pre --arg own "$GITHUB_RUN_ID" --arg start "$start" --arg end "$start" -f scripts/ci/assess-performance-overlap.jq "$dir/.runs-before.ndjson" > "$dir/concurrency-before.json"
           if ! jq -e '.overlaps | length == 0' "$dir/concurrency-before.json" >/dev/null; then
             printf '%s\n' 'blocked: another performance workflow was active before calibration' > "$dir/concurrency-status.txt"
             exit 1
@@ -658,7 +659,7 @@ jobs:
             rc=$?
             trap - EXIT
             end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            if ! snapshot > "$dir/.runs-after.ndjson" || ! jq -s -e --arg own "$GITHUB_RUN_ID" --arg start "$start" --arg end "$end" -f scripts/ci/assess-performance-overlap.jq "$dir/.runs-after.ndjson" >/dev/null || ! jq -s -e --arg own "$GITHUB_RUN_ID" --arg start "$start" --arg end "$end" -f scripts/ci/assess-performance-overlap.jq "$dir/.runs-before.ndjson" "$dir/.runs-after.ndjson" > "$dir/concurrency-after.json"; then
+            if ! snapshot > "$dir/.runs-after.ndjson" || ! jq -s -e --slurpfile before "$dir/.runs-before.ndjson" --arg phase post --arg own "$GITHUB_RUN_ID" --arg start "$start" --arg end "$end" -f scripts/ci/assess-performance-overlap.jq "$dir/.runs-after.ndjson" > "$dir/concurrency-after.json"; then
               printf '%s\n' 'invalid: performance workflow inventory unavailable or malformed' > "$dir/concurrency-status.txt"
               rc=1
             elif ! jq -e '.overlaps | length == 0' "$dir/concurrency-after.json" >/dev/null; then

@@ -97,62 +97,86 @@ workflow="$here/../.github/workflows/performance.yml"
 ! grep -Fq 'before-ack-sampled-diagnostics/*.log' "$workflow"
 grep -Fq 'before-ack-sampled-diagnostics/*-sanitized.json' "$workflow"
 grep -Fq 'before-ack-sampled-diagnostics/concurrency-after.json' "$workflow"
-grep -Fq '"$dir/.runs-after.ndjson" >/dev/null' "$workflow"
+grep -Fq -- '--slurpfile before' "$workflow"
 overlap_filter="$here/../scripts/ci/assess-performance-overlap.jq"
+pages_filter="$here/../scripts/ci/flatten-performance-pages.jq"
+jq -e -c -f "$pages_filter" <<<'[{"total_count":2,"workflow_runs":[{"id":1}]},{"total_count":2,"workflow_runs":[{"id":2}]}]' | jq -s -e 'length == 2' >/dev/null
+if jq -e -c -f "$pages_filter" <<<'[{"total_count":2,"workflow_runs":[{"id":1}]}]' >/dev/null 2>&1; then printf 'missing page accepted\n' >&2; exit 1; fi
+if jq -e -c -f "$pages_filter" <<<'[{"total_count":1,"workflow_runs":[{"id":1}]},{"total_count":2,"workflow_runs":[{"id":2}]}]' >/dev/null 2>&1; then printf 'changing page count accepted\n' >&2; exit 1; fi
 run_assessment() {
- jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter"
+ jq -s -e --slurpfile before /dev/null --arg phase pre --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter"
 }
-no_overlap='{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
-{"id":2,"status":"completed","created_at":"2026-01-01T08:00:00Z","run_started_at":"2026-01-01T08:00:00Z","updated_at":"2026-01-01T09:59:59Z"}'
+no_overlap='{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"run_attempt":1,"id":2,"status":"completed","created_at":"2026-01-01T08:00:00Z","run_started_at":"2026-01-01T08:00:00Z","updated_at":"2026-01-01T09:59:59Z"}'
 run_assessment <<<"$no_overlap" | jq -e '.overlaps | length == 0' >/dev/null
 for bad in '2026-99-99T99:99:99Z' '2026-02-30T10:00:00Z'; do
- if jq -s -e --arg own 1 --arg start "$bad" --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+ if jq -s -e --slurpfile before /dev/null --arg phase pre --arg own 1 --arg start "$bad" --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
   printf 'impossible start timestamp accepted\n' >&2; exit 1
  fi
- if jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end "$bad" -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+ if jq -s -e --slurpfile before /dev/null --arg phase pre --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end "$bad" -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
   printf 'impossible end timestamp accepted\n' >&2; exit 1
  fi
 done
-if jq -s -e --arg own 1 --arg start '2026-01-01T10:05:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
+if jq -s -e --slurpfile before /dev/null --arg phase pre --arg own 1 --arg start '2026-01-01T10:05:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" >/dev/null 2>&1; then
  printf 'reversed measurement interval accepted\n' >&2; exit 1
 fi
-jq -s -e --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" | jq -e '.overlaps | length == 0' >/dev/null
-if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-02-30T10:00:00Z","run_started_at":"2026-02-30T10:00:00Z","updated_at":"2026-03-01T10:00:00Z"}' >/dev/null 2>&1; then
+jq -s -e --slurpfile before /dev/null --arg phase pre --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:00:00Z' -f "$overlap_filter" <<<"$no_overlap" | jq -e '.overlaps | length == 0' >/dev/null
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-02-30T10:00:00Z","run_started_at":"2026-02-30T10:00:00Z","updated_at":"2026-03-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'impossible run timestamp accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'run start later than update accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:30:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:30:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'run created later than start accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T10:00:01Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"queued","created_at":"2026-01-01T10:00:01Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'queued run created later than update accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":1,"status":"completed","created_at":"2026-01-01T10:00:02Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"completed","created_at":"2026-01-01T10:00:02Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'started run created later than update accepted\n' >&2; exit 1
 fi
-run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
-run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
-run_assessment <<<'{"id":1,"status":"completed","created_at":"2026-01-01T10:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
-run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T10:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
-run_assessment <<<'{"id":1,"status":"queued","created_at":"2026-01-01T09:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
-if run_assessment <<<'{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
-{"id":2,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
+run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"run_attempt":1,"id":1,"status":"completed","created_at":"2026-01-01T10:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"run_attempt":1,"id":1,"status":"queued","created_at":"2026-01-01T10:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+run_assessment <<<'{"run_attempt":1,"id":1,"status":"queued","created_at":"2026-01-01T09:00:00Z","run_started_at":null,"updated_at":"2026-01-01T10:00:00Z"}' | jq -e '.overlaps | length == 0' >/dev/null
+if run_assessment <<<'{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"run_attempt":1,"id":2,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T10:00:01Z","updated_at":"2026-01-01T10:00:00Z"}' >/dev/null 2>&1; then
  printf 'another run start later than update accepted\n' >&2; exit 1
 fi
-overlap='{"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
-{"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}'
+overlap='{"run_attempt":1,"id":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}
+{"run_attempt":1,"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}'
 run_assessment <<<"$overlap" | jq -e '.overlaps | length == 1 and .[0].id == 3' >/dev/null
 if run_assessment </dev/null >/dev/null 2>&1; then
  printf 'empty overlap inventory accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":3,"status":"completed","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:30:00Z","updated_at":"2026-01-01T10:02:00Z"}' >/dev/null 2>&1; then
  printf 'overlap inventory without own run accepted\n' >&2; exit 1
 fi
-if run_assessment <<<'{"id":4,"status":"SENTINEL_PRIVATE"}' >/dev/null 2>&1; then
+if run_assessment <<<'{"run_attempt":1,"id":4,"status":"SENTINEL_PRIVATE"}' >/dev/null 2>&1; then
  printf 'malformed overlap inventory accepted\n' >&2; exit 1
 fi
+old='{"id":2,"run_attempt":1,"status":"completed","created_at":"2026-01-01T08:00:00Z","run_started_at":"2026-01-01T08:00:00Z","updated_at":"2026-01-01T07:00:00Z"}'
+own='{"id":1,"run_attempt":1,"status":"in_progress","created_at":"2026-01-01T09:00:00Z","run_started_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-01T10:00:00Z"}'
+printf '%s\n%s\n' "$own" "$old" > "$scratch/pre.ndjson"
+run_assessment < "$scratch/pre.ndjson" | jq -e '.overlaps | length == 0' >/dev/null
+post_assessment() {
+ jq -s -e --slurpfile before "$scratch/pre.ndjson" --arg phase post --arg own 1 --arg start '2026-01-01T10:00:00Z' --arg end '2026-01-01T10:05:00Z' -f "$overlap_filter"
+}
+post_assessment < "$scratch/pre.ndjson" | jq -e '.overlaps | length == 0' >/dev/null
+if post_assessment <<<"$own" >/dev/null 2>&1; then printf 'missing prior run accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n' "$own" "$old" | sed 's/"run_attempt":1/"run_attempt":2/g' | post_assessment >/dev/null 2>&1; then printf 'changed attempt accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n%s\n' "$own" "$old" "$old" | post_assessment >/dev/null 2>&1; then printf 'duplicate page entry accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n%s\n' "$own" "$old" "$old" | run_assessment >/dev/null 2>&1; then printf 'duplicate pre page entry accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n' "$own" "$old" | sed 's/"status":"completed"/"status":"in_progress"/' | post_assessment >/dev/null 2>&1; then printf 'changed completed status accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n' "$own" "$old" | sed 's/07:00:00Z/07:01:00Z/' | post_assessment >/dev/null 2>&1; then printf 'changed malformed old run accepted\n' >&2; exit 1; fi
+new_old='{"id":4,"run_attempt":1,"status":"completed","created_at":"2026-01-01T08:00:00Z","run_started_at":"2026-01-01T08:00:00Z","updated_at":"2026-01-01T07:00:00Z"}'
+if printf '%s\n%s\n%s\n' "$own" "$old" "$new_old" | post_assessment >/dev/null 2>&1; then printf 'new malformed old run accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n%s\n' "$own" "$old" "${new_old/07:00:00Z/09:00:00Z}" | post_assessment >/dev/null 2>&1; then printf 'old run missing from pre accepted\n' >&2; exit 1; fi
+if printf '%s\n%s\n' "$own" "$old" | sed 's/08:00:00Z/10:01:00Z/g' | run_assessment >/dev/null 2>&1; then printf 'recent malformed run accepted\n' >&2; exit 1; fi
+new='{"id":3,"run_attempt":1,"status":"in_progress","created_at":"2026-01-01T10:01:00Z","run_started_at":"2026-01-01T10:01:00Z","updated_at":"2026-01-01T10:01:00Z"}'
+printf '%s\n%s\n%s\n' "$own" "$old" "$new" | post_assessment | jq -e '.overlaps | length == 1 and .[0].id == 3' >/dev/null
 mkdir -p "$scratch/bin" "$scratch/base-server"
 cat > "$scratch/bin/go" <<'MOCK'
 #!/usr/bin/env bash
