@@ -2379,6 +2379,11 @@ func (n *Node) replayLocalDecisionsFrom(ctx context.Context) (quepaxa.Slot, erro
 }
 
 func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot) (quepaxa.Slot, error) {
+	return n.replayLocalDecisionsToObserved(ctx, through, nil)
+}
+
+// phase is used only by catch-up logging; errors and all replay behavior remain unchanged.
+func (n *Node) replayLocalDecisionsToObserved(ctx context.Context, through quepaxa.Slot, phase *string) (quepaxa.Slot, error) {
 	// Archive catch-up and checkpoint verification can both request local
 	// replay. Keep the tip read, decision selection, apply, and restore-suffix
 	// state transition under one owner so neither path races or replays stale
@@ -2398,6 +2403,9 @@ func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot)
 				limit = int(remaining)
 			}
 		}
+		if phase != nil {
+			*phase = "decision-read"
+		}
 		decisions, tip, err := n.core.DecisionsFrom(from, limit)
 		if err != nil {
 			return from, err
@@ -2408,9 +2416,15 @@ func (n *Node) replayLocalDecisionsTo(ctx context.Context, through quepaxa.Slot)
 		// HA certified hints may be memory-only. Local cannot accept hints and
 		// its reclaim callback already owns the non-reentrant execution gate.
 		if !n.core.LocalMode() && len(decisions) != 0 {
+			if phase != nil {
+				*phase = "durability"
+			}
 			if err := n.core.EnsureDurableThrough(ctx, decisions[len(decisions)-1].Slot); err != nil {
 				return from, err
 			}
+		}
+		if phase != nil {
+			*phase = "materialize"
 		}
 		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
 			for _, decision := range decisions {
@@ -2584,6 +2598,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 
 type catchUpDiagnosticError struct {
 	stage           string
+	replayPhase     string
 	from, remoteTip quepaxa.Slot
 	remoteTipKnown  bool
 	cause           error
@@ -2670,6 +2685,7 @@ func catchUpCauseCode(err error) (code, extended int, known bool, fileOp string)
 func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catchUpAttempt, emit func(...any)) {
 	for i, attempt := range attempts {
 		stage, from, remoteTip, known := "unknown", quepaxa.Slot(0), quepaxa.Slot(0), false
+		replayPhase := "unknown"
 		var failure *catchUpDiagnosticError
 		if errors.As(attempt.err, &failure) {
 			switch failure.stage {
@@ -2677,6 +2693,12 @@ func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catc
 				stage = failure.stage
 			}
 			from, remoteTip, known = failure.from, failure.remoteTip, failure.remoteTipKnown
+			if stage == "local-replay" {
+				switch failure.replayPhase {
+				case "decision-read", "durability", "materialize":
+					replayPhase = failure.replayPhase
+				}
+			}
 		}
 		rpc := network.PeerRPCDiagnostic{Phase: "unknown"}
 		rpcKnown := false
@@ -2699,7 +2721,7 @@ func logOperationSyncFailure(local quepaxa.NodeID, round uint64, attempts []catc
 		if class == "sqlite" || class == "filesystem" {
 			code, extended, codeKnown, fileOp = catchUpCauseCode(attempt.err)
 		}
-		emit(fmt.Sprintf("operation sync deferred: error_class=%s error_code_known=%t error_code=%d error_extended=%d file_op=%s node_hash=%x round=%d attempt=%d count=%d source_hash=%x start_tip=%d end_tip=%d elapsed_us=%d stage=%s from=%d remote_tip_known=%t remote_tip=%d rpc_known=%t rpc_phase=%s rpc_elapsed_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d rpc_total_known=%t rpc_total_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d", class, codeKnown, code, extended, fileOp, sha256.Sum256([]byte(local)), round, i+1, len(attempts), sha256.Sum256([]byte(attempt.source)), attempt.startTip, attempt.endTip, attempt.elapsed.Microseconds(), stage, from, known, remoteTip, rpcKnown, rpc.Phase, rpc.Elapsed.Microseconds(), rpc.ConnectionKnown, rpc.ConnectionElapsed.Microseconds(), rpc.RequestKnown, rpc.RequestElapsed.Microseconds(), rpc.TotalKnown, rpc.TotalElapsed.Microseconds(), rpc.GateWaitKnown, rpc.GateWait.Microseconds(), rpc.MutexWaitKnown, rpc.MutexWait.Microseconds(), rpc.DialMeasured, rpc.DialElapsed.Microseconds(), rpc.DialDeadlineKnown, rpc.DialRemaining.Microseconds()))
+		emit(fmt.Sprintf("operation sync deferred: error_class=%s error_code_known=%t error_code=%d error_extended=%d file_op=%s node_hash=%x round=%d attempt=%d count=%d source_hash=%x start_tip=%d end_tip=%d elapsed_us=%d stage=%s from=%d remote_tip_known=%t remote_tip=%d rpc_known=%t rpc_phase=%s rpc_elapsed_us=%d connection_known=%t connection_us=%d request_known=%t request_us=%d rpc_total_known=%t rpc_total_us=%d gate_wait_known=%t gate_wait_us=%d mutex_wait_known=%t mutex_wait_us=%d dial_measured=%t dial_us=%d dial_deadline_known=%t dial_remaining_us=%d replay_phase=%s", class, codeKnown, code, extended, fileOp, sha256.Sum256([]byte(local)), round, i+1, len(attempts), sha256.Sum256([]byte(attempt.source)), attempt.startTip, attempt.endTip, attempt.elapsed.Microseconds(), stage, from, known, remoteTip, rpcKnown, rpc.Phase, rpc.Elapsed.Microseconds(), rpc.ConnectionKnown, rpc.ConnectionElapsed.Microseconds(), rpc.RequestKnown, rpc.RequestElapsed.Microseconds(), rpc.TotalKnown, rpc.TotalElapsed.Microseconds(), rpc.GateWaitKnown, rpc.GateWait.Microseconds(), rpc.MutexWaitKnown, rpc.MutexWait.Microseconds(), rpc.DialMeasured, rpc.DialElapsed.Microseconds(), rpc.DialDeadlineKnown, rpc.DialRemaining.Microseconds(), replayPhase))
 	}
 }
 
@@ -2857,17 +2879,18 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 
 func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, source quepaxa.NodeID) (result error) {
 	stage, from := "local-replay", quepaxa.Slot(0)
+	replayPhase := "unknown"
 	var remoteTip quepaxa.Slot
 	var remoteTipKnown bool
 	defer func() {
 		if result != nil {
-			result = &catchUpDiagnosticError{stage: stage, from: from, remoteTip: remoteTip, remoteTipKnown: remoteTipKnown, cause: result}
+			result = &catchUpDiagnosticError{stage: stage, replayPhase: replayPhase, from: from, remoteTip: remoteTip, remoteTipKnown: remoteTipKnown, cause: result}
 		}
 	}()
 	for {
 		stage, from, remoteTip, remoteTipKnown = "local-replay", quepaxa.Slot(n.material.Tip())+1, 0, false
 		localtesthooks.Hit("node:catchup-peer:phase=before-local-replay:node=" + string(n.config.NodeID))
-		if replayFrom, err := n.replayLocalDecisionsFrom(ctx); err != nil {
+		if replayFrom, err := n.replayLocalDecisionsToObserved(ctx, 0, &replayPhase); err != nil {
 			from = replayFrom
 			return err
 		}

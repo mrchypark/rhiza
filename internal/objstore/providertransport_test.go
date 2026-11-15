@@ -43,9 +43,25 @@ func (t conditionalExpectContinueRoundTripper) RoundTrip(request *http.Request) 
 	if request.Header.Get("Expect") == "" {
 		request.Header.Set("Expect", "100-continue")
 	}
+	return traceConditionalPutRoundTrip(t.next, request, t.trace)
+}
+
+type conditionalObserveRoundTripper struct {
+	next  http.RoundTripper
+	trace *conditionalPutHTTPTrace
+}
+
+func (t conditionalObserveRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if !isLargeConditionalPut(request) {
+		return t.next.RoundTrip(request)
+	}
+	return traceConditionalPutRoundTrip(t.next, request, t.trace)
+}
+
+func traceConditionalPutRoundTrip(next http.RoundTripper, request *http.Request, traceObserver *conditionalPutHTTPTrace) (*http.Response, error) {
 	var attempt *conditionalPutHTTPTraceAttempt
-	if t.trace != nil {
-		attempt = t.trace.beginAttempt(request.ContentLength, request.Header.Get("Expect") == "100-continue")
+	if traceObserver != nil {
+		attempt = traceObserver.beginAttempt(request.ContentLength, request.Header.Get("Expect") == "100-continue")
 		if attempt != nil {
 			trace := &httptrace.ClientTrace{
 				WroteHeaders:         func() { attempt.record("wrote_headers", 0, "") },
@@ -59,11 +75,41 @@ func (t conditionalExpectContinueRoundTripper) RoundTrip(request *http.Request) 
 			request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
 		}
 	}
-	response, err := t.next.RoundTrip(request)
+	response, err := next.RoundTrip(request)
 	if attempt != nil {
 		attempt.recordRoundTrip(response, err)
+		if response != nil && response.Body != nil {
+			response.Body = &conditionalTraceResponseBody{ReadCloser: response.Body, attempt: attempt}
+		}
 	}
 	return response, err
+}
+
+type conditionalTraceResponseBody struct {
+	io.ReadCloser
+	attempt *conditionalPutHTTPTraceAttempt
+	bytes   atomic.Int64
+}
+
+func (r *conditionalTraceResponseBody) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	count := r.bytes.Add(int64(n))
+	if err != nil {
+		event := "response_body_error"
+		class := safeHTTPTraceErrorClass(err)
+		if err == io.EOF {
+			event = "response_body_eof"
+			class = "none"
+		}
+		r.attempt.recordBody(event, count, class)
+	}
+	return n, err
+}
+
+func (r *conditionalTraceResponseBody) Close() error {
+	err := r.ReadCloser.Close()
+	r.attempt.recordBody("response_body_close", r.bytes.Load(), safeHTTPTraceErrorClass(err))
+	return err
 }
 
 func isLargeConditionalPut(request *http.Request) bool {
@@ -83,6 +129,7 @@ type conditionalPutHTTPTraceEvent struct {
 	ProtoMajor    int    `json:"proto_major,omitempty"`
 	ProtoMinor    int    `json:"proto_minor,omitempty"`
 	ResponseClose bool   `json:"response_close,omitempty"`
+	ResponseBytes int64  `json:"response_body_bytes,omitempty"`
 }
 
 type conditionalPutHTTPTraceSnapshot struct {
@@ -135,6 +182,21 @@ func (a *conditionalPutHTTPTraceAttempt) record(event string, status int, errorC
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.recordLocked(a, event, status, errorClass, nil)
+}
+
+func (a *conditionalPutHTTPTraceAttempt) recordBody(event string, size int64, errorClass string) {
+	t := a.trace
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	if len(t.events) >= maxConditionalPutTraceEvents {
+		t.droppedEvents++
+		return
+	}
+	t.order++
+	t.events = append(t.events, conditionalPutHTTPTraceEvent{Attempt: a.index, Order: t.order, ElapsedNS: time.Since(a.started).Nanoseconds(), Event: event, ErrorClass: errorClass, ContentLength: a.contentLength, Expect: a.expect, ResponseBytes: size})
 }
 
 func (a *conditionalPutHTTPTraceAttempt) recordRoundTrip(response *http.Response, err error) {
@@ -316,7 +378,7 @@ func (f providerTransportRoundTripperFunc) RoundTrip(request *http.Request) (*ht
 }
 
 func newConditionalExpectVersityBucket(cfg Config, enabled bool, trace *conditionalPutHTTPTrace) (*MeteredBucket, error) {
-	if !enabled {
+	if !enabled && trace == nil {
 		return NewBucket(cfg)
 	}
 	if err := ValidateConfig(cfg); err != nil {
@@ -329,20 +391,59 @@ func newConditionalExpectVersityBucket(cfg Config, enabled bool, trace *conditio
 		SessionToken: cfg.SessionToken, MaxRetries: cfg.MaxRetries,
 	}, "rhiza", func(next http.RoundTripper) http.RoundTripper {
 		transport, ok := next.(*http.Transport)
-		if !ok {
+		if enabled && !ok {
 			return providerTransportRoundTripperFunc(func(*http.Request) (*http.Response, error) {
 				return nil, errors.New("conditional Expect test requires net/http.Transport")
 			})
 		}
-		transport = transport.Clone()
-		transport.ExpectContinueTimeout = time.Second
-		next = conditionalExpectContinueRoundTripper{next: transport, trace: trace}
+		if enabled {
+			transport = transport.Clone()
+			transport.ExpectContinueTimeout = time.Second
+			next = conditionalExpectContinueRoundTripper{next: transport, trace: trace}
+		} else {
+			next = conditionalObserveRoundTripper{next: next, trace: trace}
+		}
 		return metrics.transport(wrapTestObserver(cfg.Endpoint, next))
 	})
 	if err != nil {
 		return nil, err
 	}
 	return newMeteredBucket(bucket, metrics), nil
+}
+
+func TestConditionalObserveBaselineDoesNotChangeRequest(t *testing.T) {
+	trace := newConditionalPutHTTPTrace()
+	request, err := http.NewRequest(http.MethodPut, "https://example.invalid/private-key", strings.NewReader("private-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ContentLength = testConditionalExpectContinueMinSize
+	request.Header.Set("If-None-Match", "*")
+	request.Header.Set("Authorization", "private-credential")
+	observer := conditionalObserveRoundTripper{trace: trace, next: providerTransportRoundTripperFunc(func(got *http.Request) (*http.Response, error) {
+		if got.Header.Get("Expect") != "" || got.Header.Get("If-None-Match") != "*" || got.Header.Get("Authorization") != "private-credential" {
+			t.Fatal("observation altered request headers")
+		}
+		return &http.Response{StatusCode: http.StatusPreconditionFailed, Body: io.NopCloser(strings.NewReader("private-response"))}, nil
+	})}
+	response, err := observer.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err = response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := trace.closeAndSnapshot()
+	if !hasConditionalPutHTTPTraceEvent(snapshot, 1, "round_trip_result", http.StatusPreconditionFailed) || !hasConditionalPutHTTPTraceEvent(snapshot, 1, "response_body_eof", 0) {
+		t.Fatalf("missing response events: %+v", snapshot)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil || strings.Contains(string(encoded), "private-") {
+		t.Fatalf("trace exposed private material or failed to marshal: %v", err)
+	}
 }
 
 func TestConditionalExpectContinuePolicy(t *testing.T) {

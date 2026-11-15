@@ -48,6 +48,14 @@ type Server struct {
 	err           error
 }
 
+func newFixtureIdentity(source io.Reader) (runID, accessKey, secretKey string, err error) {
+	var nonce [48]byte
+	if _, err = io.ReadFull(source, nonce[:]); err != nil {
+		return "", "", "", err
+	}
+	return hex.EncodeToString(nonce[:16]), "versity-" + hex.EncodeToString(nonce[16:32]), "versity-secret-" + hex.EncodeToString(nonce[32:]), nil
+}
+
 const childSupervisorScript = `
 umask 077
 output=$1
@@ -189,11 +197,12 @@ func Start(ctx context.Context, binary, parentDir string) (*Server, error) {
 	if err := listener.Close(); err != nil {
 		return nil, err
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	// RunID is exposed in object keys and evidence paths. Never derive either
+	// credential from it (or derive the secret from the logged access key).
+	token, accessKey, secretKey, err := newFixtureIdentity(rand.Reader)
+	if err != nil {
 		return nil, err
 	}
-	token := hex.EncodeToString(nonce[:])
 	evidenceBase := os.Getenv("RHIZA_VERSITY_EVIDENCE_DIR")
 	if evidenceBase == "" {
 		return nil, fmt.Errorf("RHIZA_VERSITY_EVIDENCE_DIR must name a persistent directory outside Go temp")
@@ -210,8 +219,8 @@ func Start(ctx context.Context, binary, parentDir string) (*Server, error) {
 	childArgs := []string{binary, "--port", addr, "--iam-dir", iamDir, "--access-log", logPath, "--quiet", "posix", dataDir}
 	completionPath := filepath.Join(evidenceDir, "gateway-complete")
 	cmd, shutdownPipe, err := startSupervisedChild(outputPath, completionPath, childArgs, []string{
-		"ROOT_ACCESS_KEY=versity-" + token,
-		"ROOT_SECRET_KEY=versity-secret-" + token,
+		"ROOT_ACCESS_KEY=" + accessKey,
+		"ROOT_SECRET_KEY=" + secretKey,
 		"PATH=/usr/bin:/bin",
 	})
 	if err != nil {
@@ -220,8 +229,8 @@ func Start(ctx context.Context, binary, parentDir string) (*Server, error) {
 	}
 	_ = output.Close()
 	s := &Server{
-		Endpoint: "http://" + addr, AccessKey: "versity-" + token,
-		SecretKey: "versity-secret-" + token, Root: root, LogPath: logPath,
+		Endpoint: "http://" + addr, AccessKey: accessKey,
+		SecretKey: secretKey, Root: root, LogPath: logPath,
 		OutputPath: outputPath, CompletionPath: completionPath, EvidenceDir: evidenceDir,
 		Version:      strings.TrimSpace(string(versionOut)),
 		BinarySHA256: hex.EncodeToString(hash.Sum(nil)), RunID: token, cmd: cmd,

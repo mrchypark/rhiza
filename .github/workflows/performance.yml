@@ -367,7 +367,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(pkg/recovery/archive\.go|internal/objstore/transport_observer_enabled\.go|internal/objstore/transport_observer_test\.go|pkg/node/foreground_cost_lifecycle_test\.go)$'; then
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(pkg/recovery/archive\.go|internal/objstore/transport_observer_enabled\.go|internal/objstore/transport_observer_test\.go|internal/objstore/providertransport_test\.go|internal/objstore/versity_conditional_put_test\.go|internal/objstore/conditional_put_ambiguity_test\.go|internal/objstore/versityfixture/.*\.go|scripts/ci/versity-conditional-(diagnostic(-test)?|cleanup-gate)\.sh|\.github/workflows/performance\.yml|pkg/node/foreground_cost_lifecycle_test\.go)$'; then
             echo 'required=true' >> "$GITHUB_OUTPUT"
           else
             echo 'required=false' >> "$GITHUB_OUTPUT"
@@ -421,7 +421,50 @@ jobs:
             printf 'versity_version=%s\n' "$binary_version"
           } >"$evidence_dir/environment.txt"
 
+      - name: Trace independent Versity conditional PUT cases
+        id: versity-conditional-diagnostic
+        continue-on-error: true
+        env:
+          CGO_ENABLED: "1"
+          RHIZA_DIAGNOSTIC_DIR: ${{ runner.temp }}/versity-conditional-diagnostic
+          # Keep raw server output out of artifacts: only the bounded,
+          # non-secret client trace and aggregated server counts are uploaded.
+          RHIZA_DIAGNOSTIC_RAW_DIR: ${{ runner.temp }}/versity-conditional-raw
+        run: |
+          sh scripts/ci/versity-conditional-diagnostic-test.sh
+          sh scripts/ci/versity-conditional-diagnostic.sh
+
+      - name: Upload baseline conditional PUT trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: versity-conditional-baseline-${{ github.run_id }}
+          path: ${{ runner.temp }}/versity-conditional-diagnostic/baseline
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Expect conditional PUT trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: versity-conditional-expect-${{ github.run_id }}
+          path: ${{ runner.temp }}/versity-conditional-diagnostic/expect
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Confirm diagnostic gateways stopped
+        id: versity-cleanup-gate
+        if: always() && !cancelled()
+        env:
+          RHIZA_DIAGNOSTIC_DIR: ${{ runner.temp }}/versity-conditional-diagnostic
+          RHIZA_DIAGNOSTIC_RAW_DIR: ${{ runner.temp }}/versity-conditional-raw
+          CURRENT_CLEANUP_CONFIRMED: ${{ steps.versity-conditional-diagnostic.outputs.cleanup_confirmed }}
+        run: |
+          test "$CURRENT_CLEANUP_CONFIRMED" = true
+          sh scripts/ci/versity-conditional-cleanup-gate.sh
+
       - name: Run local provider and foreground evidence serially
+        if: ${{ success() && steps.versity-cleanup-gate.outcome == 'success' }}
         env:
           CGO_ENABLED: "1"
           RHIZA_VERSITY_EVIDENCE_DIR: ${{ runner.temp }}/issue-185-cost-evidence/versity-raw
@@ -507,10 +550,6 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -timeout=2m ./internal/objstore \
             -run '^TestVersitySDKRetryEvidence$'
-          run_logged versity-conditional-large-put env \
-            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
-            go test -count=1 -v -timeout=2m ./internal/objstore \
-            -run '^TestVersityConditionalLargePutEvidence$'
           run_logged archive-attribution-regression env \
             CGO_ENABLED=1 go test -count=1 -v -tags rhiza_local_testhooks -timeout=2m ./pkg/recovery \
             -run '^TestArchiveExtentAttributionActualGuard$'
@@ -557,12 +596,24 @@ jobs:
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
 
+      - name: Require both conditional PUT diagnostics to pass
+        if: always() && !cancelled()
+        env:
+          DIAGNOSTIC_OUTCOME: ${{ steps.versity-conditional-diagnostic.outcome }}
+        run: test "$DIAGNOSTIC_OUTCOME" = success
+
       - name: Upload issue 185 cost evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: issue-185-cost-evidence-${{ github.run_id }}
-          path: ${{ runner.temp }}/issue-185-cost-evidence
+          # The unfiltered server logs can contain request identifiers or
+          # credentials. Retain sanitized test summaries and completion
+          # markers only; diagnostic HTTP events use a bounded schema.
+          path: |
+            ${{ runner.temp }}/issue-185-cost-evidence
+            !${{ runner.temp }}/issue-185-cost-evidence/**/s3-access.log
+            !${{ runner.temp }}/issue-185-cost-evidence/**/server-output.log
           if-no-files-found: error
           retention-days: 30
 

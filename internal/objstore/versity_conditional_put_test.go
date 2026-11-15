@@ -40,7 +40,7 @@ func TestVersityConditionalLargePutExpectEvidence(t *testing.T) {
 
 func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	t.Helper()
-	traceEnabled := expectContinue && os.Getenv("RHIZA_VERSITY_HTTP_TRACE") == "1"
+	traceEnabled := os.Getenv("RHIZA_VERSITY_HTTP_TRACE") == "1"
 	bin := os.Getenv("RHIZA_VERSITYGW_BIN")
 	if bin == "" {
 		t.Skip("set RHIZA_VERSITYGW_BIN to a pinned local Versity Gateway binary")
@@ -80,9 +80,10 @@ func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	}
 	const payloadSize = 7 << 20
 	payload := bytes.Repeat([]byte{0x5a}, payloadSize)
+	seedPayload := bytes.Repeat([]byte{0x41}, payloadSize)
 	payloadHash := sha256.Sum256(payload)
 	key := "issue185/conditional-put/" + server.RunID + "/archive/blocks/" + hex.EncodeToString(payloadHash[:]) + ".bin"
-	if _, err := setup.PutObject(ctx, bucketName, key, bytes.NewReader(payload), int64(len(payload)), minio.PutObjectOptions{}); err != nil {
+	if _, err := setup.PutObject(ctx, bucketName, key, bytes.NewReader(seedPayload), int64(len(seedPayload)), minio.PutObjectOptions{}); err != nil {
 		t.Fatalf("seed task-owned object: %v", err)
 	}
 	seed, err := setup.GetObject(ctx, bucketName, key, minio.GetObjectOptions{})
@@ -91,8 +92,8 @@ func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	}
 	seedBody, seedReadErr := io.ReadAll(io.LimitReader(seed, payloadSize+1))
 	seedCloseErr := seed.Close()
-	if seedReadErr != nil || seedCloseErr != nil || !bytes.Equal(seedBody, payload) {
-		t.Fatalf("seed readback valid=%t read_error=%t close_error=%t", bytes.Equal(seedBody, payload), seedReadErr != nil, seedCloseErr != nil)
+	if seedReadErr != nil || seedCloseErr != nil || !bytes.Equal(seedBody, seedPayload) {
+		t.Fatalf("seed readback valid=%t read_error=%t close_error=%t", bytes.Equal(seedBody, seedPayload), seedReadErr != nil, seedCloseErr != nil)
 	}
 	seedClientAttempts, seedClientResponses := setupCounts.Snapshot()
 
@@ -127,7 +128,7 @@ func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 		closeErr := readback.Close()
 		readbackSize = len(readbackBody)
 		readbackHash = sha256.Sum256(readbackBody)
-		readbackOK = readErr == nil && closeErr == nil && readbackSize == payloadSize && bytes.Equal(readbackBody, payload)
+		readbackOK = readErr == nil && closeErr == nil && readbackSize == payloadSize && bytes.Equal(readbackBody, seedPayload)
 	}
 	readbackStats := bucket.Stats()
 	bucket.Close()

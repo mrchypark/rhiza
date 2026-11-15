@@ -1,6 +1,7 @@
 package versityfixture
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,21 @@ import (
 	"testing"
 	"time"
 )
+
+func TestFixtureIdentitySeparatesLoggedRunAndCredentials(t *testing.T) {
+	entropy := append(bytes.Repeat([]byte{1}, 16), bytes.Repeat([]byte{2}, 16)...)
+	entropy = append(entropy, bytes.Repeat([]byte{3}, 16)...)
+	run, access, secret, err := newFixtureIdentity(bytes.NewReader(entropy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run != strings.Repeat("01", 16) || access != "versity-"+strings.Repeat("02", 16) || secret != "versity-secret-"+strings.Repeat("03", 16) {
+		t.Fatal("fixture identity did not use independent entropy slices")
+	}
+	if _, _, _, err := newFixtureIdentity(bytes.NewReader(entropy[:47])); err == nil {
+		t.Fatal("short entropy was accepted")
+	}
+}
 
 func TestRequestCountSkipsOnlyStartMetadata(t *testing.T) {
 	records := []string{
