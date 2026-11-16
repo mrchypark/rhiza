@@ -101,6 +101,14 @@ func (n *Node) managedStartupWALIdentity() string {
 var errManagedMembershipConflict = errors.New("managed checkpoint local membership conflict")
 
 func (n *Node) verifyManagedAppendOnlyCandidate(ctx context.Context, candidate quepaxa.ManagedCheckpointCandidate) error {
+	if n == nil {
+		return fmt.Errorf("managed append-only candidate verifier unavailable")
+	}
+	n.archiveMu.RLock()
+	defer n.archiveMu.RUnlock()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-append-only:verifier-archive-read")
+	}
 	if n == nil || n.checkpoints == nil || n.archive == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
 		return fmt.Errorf("managed append-only candidate verifier unavailable")
 	}

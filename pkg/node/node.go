@@ -50,6 +50,7 @@ type Node struct {
 	bucket                       *objectstore.MeteredBucket
 	checkpoints                  *checkpoint.Manager
 	archive                      *recovery.Manager
+	archiveMu                    sync.RWMutex
 	checkpointer                 *checkpoint.AutoCheckpointer
 	localStore                   *localCheckpointIdentity
 	localBackup                  *recovery.LocalArchive
@@ -3036,6 +3037,13 @@ func (n *Node) shutdownEngineWithArchiveSync(closeBucket, syncArchive bool) erro
 	// Existing certified decisions can be archived without a live quorum.
 	// Creating a new checkpoint here would instead require new consensus and
 	// make simultaneous or last-voter shutdown depend on peers staying alive.
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-append-only:shutdown-archive-lock")
+	}
+	n.archiveMu.Lock()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-append-only:shutdown-archive-locked")
+	}
 	if n.archive != nil {
 		if syncArchive && n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -3045,6 +3053,7 @@ func (n *Node) shutdownEngineWithArchiveSync(closeBucket, syncArchive bool) erro
 		n.archive.Close()
 		n.archive = nil
 	}
+	n.archiveMu.Unlock()
 	// Close WAL
 	if n.wal != nil {
 		shutdownErr = errors.Join(shutdownErr, n.wal.Sync(), n.wal.Close())
