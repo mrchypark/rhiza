@@ -1279,6 +1279,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	var failedSlot, tipBeforeReset uint64
 	var failedSlotKnown, tipKnown bool
 	var rollbackWitness *rollbackWitnessConn
+	var autoRollbackWitnessed bool
 	makePoison := func(trigger applydiag.PoisonTrigger, primary, cleanup error) applydiag.PoisonOrigin {
 		primaryClass, primaryKnown, primaryCode := poisonErrorClass(primary)
 		cleanupClass, cleanupKnown, cleanupCode := poisonErrorClass(cleanup)
@@ -1289,13 +1290,17 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			_ = conn.Raw(func(driverConn any) error {
 				if witness, ok := driverConn.(*rollbackWitnessConn); ok {
 					rollbackWitness = witness
-					witness.armAutoRollback()
+					autoRollbackWitnessed = witness.armAutoRollback()
 				}
 				return nil
 			})
 		}
 		rollbackErr := tx.Rollback()
 		if rollbackErr == nil && !commitAttempted && rollbackWitness != nil && rollbackWitness.takeRetire() {
+			if autoRollbackWitnessed && localtesthooks.Enabled {
+				class, codeKnown, code := poisonErrorClass(applyErr)
+				localtesthooks.Hit(fmt.Sprintf("materializer:sqlite:writer:auto-rollback:id=%d:class=%s:code_known=%t:code=%d", rollbackWitness.id, class, codeKnown, code))
+			}
 			retireErr := conn.Raw(func(any) error { return sqldriver.ErrBadConn })
 			if !errors.Is(retireErr, sqldriver.ErrBadConn) {
 				rollbackErr = fmt.Errorf("retire apply connection: %w", retireErr)

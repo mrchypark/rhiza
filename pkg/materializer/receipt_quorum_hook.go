@@ -42,3 +42,29 @@ func (m *Materializer) TestInstallReceiptGate(ctx context.Context, entered chan<
 	}
 	return err
 }
+
+// TestRemoveReceiptGate removes only this fixture's writer trigger.
+func (m *Materializer) TestRemoveReceiptGate(ctx context.Context) error {
+	conn, err := m.writer.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = conn.ExecContext(ctx, `DROP TRIGGER IF EXISTS receipt_quorum_gate_trigger`)
+	return err
+}
+
+// TestWriterConnectionID identifies the current physical writer connection.
+func (m *Materializer) TestWriterConnectionID(ctx context.Context) (uint64, error) {
+	conn, err := m.writer.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	var id uint64
+	err = conn.Raw(func(raw any) error {
+		id = raw.(*rollbackWitnessConn).id
+		return nil
+	})
+	return id, err
+}

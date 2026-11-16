@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/ncruces/go-sqlite3"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
+
+var rollbackWitnessConnectionID atomic.Uint64
 
 // openRollbackWitnessSQLite wraps only the single writer connection. Its
 // transaction boundary can suppress a redundant ROLLBACK after SQLite has
@@ -42,11 +46,16 @@ func (c *rollbackWitnessConnector) Connect(ctx context.Context) (driver.Conn, er
 		_ = conn.Close()
 		return nil, err
 	}
-	return &rollbackWitnessConn{Conn: sqliteConn, closed: make(chan struct{})}, nil
+	var id uint64
+	if localtesthooks.Enabled {
+		id = rollbackWitnessConnectionID.Add(1)
+	}
+	return &rollbackWitnessConn{Conn: sqliteConn, id: id, closed: make(chan struct{})}, nil
 }
 
 type rollbackWitnessConn struct {
 	sqlite3driver.Conn
+	id                   uint64
 	mu                   sync.Mutex
 	tx                   *rollbackWitnessTx
 	retire               bool
@@ -135,6 +144,9 @@ func (c *rollbackWitnessConn) Close() error {
 		c.closeErr = err
 		close(c.closed)
 	})
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("materializer:sqlite:writer:close:id=%d:failed=%t", c.id, err != nil))
+	}
 	return err
 }
 
@@ -234,7 +246,11 @@ func (tx *rollbackWitnessTx) Rollback() error {
 	if tx.owner.tx == tx && tx.armed && !tx.done && !tx.commitAttempted && !tx.hasReset && tx.owner.Conn.Raw().GetAutocommit() {
 		tx.owner.retire = true
 		tx.finish()
+		id := tx.owner.id
 		tx.owner.mu.Unlock()
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("materializer:sqlite:writer:retire:id=%d", id))
+		}
 		return nil
 	}
 	cleanupErr := tx.owner.rollbackCleanupError

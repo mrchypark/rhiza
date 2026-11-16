@@ -5,7 +5,7 @@ package network
 import (
 	"bytes"
 	"context"
-	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -13,7 +13,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestLearnedQuorumOwnsCertifiedReceiptApplyAfterStreamCancel(t *testing.T) {
@@ -23,7 +23,7 @@ func TestLearnedQuorumOwnsCertifiedReceiptApplyAfterStreamCancel(t *testing.T) {
 	if _, err := p.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "setup", SQL: "CREATE TABLE receipt_probe(id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.servers["n3"].catchUpFrom(ctx, "n1", 1, true); err != nil {
+	if err := p.servers["n3"].catchUpFrom(ctx, "n1", p.cores["n1"].Tip(), true); err != nil {
 		t.Fatal(err)
 	}
 	entered := make(chan context.Context, 1)
@@ -163,7 +163,36 @@ func testLearnedOwnedApplyCloseDuringReceipt(t *testing.T, peerClose bool) {
 	if _, err := p.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "setup", SQL: "CREATE TABLE receipt_probe(id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.servers["n3"].catchUpFrom(ctx, "n1", 1, true); err != nil {
+	if _, err := p.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "seed", SQL: "INSERT INTO receipt_probe VALUES(7)"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.cores["n1"].WaitTip(ctx, 2); err != nil {
+		t.Fatalf("wait for locally certified seed: %v", err)
+	}
+	if err := p.servers["n3"].catchUpFrom(ctx, "n1", 2, true); err != nil {
+		t.Fatal(err)
+	}
+	seedDecisions, certifiedTip, err := p.cores["n3"].DecisionsFrom(1, 2)
+	if err != nil || certifiedTip != 2 || len(seedDecisions) != 2 {
+		t.Fatalf("seed decisions tip=%d count=%d err=%v", certifiedTip, len(seedDecisions), err)
+	}
+	if err := p.materials["n3"].ApplyBatch(ctx, seedDecisions); err != nil {
+		t.Fatalf("apply seed decisions: %v", err)
+	}
+	beforeTip := p.materials["n3"].Tip()
+	beforeStateTip := p.materials["n3"].StateTip()
+	if beforeTip != 2 || beforeStateTip != 2 {
+		t.Fatalf("slow peer initial tip=%d state_tip=%d", beforeTip, beforeStateTip)
+	}
+	beforeRows, err := p.materials["n3"].QueryResult(ctx, "SELECT id FROM receipt_probe ORDER BY id", nil)
+	if err != nil || len(beforeRows.Rows) != 1 || beforeRows.Rows[0][0] != int64(7) {
+		t.Fatalf("slow peer initial rows=%+v err=%v", beforeRows.Rows, err)
+	}
+	if _, found, err := p.materials["n3"].MutationReceipt(ctx, types.MutationSQL, "probe"); err != nil || found {
+		t.Fatalf("probe receipt before apply found=%t err=%v", found, err)
+	}
+	writerID, err := p.materials["n3"].TestWriterConnectionID(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
 	entered := make(chan context.Context, 1)
@@ -178,12 +207,40 @@ func testLearnedOwnedApplyCloseDuringReceipt(t *testing.T, peerClose bool) {
 	var fastOnce sync.Once
 	allowFast := func() { fastOnce.Do(func() { close(fast) }) }
 	t.Cleanup(allowFast)
+	var mu sync.Mutex
+	var retired, physicallyClosed, closeFailed bool
+	var witnessEvent, applyFailedEvent, applyCompleteEvent, handlerResultEvent string
+	var observedEvents []string
 	restore := localtesthooks.Set(func(event string) {
 		if strings.Contains(event, "network:learned:phase=received:node=n2:sender=n1:") {
 			select {
 			case <-fast:
 			case <-ctx.Done():
 			}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if event == fmt.Sprintf("materializer:sqlite:writer:retire:id=%d", writerID) {
+			retired = true
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("materializer:sqlite:writer:auto-rollback:id=%d:", writerID)) {
+			witnessEvent = event
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("materializer:sqlite:writer:close:id=%d:", writerID)) {
+			physicallyClosed = true
+			closeFailed = strings.HasSuffix(event, ":failed=true")
+		}
+		if strings.Contains(event, "network:learned:phase=apply-failed:node=n3:sender=n1:slot=3:") {
+			applyFailedEvent = event
+		}
+		if strings.Contains(event, "network:learned:phase=apply-complete:node=n3:sender=n1:slot=3") {
+			applyCompleteEvent = event
+		}
+		if strings.Contains(event, "network:learned:phase=handler-result:node=n3:sender=n1:slot=3:") {
+			handlerResultEvent = event
+		}
+		if strings.Contains(event, ":node=n3:") || strings.HasPrefix(event, "materializer:sqlite:writer:") {
+			observedEvents = append(observedEvents, event)
 		}
 	})
 	t.Cleanup(restore)
@@ -200,14 +257,14 @@ func testLearnedOwnedApplyCloseDuringReceipt(t *testing.T, peerClose bool) {
 	case <-ctx.Done():
 		t.Fatal("receipt gate not reached")
 	}
-	closed := make(chan error, 1)
+	closeDone := make(chan error, 1)
 	go func() {
 		if peerClose {
-			closed <- p.peerServers[2].Close()
+			closeDone <- p.peerServers[2].Close()
 			return
 		}
 		p.servers["n3"].Close()
-		closed <- nil
+		closeDone <- nil
 	}()
 	select {
 	case <-slowCtx.Done():
@@ -215,21 +272,76 @@ func testLearnedOwnedApplyCloseDuringReceipt(t *testing.T, peerClose bool) {
 		t.Fatal("server close did not cancel owned SQL")
 	}
 	select {
-	case <-closed:
+	case <-closeDone:
 		t.Fatal("server close returned before receipt gate released")
 	default:
 	}
 	releaseGate()
 	select {
-	case err := <-closed:
+	case err := <-closeDone:
 		if err != nil {
 			t.Fatalf("close: %v", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("server close did not join owned SQL")
 	}
-	if err := p.materials["n3"].Health(ctx); !errors.Is(err, materializer.ErrGraphCommitUnknown) {
-		t.Fatalf("local interruption must remain fail closed: %v", err)
+	if err := p.materials["n3"].Health(ctx); err != nil {
+		t.Fatalf("confirmed auto-rollback poisoned slow materializer: %v", err)
+	}
+	if tip, stateTip := p.materials["n3"].Tip(), p.materials["n3"].StateTip(); tip != beforeTip || stateTip != beforeStateTip {
+		t.Fatalf("slow peer tip changed across close: %d/%d, want %d/%d", tip, stateTip, beforeTip, beforeStateTip)
+	}
+	afterCloseRows, err := p.materials["n3"].QueryResult(ctx, "SELECT id FROM receipt_probe ORDER BY id", nil)
+	if err != nil || len(afterCloseRows.Rows) != 1 || afterCloseRows.Rows[0][0] != int64(7) {
+		t.Fatalf("slow peer rows changed across close=%+v err=%v", afterCloseRows.Rows, err)
+	}
+	if _, found, err := p.materials["n3"].MutationReceipt(ctx, types.MutationSQL, "probe"); err != nil || found {
+		t.Fatalf("interrupted probe exposed receipt found=%t err=%v", found, err)
+	}
+	mu.Lock()
+	gotRetired, gotClosed, gotCloseFailed := retired, physicallyClosed, closeFailed
+	gotWitness, gotApplyFailed := witnessEvent, applyFailedEvent
+	gotApplyComplete, gotHandlerResult := applyCompleteEvent, handlerResultEvent
+	gotEvents := append([]string(nil), observedEvents...)
+	mu.Unlock()
+	if !gotRetired || !gotClosed || gotCloseFailed {
+		t.Fatalf("writer retirement retired=%t closed=%t close_failed=%t", gotRetired, gotClosed, gotCloseFailed)
+	}
+	if gotWitness == "" || !strings.Contains(gotWitness, ":class=sqlite:code_known=true:code=9") {
+		t.Fatalf("auto-rollback witness=%q", gotWitness)
+	}
+	if gotApplyFailed == "" || !strings.Contains(gotApplyFailed, "sqlite3: interrupted") {
+		t.Fatalf("apply failure=%q events=%q", gotApplyFailed, gotEvents)
+	}
+	if gotApplyComplete != "" {
+		t.Fatalf("closed slow peer emitted a success ACK: %q events=%q", gotApplyComplete, gotEvents)
+	}
+	if gotHandlerResult == "" || strings.HasSuffix(gotHandlerResult, `:error=""`) {
+		t.Fatalf("closed slow peer returned success: %q events=%q", gotHandlerResult, gotEvents)
+	}
+	if err := p.materials["n3"].TestRemoveReceiptGate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replacementID, err := p.materials["n3"].TestWriterConnectionID(ctx)
+	if err != nil || replacementID == writerID {
+		t.Fatalf("old writer connection reused: old=%d new=%d err=%v", writerID, replacementID, err)
+	}
+	decision, ok := p.cores["n1"].CertifiedValue(3)
+	if !ok || decision.Slot != 3 || len(decision.Certificate) == 0 {
+		t.Fatalf("certified replay missing: found=%t slot=%d certificate=%d", ok, decision.Slot, len(decision.Certificate))
+	}
+	if err := p.materials["n3"].ApplyBatch(ctx, []quepaxa.DecidedValue{decision}); err != nil {
+		t.Fatalf("reapply certified slot: %v", err)
+	}
+	if receipt, found, err := p.materials["n3"].MutationReceipt(ctx, types.MutationSQL, "probe"); err != nil || !found || receipt.Slot != 3 || receipt.Status != types.MutationCommitted {
+		t.Fatalf("replayed receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+	replayedRows, err := p.materials["n3"].QueryResult(ctx, "SELECT id FROM receipt_probe ORDER BY id", nil)
+	if err != nil || len(replayedRows.Rows) != 2 || replayedRows.Rows[0][0] != int64(1) || replayedRows.Rows[1][0] != int64(7) {
+		t.Fatalf("replayed rows=%+v err=%v", replayedRows.Rows, err)
+	}
+	if tip, stateTip := p.materials["n3"].Tip(), p.materials["n3"].StateTip(); tip != 3 || stateTip != 3 {
+		t.Fatalf("replayed tip=%d state_tip=%d, want 3/3", tip, stateTip)
 	}
 	allowFast()
 	select {

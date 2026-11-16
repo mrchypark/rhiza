@@ -14,7 +14,6 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -494,6 +493,34 @@ func TestHAReadOwnedApplyShutdownJoinsReceipt(t *testing.T) {
 	if _, err := p.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE shutdown_probe(id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
+	beforeTip := p.materials["n1"].Tip()
+	if beforeTip != 1 {
+		t.Fatalf("initial tip=%d", beforeTip)
+	}
+	beforeRows, err := p.materials["n1"].QueryResult(ctx, "SELECT id FROM shutdown_probe", nil)
+	if err != nil || len(beforeRows.Rows) != 0 {
+		t.Fatalf("initial rows=%+v err=%v", beforeRows.Rows, err)
+	}
+	writerID, err := p.materials["n1"].TestWriterConnectionID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lifecycleMu sync.Mutex
+	var witnessEvent, closeEvent string
+	restore := localtesthooks.Set(func(event string) {
+		if !strings.HasPrefix(event, "materializer:sqlite:writer:") {
+			return
+		}
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
+		if strings.HasPrefix(event, fmt.Sprintf("materializer:sqlite:writer:auto-rollback:id=%d:", writerID)) {
+			witnessEvent = event
+		}
+		if strings.HasPrefix(event, fmt.Sprintf("materializer:sqlite:writer:close:id=%d:", writerID)) {
+			closeEvent = event
+		}
+	})
+	t.Cleanup(restore)
 	entered, release := make(chan context.Context, 1), make(chan struct{})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
@@ -546,8 +573,48 @@ func TestHAReadOwnedApplyShutdownJoinsReceipt(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("query not completed")
 	}
-	if err := p.materials["n1"].Health(ctx); !errors.Is(err, materializer.ErrGraphCommitUnknown) {
-		t.Fatalf("interrupted apply must remain unknown: %v", err)
+	if err := p.materials["n1"].Health(ctx); err != nil {
+		t.Fatalf("confirmed auto-rollback poisoned materializer: %v", err)
+	}
+	if tip := p.materials["n1"].Tip(); tip != beforeTip {
+		t.Fatalf("tip changed across shutdown: %d, want %d", tip, beforeTip)
+	}
+	afterCloseRows, err := p.materials["n1"].QueryResult(ctx, "SELECT id FROM shutdown_probe", nil)
+	if err != nil || len(afterCloseRows.Rows) != 0 {
+		t.Fatalf("rows changed across shutdown=%+v err=%v", afterCloseRows.Rows, err)
+	}
+	if _, found, err := p.materials["n1"].MutationReceipt(ctx, types.MutationSQL, "pending-shutdown"); err != nil || found {
+		t.Fatalf("interrupted query exposed receipt found=%t err=%v", found, err)
+	}
+	lifecycleMu.Lock()
+	gotWitness, gotClose := witnessEvent, closeEvent
+	lifecycleMu.Unlock()
+	if !strings.Contains(gotWitness, ":class=sqlite:code_known=true:code=9") || !strings.HasSuffix(gotClose, ":failed=false") {
+		t.Fatalf("writer lifecycle witness=%q close=%q", gotWitness, gotClose)
+	}
+	if err := p.materials["n1"].TestRemoveReceiptGate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replacementID, err := p.materials["n1"].TestWriterConnectionID(ctx)
+	if err != nil || replacementID == writerID {
+		t.Fatalf("old writer connection reused: old=%d new=%d err=%v", writerID, replacementID, err)
+	}
+	decision, ok := p.cores["n1"].CertifiedValue(2)
+	if !ok || decision.Slot != 2 || len(decision.Certificate) == 0 {
+		t.Fatalf("certified replay missing: found=%t slot=%d certificate=%d", ok, decision.Slot, len(decision.Certificate))
+	}
+	if err := p.materials["n1"].ApplyBatch(ctx, []quepaxa.DecidedValue{decision}); err != nil {
+		t.Fatalf("reapply certified slot: %v", err)
+	}
+	if receipt, found, err := p.materials["n1"].MutationReceipt(ctx, types.MutationSQL, "pending-shutdown"); err != nil || !found || receipt.Slot != 2 || receipt.Status != types.MutationCommitted {
+		t.Fatalf("replayed receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+	replayedRows, err := p.materials["n1"].QueryResult(ctx, "SELECT id FROM shutdown_probe", nil)
+	if err != nil || len(replayedRows.Rows) != 1 || replayedRows.Rows[0][0] != int64(1) {
+		t.Fatalf("replayed rows=%+v err=%v", replayedRows.Rows, err)
+	}
+	if tip, stateTip := p.materials["n1"].Tip(), p.materials["n1"].StateTip(); tip != 2 || stateTip != 2 {
+		t.Fatalf("replayed tip=%d state_tip=%d, want 2/2", tip, stateTip)
 	}
 	if len(p.servers["n1"].readReplayLimit) != 0 {
 		t.Fatal("worker admission leaked")
