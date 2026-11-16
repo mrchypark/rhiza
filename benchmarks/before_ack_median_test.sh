@@ -17,6 +17,16 @@ median_source=$(awk '
 [[ -n $median_source ]]
 eval "$median_source"
 
+assert_median() {
+	local label=$1 got=$2 want=$3
+	if jq -en --argjson got "$got" --argjson want "$want" \
+		'($got - $want) as $delta | (if $delta < 0 then -$delta else $delta end) <= 1e-9' >/dev/null; then
+		return
+	fi
+	printf 'median mismatch: %s got=%s want=%s\n' "$label" "$got" "$want" >&2
+	exit 1
+}
+
 write_sample() {
 	local file=$1 p99=$2 ops=$3 http=$4 put=$5
 	jq -n --argjson p99 "$p99" --argjson ops "$ops" --argjson http "$http" --argjson put "$put" \
@@ -51,10 +61,10 @@ candidate_files=(
 	"$sample_dir/rhiza-server-before-ack-candidate-3.json"
 )
 
-[[ $(before_ack_median result.p99_ms "${base_files[@]}") == 40.55908 ]]
-[[ $(before_ack_median result.p99_ms "${candidate_files[@]}") == 38.231271 ]]
-[[ $(before_ack_median result.success_ops_per_sec "${base_files[@]}") == 495.86748719638945 ]]
-[[ $(before_ack_median result.success_ops_per_sec "${candidate_files[@]}") == 501.74687930080256 ]]
+assert_median base_p99 "$(before_ack_median result.p99_ms "${base_files[@]}")" 40.55908
+assert_median candidate_p99 "$(before_ack_median result.p99_ms "${candidate_files[@]}")" 38.231271
+assert_median base_ops "$(before_ack_median result.success_ops_per_sec "${base_files[@]}")" 495.86748719638945
+assert_median candidate_ops "$(before_ack_median result.success_ops_per_sec "${candidate_files[@]}")" 501.74687930080256
 
 assert_workflow_line() {
 	if ! grep -Fqx -- "$1" "$workflow"; then
@@ -77,7 +87,7 @@ assert_workflow_line '          before_ack_candidate_http=$(before_ack_median ob
 assert_workflow_line '          before_ack_candidate_put=$(before_ack_median object_store_delta.http_put_requests "${before_ack_candidate_files[@]}")'
 assert_workflow_line '          bash benchmarks/before_ack_median_test.sh'
 
-call_count=$(awk '/^[[:space:]]+before_ack_(base|candidate)_[[:alnum:]_]+=\$$\(before_ack_median / { count++ } END { print count + 0 }' "$workflow")
+call_count=$(grep -Fc -- '$(before_ack_median ' "$workflow")
 [[ $call_count -eq 7 ]]
 if grep -Fq 'rhiza-server-before-ack-base-*.json' "$workflow" || grep -Fq 'rhiza-server-before-ack-candidate-*.json' "$workflow"; then
 	printf 'before-ack median still uses a wildcard input\n' >&2
@@ -86,7 +96,7 @@ fi
 
 # Unrelated matching-suffix files must not enter explicit sample selection.
 printf '{"p99_ms":null}\n' > "$sample_dir/rhiza-server-before-ack-base-1-client-result.json"
-[[ $(before_ack_median result.p99_ms "${base_files[@]}") == 40.55908 ]]
+assert_median base_p99_with_client_result "$(before_ack_median result.p99_ms "${base_files[@]}")" 40.55908
 
 if before_ack_median result.p99_ms "${base_files[@]:0:2}" >/dev/null 2>&1; then
 	printf 'missing sample count accepted\n' >&2
@@ -114,3 +124,5 @@ for nonfinite in NaN Infinity 1e999; do
 		exit 1
 	fi
 done
+
+printf 'PASS before-ack median regression\n'
