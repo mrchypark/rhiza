@@ -280,26 +280,35 @@ func retryCheckpointBarrier(ctx context.Context, value []byte, propose func(cont
 
 func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
 	if err := ctx.Err(); err != nil {
+		latencydiag.TraceRequestLockWait(ctx, 0, err, latencydiag.StartTagged(ctx))
 		return nil, err
 	}
 	hash := sha256.Sum256([]byte(id))
-	lock := s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
+	shard := uint16(hash[0])<<4 | uint16(hash[1])>>4
+	lock := s.requestLocks[shard]
+	waitStarted := latencydiag.StartTagged(ctx)
 	select {
 	case lock <- struct{}{}:
+		acquiredAt := requestLockAcquired(ctx)
 		if err := ctx.Err(); err != nil {
-			<-lock
+			latencydiag.TraceRequestLockWait(ctx, uint64(shard), err, waitStarted)
+			releaseInstrumentedRequestLock(ctx, lock, uint64(shard), acquiredAt)
 			return nil, err
 		}
 		select {
 		case <-s.proposalCtx.Done():
-			<-lock
+			latencydiag.TraceRequestLockWait(ctx, uint64(shard), ErrNotReady, waitStarted)
+			releaseInstrumentedRequestLock(ctx, lock, uint64(shard), acquiredAt)
 			return nil, ErrNotReady
 		default:
 		}
-		return func() { <-lock }, nil
+		latencydiag.TraceRequestLockWait(ctx, uint64(shard), nil, waitStarted)
+		return func() { releaseInstrumentedRequestLock(ctx, lock, uint64(shard), acquiredAt) }, nil
 	case <-ctx.Done():
+		latencydiag.TraceRequestLockWait(ctx, uint64(shard), ctx.Err(), waitStarted)
 		return nil, ctx.Err()
 	case <-s.proposalCtx.Done():
+		latencydiag.TraceRequestLockWait(ctx, uint64(shard), ErrNotReady, waitStarted)
 		return nil, ErrNotReady
 	}
 }
@@ -1680,21 +1689,32 @@ func (s *Server) execute(ctx context.Context, req ExecuteRequest, oneStatement b
 		return ExecuteResponse{}, err
 	}
 	defer lease.releaseCaller()
+	cloneStarted := latencydiag.StartTagged(ctx)
 	command, err = cloneSQLCommand(command)
+	latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueClone, err, cloneStarted)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
+	validateStarted := latencydiag.StartTagged(ctx)
 	if oneStatement && len(command.Statements) != 0 {
-		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
+		err = fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
+		latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueValidate, err, validateStarted)
+		return ExecuteResponse{}, err
 	}
 	if err := validateSQLCommand(command); err != nil {
+		latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueValidate, err, validateStarted)
 		return ExecuteResponse{}, err
 	}
+	latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueValidate, nil, validateStarted)
+	fingerprintStarted := latencydiag.StartTagged(ctx)
 	fingerprint, err := types.SQLFingerprint(command)
+	latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueFingerprint, err, fingerprintStarted)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
+	encodeStarted := latencydiag.StartTagged(ctx)
 	encoded, err := encodeSQLCommand(command)
+	latencydiag.TraceTaggedStage(ctx, latencydiag.StagePreEnqueueEncode, err, encodeStarted)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -1801,7 +1821,9 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 		return ExecuteResponse{}, err
 	}
 	defer unlock()
+	receiptStarted := latencydiag.StartTagged(ctx)
 	receipt, sqlResult, found, matches, err := s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
+	latencydiag.TraceTaggedStage(ctx, latencydiag.StageMaterializerReceipt, err, receiptStarted)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}

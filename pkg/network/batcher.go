@@ -150,7 +150,10 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T, leases ...*m
 }
 
 func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte, leases ...*mutationLease) (quepaxa.Slot, error) {
+	enqueueStarted := latencydiag.StartTagged(ctx)
+	traceEnqueue := func(err error) { latencydiag.TraceBatcherEnqueue(ctx, err, enqueueStarted) }
 	if b.baseSize+len(encoded) > b.encodedValueLimit() {
+		traceEnqueue(ErrInvalidRequest)
 		return 0, ErrInvalidRequest
 	}
 	item := &batchItem{
@@ -160,28 +163,34 @@ func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encod
 	if len(leases) != 0 {
 		item.lease = leases[0]
 		if item.lease != nil && !item.lease.transfer() {
+			traceEnqueue(ErrInvalidRequest)
 			return 0, ErrInvalidRequest
 		}
 	}
 	if !b.reserveQueue(item.reserved) {
 		item.releaseLease()
 		localtesthooks.Hit("network:mutation-queue:reservation-rejected")
+		traceEnqueue(ErrOverloaded)
 		return 0, ErrOverloaded
 	}
 	select {
 	case b.input <- item:
+		traceEnqueue(nil)
 	case <-ctx.Done():
 		b.releaseQueue(item.reserved)
 		item.releaseLease()
+		traceEnqueue(ctx.Err())
 		return 0, ctx.Err()
 	case <-b.ctx.Done():
 		b.releaseQueue(item.reserved)
 		item.releaseLease()
+		traceEnqueue(ErrNotReady)
 		return 0, ErrNotReady
 	default:
 		b.releaseQueue(item.reserved)
 		item.releaseLease()
 		localtesthooks.Hit("network:mutation-queue:input-channel-full")
+		traceEnqueue(ErrOverloaded)
 		return 0, ErrOverloaded
 	}
 	select {

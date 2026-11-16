@@ -75,9 +75,21 @@ func TestTaggedHTTPCarriesSendReceiveAdmissionAndSlot(t *testing.T) {
 		}
 		events[key] = observedEvent{slot: slot, outcome: outcome, status: status}
 	}
-	for _, stage := range []string{"http_receive", "mutation_entry", "mutation_admission", "batch_proposal", "batch_result", "http_response"} {
+	for _, stage := range []string{
+		"http_receive", "mutation_entry", "mutation_admission",
+		latencydiag.StagePreEnqueueClone, latencydiag.StagePreEnqueueValidate,
+		latencydiag.StagePreEnqueueFingerprint, latencydiag.StagePreEnqueueEncode,
+		latencydiag.StageRequestLockWait, latencydiag.StageRequestLockHold,
+		latencydiag.StageMaterializerReceipt, latencydiag.StageBatcherEnqueue,
+		"batch_proposal", "batch_result", "http_response",
+	} {
 		if _, found := events["16/"+stage]; !found {
 			t.Errorf("missing %s event for tag 16", stage)
+		}
+	}
+	for _, stage := range []string{latencydiag.StageRequestLockWait, latencydiag.StageRequestLockHold} {
+		if event := events["16/"+stage]; event.status == "0" {
+			t.Errorf("%s did not retain a request-lock shard", stage)
 		}
 	}
 	if responseSlot == 0 {

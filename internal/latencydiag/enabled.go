@@ -5,6 +5,7 @@ package latencydiag
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -42,6 +43,7 @@ func Start() time.Time { return time.Now() }
 
 type event struct {
 	stage, outcome string
+	family         eventFamily
 	slot           uint64
 	batch          uint64
 	request        uint64
@@ -51,11 +53,20 @@ type event struct {
 	peer           [8]byte
 	start, end     time.Time
 }
+
+type eventFamily uint8
+
+const (
+	familyOther eventFamily = iota
+	familyPreEnqueue
+)
+
 type eventRing struct {
-	mu           sync.Mutex
-	items        [capacity]event
-	start, count int
-	dropped      atomic.Uint64
+	mu                sync.Mutex
+	items             [capacity]event
+	start, count      int
+	dropped           atomic.Uint64
+	preEnqueueDropped atomic.Uint64
 }
 
 var ring eventRing
@@ -83,19 +94,32 @@ func (r *eventRing) add(e event) {
 	if testLossless.Load() {
 		r.mu.Lock()
 	} else if !r.mu.TryLock() {
-		r.dropped.Add(1)
+		r.recordDrop(e)
 		return
 	}
 	defer r.mu.Unlock()
 	if r.count == capacity {
+		r.recordDrop(r.items[r.start])
 		r.start = (r.start + 1) % capacity
 		r.count--
-		r.dropped.Add(1)
 	}
 	r.items[(r.start+r.count)%capacity] = e
 	r.count++
 }
+
+func (r *eventRing) recordDrop(e event) {
+	r.dropped.Add(1)
+	if e.family == familyPreEnqueue {
+		r.preEnqueueDropped.Add(1)
+	}
+}
+
 func (r *eventRing) drain() ([]event, uint64) {
+	events, dropped, _ := r.drainWithStats()
+	return events, dropped
+}
+
+func (r *eventRing) drainWithStats() ([]event, uint64, uint64) {
 	r.mu.Lock()
 	events := make([]event, r.count)
 	for i := range events {
@@ -103,7 +127,7 @@ func (r *eventRing) drain() ([]event, uint64) {
 	}
 	r.start, r.count = 0, 0
 	r.mu.Unlock()
-	return events, r.dropped.Swap(0)
+	return events, r.dropped.Swap(0), r.preEnqueueDropped.Swap(0)
 }
 func start() {
 	startWriter.Do(func() {
@@ -121,9 +145,12 @@ func start() {
 func Flush() {
 	flushMu.Lock()
 	defer flushMu.Unlock()
-	events, dropped := ring.drain()
+	events, dropped, preEnqueueDropped := ring.drainWithStats()
 	if dropped > 0 {
 		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
+	}
+	if preEnqueueDropped > 0 {
+		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped=%d\n", preEnqueueDropped)
 	}
 	for _, e := range events {
 		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d tag=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt, e.tag)
@@ -165,6 +192,61 @@ func TraceTag(stage string, tag, slot uint64, err error, begin time.Time) {
 		e.outcome = "error"
 	}
 	ring.add(e)
+}
+
+// StartTagged avoids taking a timestamp for untagged or unsampled requests.
+func StartTagged(ctx context.Context) time.Time {
+	if !SampleTag(Tag(ctx)) {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// TraceTaggedStage records one bounded pre-enqueue boundary. Error values are
+// reduced to outcome classes; request IDs, SQL, and error text are never kept.
+func TraceTaggedStage(ctx context.Context, stage string, err error, begin time.Time) {
+	traceTagged(ctx, stage, 0, err, begin)
+}
+
+// TraceRequestLockWait records the select wait on a request-lock shard. count
+// carries only the low-cardinality shard number, never a request identifier.
+func TraceRequestLockWait(ctx context.Context, shard uint64, err error, begin time.Time) {
+	traceTagged(ctx, StageRequestLockWait, shard, err, begin)
+}
+
+func TraceRequestLockHold(ctx context.Context, shard uint64, begin, end time.Time) {
+	traceTaggedRange(ctx, StageRequestLockHold, shard, nil, begin, end)
+}
+
+func TraceBatcherEnqueue(ctx context.Context, err error, begin time.Time) {
+	traceTagged(ctx, StageBatcherEnqueue, 0, err, begin)
+}
+
+func traceTagged(ctx context.Context, stage string, shard uint64, err error, begin time.Time) {
+	traceTaggedRange(ctx, stage, shard, err, begin, time.Now())
+}
+
+func traceTaggedRange(ctx context.Context, stage string, shard uint64, err error, begin, end time.Time) {
+	tag := Tag(ctx)
+	if !SampleTag(tag) || begin.IsZero() || end.IsZero() || end.Before(begin) {
+		return
+	}
+	start()
+	ring.add(event{
+		stage: stage, family: familyPreEnqueue, tag: tag, count: int(shard),
+		start: begin, end: end, outcome: taggedOutcome(err),
+	})
+}
+
+func taggedOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "cancelled"
+	default:
+		return "error"
+	}
 }
 
 // TraceHTTPResponse records the final status without response headers or body.
