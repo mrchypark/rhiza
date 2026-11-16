@@ -954,12 +954,22 @@ func (m *Manager) syncThrough(ctx context.Context, core source, through quepaxa.
 
 func (m *Manager) flushBatch(batch *syncBatch, core source) {
 	defer m.batchWG.Done()
+	var timerStart time.Time
+	if latencydiag.Enabled {
+		timerStart = latencydiag.Start()
+	}
 	timer := time.NewTimer(m.groupDelay)
 	select {
 	case <-m.ctx.Done():
 		timer.Stop()
+		if latencydiag.Enabled {
+			latencydiag.TraceBatch("archive_batch_timer", batch.traceID(), 0, 0, "cancelled", timerStart)
+		}
 		batch.err = ErrArchiveClosed
 	case <-timer.C:
+		if latencydiag.Enabled {
+			latencydiag.TraceBatch("archive_batch_timer", batch.traceID(), 0, 0, "ok", timerStart)
+		}
 		m.batchMu.Lock()
 		target := batch.target
 		m.batchMu.Unlock()
@@ -1005,7 +1015,15 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	}
 	// Another manager may already have durably published this batch's effective
 	// target. Only a validated, non-sealed remote HEAD can skip admission.
-	if err := m.Load(ctx); err == nil && !forceValidation {
+	var loadStart time.Time
+	if latencydiag.Enabled {
+		loadStart = latencydiag.Start()
+	}
+	loadErr := m.Load(ctx)
+	if latencydiag.Enabled {
+		latencydiag.TraceSync("archive_load_initial", latencydiag.SyncID(ctx), 0, 0, "", loadErr, loadStart)
+	}
+	if loadErr == nil && !forceValidation {
 		m.mu.Lock()
 		tip, sealed := m.tip, m.head.Sealed
 		m.mu.Unlock()
@@ -1020,7 +1038,15 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		if forceValidation {
 			return false, nil
 		}
-		if err := m.Load(ctx); err != nil {
+		var recheckStart time.Time
+		if latencydiag.Enabled {
+			recheckStart = latencydiag.Start()
+		}
+		err := m.Load(ctx)
+		if latencydiag.Enabled {
+			latencydiag.TraceSync("archive_load_recheck", latencydiag.SyncID(ctx), 0, 0, "", err, recheckStart)
+		}
+		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return false, ctxErr
 			}
@@ -1036,7 +1062,15 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	}, func(ctx context.Context) error {
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
-		if err := m.Load(ctx); err != nil {
+		var lockedLoadStart time.Time
+		if latencydiag.Enabled {
+			lockedLoadStart = latencydiag.Start()
+		}
+		err := m.Load(ctx)
+		if latencydiag.Enabled {
+			latencydiag.TraceSync("archive_load_locked", latencydiag.SyncID(ctx), 0, 0, "", err, lockedLoadStart)
+		}
+		if err != nil {
 			return err
 		}
 		if batch != nil {
@@ -1080,7 +1114,14 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		previous, previousObject := head.TailHash, head.TailObject
 		from := tip + 1
 		for from <= through {
+			var buildStart time.Time
+			if latencydiag.Enabled {
+				buildStart = latencydiag.Start()
+			}
 			extent, data, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
+			if latencydiag.Enabled {
+				latencydiag.TraceSync("archive_extent_build", latencydiag.SyncID(ctx), uint64(through), 0, "", err, buildStart)
+			}
 			if err != nil {
 				return err
 			}
@@ -1110,11 +1151,27 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		}
 		head.Generation = nextGeneration
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
-			return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...), cacheTail[:cacheTailCount]...)
+			var refreshStart time.Time
+			if latencydiag.Enabled {
+				refreshStart = latencydiag.Start()
+			}
+			err := m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...), cacheTail[:cacheTailCount]...)
+			if latencydiag.Enabled {
+				latencydiag.TraceSync("archive_head_refresh", latencydiag.SyncID(ctx), uint64(through), 0, "", err, refreshStart)
+			}
+			return err
 		} else if !m.cas {
 			return err
 		}
-		if err := m.Load(ctx); err != nil {
+		var retryLoadStart time.Time
+		if latencydiag.Enabled {
+			retryLoadStart = latencydiag.Start()
+		}
+		err := m.Load(ctx)
+		if latencydiag.Enabled {
+			latencydiag.TraceSync("archive_load_retry", latencydiag.SyncID(ctx), 0, 0, "", err, retryLoadStart)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -1157,7 +1214,13 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 	return err
 }
 
-func (m *Manager) confirmPublicationLease(ctx context.Context) error {
+func (m *Manager) confirmPublicationLease(ctx context.Context) (retErr error) {
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		started := latencydiag.Start()
+		defer func() {
+			latencydiag.TraceSync("archive_lease_confirm", latencydiag.SyncID(ctx), 0, 0, "", retErr, started)
+		}()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1960,10 +2023,17 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 		return err
 	}
 	var err error
+	var acquireStart time.Time
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		acquireStart = latencydiag.Start()
+	}
 	if gcTrace {
 		err = archiveGCTrace(ctx, "remote-lock", acquire)
 	} else {
 		err = acquire()
+	}
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		latencydiag.TraceSync("archive_lease_acquire", latencydiag.SyncID(ctx), 0, 0, "", err, acquireStart)
 	}
 	if err != nil {
 		return err
@@ -2021,10 +2091,17 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	releaseCtx = localtesthooks.CarryArchiveBusyObserver(releaseCtx, ctx)
 	release := func() error { return m.releaseArchiveLock(releaseCtx, key, lock) }
 	var releaseErr error
+	var releaseStart time.Time
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		releaseStart = latencydiag.Start()
+	}
 	if gcTrace {
 		releaseErr = archiveGCTrace(ctx, "lock-release", release)
 	} else {
 		releaseErr = release()
+	}
+	if latencydiag.Enabled && latencydiag.SyncID(ctx) != 0 {
+		latencydiag.TraceSync("archive_lease_release", latencydiag.SyncID(ctx), 0, 0, "", releaseErr, releaseStart)
 	}
 	releaseCancel()
 	if err == nil && releaseErr != nil && (!gcTrace || !errors.Is(releaseErr, ErrArchiveBusy)) {

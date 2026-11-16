@@ -3,6 +3,8 @@
 package recovery
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +15,15 @@ import (
 	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/thanos-io/objstore"
 )
+
+type traceFailHeadBucket struct{ objstore.Bucket }
+
+func (b traceFailHeadBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "archive/head.bin") {
+		return errors.New("synthetic head upload failure")
+	}
+	return b.Bucket.Upload(ctx, name, reader, opts...)
+}
 
 func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 	latencydiag.DisableBackgroundWriterForTest()
@@ -52,9 +63,18 @@ func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 	shutdown.flushBatch(batch, nil)
 	shutdown.Close()
 	latencydiag.Flush()
+	failureCtx, base, failureCore, _, failedWriter := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := failureCore.Propose(failureCtx, []byte("trace failed head")); err != nil {
+		t.Fatal(err)
+	}
+	failedWriter.bucket = traceFailHeadBucket{base}
+	if err := failedWriter.SyncThrough(failureCtx, failureCore, failureCore.Tip()); err == nil {
+		t.Fatal("synthetic upload should fail")
+	}
+	latencydiag.Flush()
 	_ = w.Close()
 	log := <-data
-	for _, want := range []string{"stage=archive_batch_wait", "stage=archive_batch_target", "stage=archive_batch_result", "stage=archive_slot_result", "stage=archive_head_upload", "stage=archive_extent_upload", "outcome=error"} {
+	for _, want := range []string{"stage=archive_batch_wait", "stage=archive_batch_timer", "stage=archive_batch_target", "stage=archive_batch_result", "stage=archive_slot_result", "stage=archive_head_upload", "stage=archive_extent_upload", "stage=archive_load_initial", "stage=archive_load_locked", "stage=archive_extent_build", "stage=archive_head_refresh", "stage=archive_lease_acquire", "stage=archive_lease_confirm", "stage=archive_lease_release", "outcome=error"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("missing trace %s", want)
 		}
@@ -71,6 +91,8 @@ func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 	slotRequests := map[string]map[string]bool{}
 	attempts := map[string]map[string]bool{}
 	shutdownResult := false
+	timerCanceled := false
+	headUploadFailed := false
 	for _, line := range strings.Split(log, "\n") {
 		fields := map[string]string{}
 		for _, field := range strings.Fields(line) {
@@ -100,6 +122,10 @@ func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 			if fields["batch"] == fmt.Sprint(batch.traceID()) && fields["outcome"] == "error" {
 				shutdownResult = true
 			}
+		case "archive_batch_timer":
+			if fields["batch"] == fmt.Sprint(batch.traceID()) && fields["outcome"] == "cancelled" {
+				timerCanceled = true
+			}
 		case "archive_slot_result":
 			if fields["batch"] != "0" || fields["slot"] == "0" {
 				t.Errorf("invalid final slot result: %s", line)
@@ -116,6 +142,9 @@ func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 			}
 			failed = failed || fields["outcome"] == "error"
 		case "archive_head_upload", "archive_extent_upload":
+			if fields["stage"] == "archive_head_upload" && fields["outcome"] == "error" {
+				headUploadFailed = true
+			}
 			if fields["batch"] != "0" {
 				uploads[fields["batch"]] = true
 				if attempts[fields["batch"]] == nil {
@@ -146,8 +175,11 @@ func TestArchiveBatchTraceRealRecursionAndFailure(t *testing.T) {
 	if !recursiveRequest {
 		t.Error("no request ID spans recursive waits and exactly one slot-2 result")
 	}
-	if !shutdownResult {
+	if !shutdownResult || !timerCanceled {
 		t.Error("shutdown batch has no error result")
+	}
+	if !headUploadFailed {
+		t.Error("missing failed head upload trace")
 	}
 	if len(slotRequests["1"]) < 2 {
 		t.Error("same-slot requests were not distinguished")
