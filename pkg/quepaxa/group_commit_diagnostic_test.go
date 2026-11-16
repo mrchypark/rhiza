@@ -74,6 +74,8 @@ func TestTaggedRealWALTraceRecordsLinkSlotsAndBatches(t *testing.T) {
 		}
 	}
 	check("wal_group_lock", a.batch, "ok", "")
+	check("wal_worker_batching_and_lock", a.batch, "ok", "")
+	check("wal_worker_queue_lock", a.batch, "ok", "")
 	check("wal_group_file_sync", a.batch, "ok", "")
 	check("wal_group_sync", a.batch, "ok", "2")
 	check("wal_group_file_sync", c.batch, "skipped", "")

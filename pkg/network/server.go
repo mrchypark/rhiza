@@ -1019,7 +1019,15 @@ func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.
 	if err != nil {
 		return slot, err, true, s.localMode && quepaxa.IsLocalAdmissionDenial(err)
 	}
-	if err = s.applyDecisions(ctx, slot); err == nil {
+	var applyStart time.Time
+	if latencydiag.Enabled {
+		applyStart = latencydiag.Start()
+	}
+	err = s.applyDecisions(ctx, slot)
+	if latencydiag.Enabled {
+		latencydiag.ObserveError("proposal_target_apply", uint64(slot), err, applyStart)
+	}
+	if err == nil {
 		err = s.waitDurable(ctx, slot)
 	}
 	return slot, err, true, false
@@ -2618,7 +2626,20 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 }
 
 func (s *Server) applyDecisionsWithPeerLifetime(ctx context.Context, through quepaxa.Slot, peer context.Context) error {
+	var lockStart time.Time
+	if latencydiag.Enabled {
+		lockStart = latencydiag.Start()
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:apply:before-lock")
+	}
 	s.applyMu.Lock()
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:apply:after-lock")
+	}
+	if latencydiag.Enabled {
+		latencydiag.Observe("apply_target_lock", uint64(through), lockStart)
+	}
 	defer s.applyMu.Unlock()
 	if peer != nil {
 		if err := peer.Err(); err != nil {
@@ -2629,7 +2650,15 @@ func (s *Server) applyDecisionsWithPeerLifetime(ctx context.Context, through que
 		}
 	}
 
-	if err := s.core.WaitTip(ctx, through); err != nil {
+	var waitStart time.Time
+	if latencydiag.Enabled {
+		waitStart = latencydiag.Start()
+	}
+	err := s.core.WaitTip(ctx, through)
+	if latencydiag.Enabled {
+		latencydiag.ObserveError("apply_target_wait_tip", uint64(through), err, waitStart)
+	}
+	if err != nil {
 		return err
 	}
 	// WaitTip may return immediately for an already-present prefix even when
@@ -2668,11 +2697,27 @@ func (s *Server) applyDecisionsWithPeerLifetime(ctx context.Context, through que
 		// HA certified hints need WAL persistence before application. Local
 		// owns its durability pipeline and cannot accept external hints.
 		if !s.core.LocalMode() && end > 0 {
-			if err := s.core.EnsureDurableThrough(ctx, decisions[end-1].Slot); err != nil {
+			var durableStart time.Time
+			if latencydiag.Enabled {
+				durableStart = latencydiag.Start()
+			}
+			err := s.core.EnsureDurableThrough(ctx, decisions[end-1].Slot)
+			if latencydiag.Enabled {
+				latencydiag.ObserveError("apply_target_ensure_durable", uint64(through), err, durableStart)
+			}
+			if err != nil {
 				return err
 			}
 		}
-		if err := s.material.ApplyBatch(ctx, decisions[:end]); err != nil {
+		var materialStart time.Time
+		if latencydiag.Enabled {
+			materialStart = latencydiag.Start()
+		}
+		err = s.material.ApplyBatch(ctx, decisions[:end])
+		if latencydiag.Enabled {
+			latencydiag.ObserveError("apply_target_material_batch", uint64(through), err, materialStart)
+		}
+		if err != nil {
 			return fmt.Errorf("certified replay apply first_slot=%d last_slot=%d last_hash=%x ctx_canceled=%t: %w", decisions[0].Slot, decisions[end-1].Slot, decisions[end-1].Hash, ctx.Err() != nil, err)
 		}
 		if end < len(decisions) {

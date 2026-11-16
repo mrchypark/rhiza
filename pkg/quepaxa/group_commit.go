@@ -87,16 +87,28 @@ func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) (retErr err
 
 func (g *groupCommit) flush() {
 	for {
+		var batchingStart time.Time
+		if latencydiag.Enabled {
+			batchingStart = latencydiag.Start()
+		}
 		timer := time.NewTimer(g.delay)
 		select {
 		case <-timer.C:
 		case <-g.wake:
 			timer.Stop()
 		}
+		var lockStart time.Time
+		if latencydiag.Enabled {
+			lockStart = latencydiag.Start()
+		}
 		g.mu.Lock()
 		batch := g.pending
 		g.pending = nil
 		g.mu.Unlock()
+		if latencydiag.Enabled {
+			latencydiag.TraceBatch("wal_worker_batching_and_lock", batch.traceID(), 0, 0, "ok", batchingStart)
+			latencydiag.TraceBatch("wal_worker_queue_lock", batch.traceID(), 0, 0, "ok", lockStart)
+		}
 		diagnosticStart := latencydiag.Start()
 		if latencydiag.Enabled {
 			batch.err = g.syncForTrace(batch.traceID())
