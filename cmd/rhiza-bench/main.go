@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 )
 
 type result struct {
@@ -44,6 +46,7 @@ type result struct {
 	FaultOverlap       bool                `json:"fault_overlap_control,omitempty"`
 	FaultWindow        *faultWindow        `json:"fault_window,omitempty"`
 	SlotEvidence       *liveProgressSample `json:"slot_evidence,omitempty"`
+	TagEvidence        *liveProgressSample `json:"tag_evidence,omitempty"`
 }
 
 func main() {
@@ -61,6 +64,7 @@ func main() {
 	liveProgressFile := flag.String("live-progress-file", "", "optional bounded aggregate progress output")
 	liveSlowest := flag.Bool("live-progress-slowest", false, "include the slowest completed request in diagnostic progress")
 	liveSlots := flag.Bool("live-progress-slot-samples", false, "include bounded completed slot samples in diagnostic progress")
+	liveTags := flag.Bool("live-progress-tag-samples", false, "send opaque tags and include bounded tagged client samples")
 	flag.Parse()
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
@@ -130,7 +134,7 @@ func main() {
 	started := time.Now()
 	var live *liveProgress
 	if *liveProgressFile != "" {
-		live = &liveProgress{start: started, captureSlowest: *liveSlowest, captureSlotSamples: *liveSlots}
+		live = &liveProgress{start: started, captureSlowest: *liveSlowest, captureSlotSamples: *liveSlots, captureTagSamples: *liveTags, tagSampleMax: uint64(*requests)}
 		live.phase.Store(progressDispatch)
 		stop := make(chan struct{})
 		defer close(stop)
@@ -156,13 +160,24 @@ func main() {
 				if progress != nil {
 					requestCtx, finish, interval = progress.traceRequestInterval(ctx, id, begin)
 				}
-				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
+				var latency *clientLatencyTrace
+				if live != nil && live.captureTagSamples {
+					tag := uint64(id) + 1
+					if latencydiag.SampleTag(tag) {
+						latency = &clientLatencyTrace{Tag: tag}
+					}
+				}
+				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert, latency)
 				completed, elapsed := observeRequestReturn(begin, finish, &retries, retryCount, live)
+				completedSample := slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample, latency)
 				if live != nil && live.captureSlotSamples {
-					live.recordSlotSample(slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample))
+					live.recordSlotSample(completedSample)
+				}
+				if live != nil && latency != nil {
+					live.recordTagSample(completedSample)
 				}
 				if live != nil && live.captureSlowest && (live.slowest.Load() == nil || elapsed.Nanoseconds() > live.slowest.Load().LatencyNS) {
-					live.recordSlowest(slowestRequest(begin, elapsed, retryCount, requestErr == nil && status >= 200 && status < 300, *verifyInsert, sample))
+					live.recordSlowest(completedSample)
 				}
 				if status < 200 || status >= 300 {
 					if text := strings.TrimSpace(string(sample)); text != "" {
@@ -283,6 +298,11 @@ func main() {
 			evidence.CaptureStatus = "completed"
 			output.SlotEvidence = &evidence
 		}
+		if live.captureTagSamples {
+			evidence := live.sample(-1, time.Now())
+			evidence.CaptureStatus = "completed"
+			output.TagEvidence = &evidence
+		}
 	}
 	if progress != nil {
 		window := progress.window()
@@ -318,7 +338,17 @@ func observeRequestReturn(begin time.Time, finish func(time.Time), retries *atom
 	return completed, elapsed
 }
 
-func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool) (int, []byte, int, error) {
+type clientLatencyTrace struct {
+	Tag                   uint64
+	SendUnixNS            int64
+	ResponseHeadersUnixNS int64
+}
+
+func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool, latency ...*clientLatencyTrace) (int, []byte, int, error) {
+	var trace *clientLatencyTrace
+	if len(latency) != 0 {
+		trace = latency[0]
+	}
 	for retries := 0; ; retries++ {
 		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))
 		if err != nil {
@@ -327,7 +357,15 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 		if payload != "" {
 			request.Header.Set("Content-Type", "application/json")
 		}
+		if trace != nil {
+			request.Header.Set(latencydiag.TagHeader, strconv.FormatUint(trace.Tag, 10))
+			trace.SendUnixNS = time.Now().UnixNano()
+			trace.ResponseHeadersUnixNS = 0
+		}
 		response, err := client.Do(request)
+		if trace != nil && err == nil {
+			trace.ResponseHeadersUnixNS = time.Now().UnixNano()
+		}
 		if err != nil {
 			return 0, nil, retries, err
 		}

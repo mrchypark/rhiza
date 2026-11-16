@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -412,7 +413,16 @@ func (b *mutationBatcher[T]) releaseInflight(size int) {
 
 func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	var proposalStarted time.Time
+	if latencydiag.Enabled {
+		proposalStarted = latencydiag.Start()
+	}
 	slot, err := b.propose(ctx, value)
+	if latencydiag.Enabled {
+		for _, item := range items {
+			latencydiag.TraceTag("batch_proposal", latencydiag.Tag(item.ctx), uint64(slot), err, proposalStarted)
+		}
+	}
 	stage := "propose"
 	if err == nil && b.apply != nil {
 		err = b.apply(ctx, slot)
@@ -420,6 +430,9 @@ func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	}
 	cancel()
 	for _, item := range items {
+		if latencydiag.Enabled {
+			latencydiag.TraceTag("batch_result", latencydiag.Tag(item.ctx), uint64(slot), err, item.enqueued)
+		}
 		itemErr := err
 		if err != nil {
 			itemErr = commitUnknown(slot, item.requestID, err)

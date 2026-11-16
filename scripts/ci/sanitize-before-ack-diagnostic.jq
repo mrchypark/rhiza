@@ -5,7 +5,9 @@ def sample: if type != "object" then null else {
   measured_end_unix_ns: (.measured_end_unix_ns | number_or_null),
   latency_ns: (.latency_ns | number_or_null), retries: (.retries | number_or_null),
   succeeded: (.succeeded | bool_or_null), slot_known: (.slot_known | bool_or_null),
-  slot: (.slot | number_or_null)
+  slot: (.slot | number_or_null), tag_known: (.tag_known | bool_or_null),
+  tag: (.tag | number_or_null), send_unix_ns: (.send_unix_ns | number_or_null),
+  response_headers_unix_ns: (.response_headers_unix_ns | number_or_null)
 } end;
 {
   client_revision: (if (try (.client_revision | test("^[0-9a-f]{40}$")) catch false) then .client_revision else null end),
@@ -28,6 +30,13 @@ def sample: if type != "object" then null else {
       slot_samples_enabled: (.slot_samples_enabled | bool_or_null),
       slot_samples_dropped: (.slot_samples_dropped | number_or_null), slot_unknown: (.slot_unknown | number_or_null),
       slot_samples: (if (.slot_samples | type) == "array" then [.slot_samples[:64][] | sample] else [] end)
+    } end),
+    tag_evidence: (.tag_evidence | if type != "object" then null else {
+      tag_samples_enabled: (.tag_samples_enabled | bool_or_null),
+      tag_samples_dropped: (.tag_samples_dropped | number_or_null),
+      tag_sample_stride: (.tag_sample_stride | number_or_null),
+      tag_sample_max: (.tag_sample_max | number_or_null),
+      tag_samples: (if (.tag_samples | type) == "array" then [.tag_samples[:64][] | sample] else [] end)
     } end)
   } end)
 }

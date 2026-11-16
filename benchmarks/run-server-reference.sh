@@ -251,7 +251,7 @@ if [[ ${RHIZA_SERVER_BENCH_RECORD_BUILD_ID:-0} == 1 ]]; then
 	{
 		printf 'source_sha=%s\n' "$(git -C "$source_dir" rev-parse HEAD)"
 		printf 'client_sha256=%s\nserver_sha256=%s\n' "$client_sha256" "$server_sha256"
-		printf 'tagged=%s\nslot_samples=%s\n' "${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0}" "${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0}"
+		printf 'tagged=%s\nslot_samples=%s\ntag_samples=%s\n' "${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0}" "${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0}" "${RHIZA_SERVER_BENCH_TAG_SAMPLES:-0}"
 	} > "${output_file%.json}-build.txt"
 fi
 
@@ -346,6 +346,9 @@ if [[ ${RHIZA_SERVER_BENCH_LIVE_PROGRESS:-0} == 1 ]]; then
 	fi
 	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_SLOT_SAMPLES:-0} == 1 ]]; then
 		progress_args+=(-live-progress-slot-samples)
+	fi
+	if [[ ${RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS:-0} == 1 && ${RHIZA_SERVER_BENCH_TAG_SAMPLES:-0} == 1 ]]; then
+		progress_args+=(-live-progress-tag-samples)
 	fi
 fi
 if [[ $failed_node != none ]]; then

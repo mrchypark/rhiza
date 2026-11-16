@@ -13,7 +13,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/latencydiag"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func TestIsCommitUnknown(t *testing.T) {
 	if !isCommitUnknown(http.StatusServiceUnavailable, []byte(`{"code":"commit_unknown"}`)) {
@@ -21,6 +27,53 @@ func TestIsCommitUnknown(t *testing.T) {
 	}
 	if isCommitUnknown(http.StatusServiceUnavailable, []byte(`{"code":"overloaded"}`)) {
 		t.Fatal("unrelated 503 response was recognized")
+	}
+}
+
+func TestDoRequestSendsOpaqueDiagnosticTag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(latencydiag.TagHeader); got != "16" {
+			t.Errorf("tag header=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"slot":1,"status":"committed","rows_affected":1,"last_insert_id":0,"retry_through_slot":65536}`)
+	}))
+	defer server.Close()
+	trace := &clientLatencyTrace{Tag: 16}
+	status, _, _, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true, trace)
+	if err != nil || status != http.StatusOK || trace.SendUnixNS == 0 || trace.ResponseHeadersUnixNS < trace.SendUnixNS {
+		t.Fatalf("status=%d trace=%+v err=%v", status, trace, err)
+	}
+}
+
+func TestDoRequestSendFailureHasNoResponseTimestamp(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close()
+	trace := &clientLatencyTrace{Tag: 16}
+	status, _, _, err := doRequest(t.Context(), server.Client(), http.MethodPost, url, `{}`, 0, false, trace)
+	if err == nil || status != 0 || trace.SendUnixNS == 0 || trace.ResponseHeadersUnixNS != 0 {
+		t.Fatalf("status=%d trace=%+v err=%v", status, trace, err)
+	}
+}
+
+func TestDoRequestRetryClearsPreviousResponseTimestamp(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"code":"commit_unknown"}`)),
+			}, nil
+		}
+		return nil, errors.New("transport failure")
+	})}
+	trace := &clientLatencyTrace{Tag: 16}
+	status, _, retries, err := doRequest(t.Context(), client, http.MethodPost, "http://diag.invalid/sql/execute", `{}`, 1, false, trace)
+	if err == nil || status != 0 || retries != 1 || trace.SendUnixNS == 0 || trace.ResponseHeadersUnixNS != 0 {
+		t.Fatalf("attempts=%d status=%d retries=%d trace=%+v err=%v", attempts, status, retries, trace, err)
 	}
 }
 

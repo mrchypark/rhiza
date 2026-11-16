@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1407,6 +1408,16 @@ func fetchDecisionsWithRetry(
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var observed *latencydiagResponse
+	if latencydiag.Enabled {
+		if tag := latencydiagTag(r); tag != 0 {
+			started := latencydiag.Start()
+			r = r.WithContext(latencydiag.WithTag(r.Context(), tag))
+			latencydiag.TraceTag("http_receive", tag, 0, nil, started)
+			w, observed = latencydiagResponseWriter(w)
+			defer func() { latencydiag.TraceHTTPResponse(tag, observed.statusCode(), started) }()
+		}
+	}
 	// Drain calls cannot join themselves; their handler validates identity and
 	// invokes the same idempotent terminal operation after other work stops.
 	if r.URL.Path != "/recovery/drain" {
@@ -1421,6 +1432,60 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer s.handlerWG.Done()
 	}
 	s.mux.ServeHTTP(w, r)
+}
+
+type latencydiagResponse struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *latencydiagResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *latencydiagResponse) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *latencydiagResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *latencydiagResponse) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+type latencydiagFlushResponse struct{ *latencydiagResponse }
+
+func (w *latencydiagFlushResponse) Flush() {
+	w.ResponseWriter.(http.Flusher).Flush()
+}
+
+func latencydiagResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *latencydiagResponse) {
+	observed := &latencydiagResponse{ResponseWriter: w}
+	if _, ok := w.(http.Flusher); ok {
+		return &latencydiagFlushResponse{latencydiagResponse: observed}, observed
+	}
+	return observed, observed
+}
+
+func latencydiagTag(r *http.Request) uint64 {
+	raw := r.Header.Get(latencydiag.TagHeader)
+	if raw == "" || len(raw) > 20 {
+		return 0
+	}
+	tag, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || !latencydiag.SampleTag(tag) {
+		return 0
+	}
+	return tag
 }
 
 // ExecuteRequest is the request body for execute.
@@ -1591,6 +1656,11 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 }
 
 func (s *Server) execute(ctx context.Context, req ExecuteRequest, oneStatement bool) (ExecuteResponse, error) {
+	tag, admissionStarted := latencydiag.Tag(ctx), time.Time{}
+	if tag != 0 {
+		admissionStarted = latencydiag.Start()
+		latencydiag.TraceTag("mutation_entry", tag, 0, nil, admissionStarted)
+	}
 	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
@@ -1603,6 +1673,9 @@ func (s *Server) execute(ctx context.Context, req ExecuteRequest, oneStatement b
 		return ExecuteResponse{}, err
 	}
 	lease, err := s.admitMutation(charge)
+	if tag != 0 {
+		latencydiag.TraceTag("mutation_admission", tag, 0, err, admissionStarted)
+	}
 	if err != nil {
 		return ExecuteResponse{}, err
 	}

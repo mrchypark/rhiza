@@ -90,6 +90,21 @@ func TestSlotSamplesConcurrentAccounting(t *testing.T) {
 	}
 }
 
+func TestTagSamplesBoundedAndTagged(t *testing.T) {
+	p := &liveProgress{start: time.Now(), captureTagSamples: true, tagSampleMax: 10000}
+	for i := 0; i < 65; i++ {
+		p.recordTagSample(slowestProgress{Tag: uint64(16 + i*16), TagKnown: true, SlotKnown: true, Slot: 7, LatencyNS: int64(i)})
+	}
+	s := p.sample(0, time.Now())
+	if !s.TagSamplesEnabled || s.TagSampleStride != 16 || s.TagSampleMax != 10000 || len(s.TagSamples) != 64 || s.TagSamplesDropped != 1 || !s.TagSamples[0].TagKnown || s.TagSamples[0].Tag == 0 || s.TagSamples[0].Slot != 7 || s.TagSamples[0].LatencyNS != 64 {
+		t.Fatalf("unexpected tag samples: %+v", s)
+	}
+	encoded, err := json.Marshal(s)
+	if err != nil || strings.Contains(string(encoded), "SECRET_SENTINEL") {
+		t.Fatalf("diagnostic JSON: %q, %v", encoded, err)
+	}
+}
+
 func TestSlowestRequestReceiptScope(t *testing.T) {
 	for _, tc := range []struct {
 		name                string

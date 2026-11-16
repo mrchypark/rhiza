@@ -27,11 +27,16 @@ type liveProgress struct {
 	captureSlowest     bool
 	slowest            atomic.Pointer[slowestProgress]
 	captureSlotSamples bool
+	captureTagSamples  bool
+	tagSampleMax       uint64
 	sampleMu           sync.Mutex
 	sampleItems        [64]slowestProgress
 	sampleCount        int
 	sampleDropped      atomic.Uint64
 	sampleUnknown      atomic.Uint64
+	tagItems           [64]slowestProgress
+	tagCount           int
+	tagDropped         atomic.Uint64
 }
 
 // Samples use fixed slot modulo rather than request IDs; retain the slowest
@@ -66,20 +71,56 @@ func (p *liveProgress) recordSlotSample(s slowestProgress) {
 	p.sampleCount++
 }
 
+// Tag samples use an opaque client tag shared with server trace events. These
+// are useful only with a tagged server; the fixed count keeps reporting bounded.
+func (p *liveProgress) recordTagSample(s slowestProgress) {
+	if s.Tag == 0 {
+		return
+	}
+	if !p.sampleMu.TryLock() {
+		p.tagDropped.Add(1)
+		return
+	}
+	defer p.sampleMu.Unlock()
+	if p.tagCount == len(p.tagItems) {
+		p.tagDropped.Add(1)
+		min := 0
+		for i := 1; i < p.tagCount; i++ {
+			if p.tagItems[i].LatencyNS < p.tagItems[min].LatencyNS {
+				min = i
+			}
+		}
+		if s.LatencyNS > p.tagItems[min].LatencyNS {
+			p.tagItems[min] = s
+		}
+		return
+	}
+	p.tagItems[p.tagCount] = s
+	p.tagCount++
+}
+
 // slowestProgress is one completed logical request, not a p99 estimate.
 // A missing or failed receipt must never be interpreted as a known slot.
 type slowestProgress struct {
-	StartUnixNS int64  `json:"start_unix_ns"`
-	EndUnixNS   int64  `json:"measured_end_unix_ns"`
-	LatencyNS   int64  `json:"latency_ns"`
-	Retries     int    `json:"retries"`
-	Succeeded   bool   `json:"succeeded"`
-	SlotKnown   bool   `json:"slot_known"`
-	Slot        uint64 `json:"slot"`
+	StartUnixNS  int64  `json:"start_unix_ns"`
+	EndUnixNS    int64  `json:"measured_end_unix_ns"`
+	LatencyNS    int64  `json:"latency_ns"`
+	Retries      int    `json:"retries"`
+	Succeeded    bool   `json:"succeeded"`
+	SlotKnown    bool   `json:"slot_known"`
+	Slot         uint64 `json:"slot"`
+	TagKnown     bool   `json:"tag_known"`
+	Tag          uint64 `json:"tag"`
+	SendUnixNS   int64  `json:"send_unix_ns"`
+	HeaderUnixNS int64  `json:"response_headers_unix_ns"`
 }
 
-func slowestRequest(begin time.Time, elapsed time.Duration, retries int, succeeded, verified bool, response []byte) slowestProgress {
+func slowestRequest(begin time.Time, elapsed time.Duration, retries int, succeeded, verified bool, response []byte, latency ...*clientLatencyTrace) slowestProgress {
 	s := slowestProgress{StartUnixNS: begin.UnixNano(), EndUnixNS: begin.Add(elapsed).UnixNano(), LatencyNS: elapsed.Nanoseconds(), Retries: retries, Succeeded: succeeded}
+	if len(latency) != 0 && latency[0] != nil {
+		s.TagKnown, s.Tag = true, latency[0].Tag
+		s.SendUnixNS, s.HeaderUnixNS = latency[0].SendUnixNS, latency[0].ResponseHeadersUnixNS
+	}
 	if succeeded && verified {
 		var receipt struct {
 			Slot uint64 `json:"slot"`
@@ -124,6 +165,11 @@ type liveProgressSample struct {
 	SlotSamplesDropped  uint64            `json:"slot_samples_dropped,omitempty"`
 	SlotUnknown         uint64            `json:"slot_unknown,omitempty"`
 	SlotSamplesEnabled  bool              `json:"slot_samples_enabled,omitempty"`
+	TagSamples          []slowestProgress `json:"tag_samples,omitempty"`
+	TagSamplesDropped   uint64            `json:"tag_samples_dropped,omitempty"`
+	TagSamplesEnabled   bool              `json:"tag_samples_enabled,omitempty"`
+	TagSampleStride     int               `json:"tag_sample_stride,omitempty"`
+	TagSampleMax        uint64            `json:"tag_sample_max,omitempty"`
 }
 
 const liveProgressSampleLimit = 120
@@ -178,6 +224,14 @@ func (p *liveProgress) sample(seq int, now time.Time) liveProgressSample {
 		p.sampleMu.Unlock()
 		s.SlotSamplesDropped = p.sampleDropped.Load()
 		s.SlotUnknown = p.sampleUnknown.Load()
+	}
+	if p.captureTagSamples {
+		s.TagSamplesEnabled = true
+		s.TagSampleStride, s.TagSampleMax = 16, p.tagSampleMax
+		p.sampleMu.Lock()
+		s.TagSamples = append(s.TagSamples, p.tagItems[:p.tagCount]...)
+		p.sampleMu.Unlock()
+		s.TagSamplesDropped = p.tagDropped.Load()
 	}
 	return s
 }

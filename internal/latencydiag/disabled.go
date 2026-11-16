@@ -24,3 +24,7 @@ func ObserveBatch(_ string, _ int, _ error, _ time.Time)             {}
 func ObservePeer(_ string, _ uint64, _ string, _ error, _ time.Time) {}
 func WithSlot(ctx context.Context, _ uint64) context.Context         { return ctx }
 func Slot(_ context.Context) uint64                                  { return 0 }
+func WithTag(ctx context.Context, _ uint64) context.Context          { return ctx }
+func Tag(_ context.Context) uint64                                   { return 0 }
+func TraceTag(_ string, _, _ uint64, _ error, _ time.Time)           {}
+func TraceHTTPResponse(_ uint64, _ int, _ time.Time)                 {}

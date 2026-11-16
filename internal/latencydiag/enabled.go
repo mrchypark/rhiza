@@ -17,6 +17,7 @@ const capacity = 256
 
 type slotKey struct{}
 type syncKey struct{}
+type tagKey struct{}
 
 func WithSync(ctx context.Context, id uint64) context.Context {
 	return context.WithValue(ctx, syncKey{}, id)
@@ -27,7 +28,17 @@ func WithSlot(ctx context.Context, slot uint64) context.Context {
 	return context.WithValue(ctx, slotKey{}, slot)
 }
 func Slot(ctx context.Context) uint64 { slot, _ := ctx.Value(slotKey{}).(uint64); return slot }
-func Start() time.Time                { return time.Now() }
+func WithTag(ctx context.Context, tag uint64) context.Context {
+	return context.WithValue(ctx, tagKey{}, tag)
+}
+func Tag(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	tag, _ := ctx.Value(tagKey{}).(uint64)
+	return tag
+}
+func Start() time.Time { return time.Now() }
 
 type event struct {
 	stage, outcome string
@@ -35,6 +46,7 @@ type event struct {
 	batch          uint64
 	request        uint64
 	attempt        uint64
+	tag            uint64
 	count          int
 	peer           [8]byte
 	start, end     time.Time
@@ -114,7 +126,7 @@ func Flush() {
 		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
 	}
 	for _, e := range events {
-		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt)
+		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d tag=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt, e.tag)
 	}
 }
 func Observe(stage string, slot uint64, start time.Time) { observe(stage, slot, "", nil, start) }
@@ -138,6 +150,34 @@ func batchEvent(stage string, count int, err error, begin, end time.Time) event 
 }
 func ObservePeer(stage string, slot uint64, peer string, err error, start time.Time) {
 	observe(stage, slot, peer, err, start)
+}
+
+// TraceTag records every sampled client boundary. Unlike slow observations,
+// these markers are emitted without a duration threshold.
+func TraceTag(stage string, tag, slot uint64, err error, begin time.Time) {
+	if !SampleTag(tag) {
+		return
+	}
+	end := time.Now()
+	start()
+	e := event{stage: stage, tag: tag, slot: slot, start: begin, end: end, outcome: "ok"}
+	if err != nil {
+		e.outcome = "error"
+	}
+	ring.add(e)
+}
+
+// TraceHTTPResponse records the final status without response headers or body.
+func TraceHTTPResponse(tag uint64, status int, begin time.Time) {
+	if !SampleTag(tag) {
+		return
+	}
+	start()
+	outcome := "ok"
+	if status >= 400 {
+		outcome = "error"
+	}
+	ring.add(event{stage: "http_response", tag: tag, count: status, start: begin, end: time.Now(), outcome: outcome})
 }
 
 // TraceSync records every Sync stage; batch identifies a server-local request.

@@ -91,6 +91,69 @@ for sample in '{"error_samples":{"http_500":"SECRET_SENTINEL"},"object_store_del
  [[ $sanitized != *SECRET_SENTINEL* && $sanitized != *918273645* ]]
  jq -e '.object_store_delta.gets == 2 and (.object_store_delta | has("private_count") | not) and .result.requests == 1' <<<"$sanitized" >/dev/null
 done
+# Tagged joins require both the client sample and the exact tag boundary.
+printf '16\t2\t1000\t11500\t1100\t11000\t10500\ttrue\n' > "$scratch/tag-client.tsv"
+printf '%s\n' \
+ 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=mutation_entry batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=3000 end_unix_ns=3000 duration_ns=0 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=mutation_admission batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=3000 end_unix_ns=4000 duration_ns=1000 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=batch_proposal batch=0 slot=2 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5000 end_unix_ns=7000 duration_ns=2000 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=batch_result batch=0 slot=2 count=0 peer=0000000000000000 outcome=ok start_unix_ns=1100 end_unix_ns=7001 duration_ns=5901 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=http_response batch=0 slot=0 count=200 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=8000 duration_ns=6000 request=0 attempt=0 tag=16' > "$scratch/tag-trace.txt"
+tag_join=$(awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace.txt")
+grep -q $'^16\t1000\t11500\t10500\t1100\t11000\t2\ttrue\tok\t200\t2000\t3000\t3000\t4000\t5000\t7000\t2\t7001\t2\t8000\t900\t1000\t1000\t1000\t3000\tvalid\tcomplete$' <<<"$tag_join"
+grep -qx '# correlation_status=valid' <<<"$tag_join"
+grep -qx '# missing_result=0' <<<"$tag_join"
+grep -qx '# cross_process_order_unknown=0' <<<"$tag_join"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-unpaired.txt"
+for ((tag=32; tag<=1056; tag+=16)); do
+ printf 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=%d end_unix_ns=%d duration_ns=1 request=0 attempt=0 tag=%d\n' "$((2000 + tag))" "$((2001 + tag))" "$tag" >> "$scratch/tag-trace-unpaired.txt"
+done
+tag_unpaired=$(awk -v client_file="$scratch/tag-client.tsv" -v tag_sample_max=2000 -v tag_sample_stride=16 -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-unpaired.txt")
+grep -qx '# correlation_status=valid' <<<"$tag_unpaired"
+grep -qx '# unpaired_sampled_tags=65' <<<"$tag_unpaired"
+grep -qx '# foreign_server_events=0' <<<"$tag_unpaired"
+printf '16\t2\t1000\t11500\t1100\t8500\t10500\ttrue\n' > "$scratch/tag-client-cross.tsv"
+tag_cross=$(awk -v client_file="$scratch/tag-client-cross.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace.txt")
+grep -q $'\tNA\tvalid\tcomplete_cross_process_order_unknown$' <<<"$tag_cross"
+grep -qx '# cross_process_order_unknown=1' <<<"$tag_cross"
+printf '16\t2\t1000\t9000\t1100\t8500\t7000\ttrue\n16\t2\t1000\t9000\t1100\t8500\t7000\ttrue\n' > "$scratch/tag-client-duplicate.tsv"
+if awk -v client_file="$scratch/tag-client-duplicate.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace.txt" > "$scratch/tag-duplicate.out"; then
+ printf 'duplicate client tag accepted\n' >&2; exit 1
+fi
+grep -qx '# duplicate_client_tags=1' "$scratch/tag-duplicate.out"
+grep -qx '# correlation_status=invalid' "$scratch/tag-duplicate.out"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-foreign.txt"
+printf '%s\n' 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=32' >> "$scratch/tag-trace-foreign.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-foreign.txt" > "$scratch/tag-foreign.out"; then
+ printf 'foreign server tag accepted\n' >&2; exit 1
+fi
+grep -qx '# foreign_server_events=1' "$scratch/tag-foreign.out"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-duplicate.txt"
+printf '%s\n' 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=16' >> "$scratch/tag-trace-duplicate.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-duplicate.txt" > "$scratch/tag-server-duplicate.out"; then
+ printf 'duplicate server tag accepted\n' >&2; exit 1
+fi
+grep -qx '# duplicate_server_events=1' "$scratch/tag-server-duplicate.out"
+sed 's/stage=batch_proposal batch=0 slot=2/stage=batch_proposal batch=0 slot=3/' "$scratch/tag-trace.txt" > "$scratch/tag-trace-slot.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-slot.txt" > "$scratch/tag-slot.out"; then
+ printf 'proposal slot mismatch accepted\n' >&2; exit 1
+fi
+grep -qx '# slot_mismatches=1' "$scratch/tag-slot.out"
+printf '16\t0\t1000\t9000\t1100\t8500\t7000\tfalse\n' > "$scratch/tag-client-failed.tsv"
+printf '%s\n' \
+ 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=http_response batch=0 slot=0 count=503 peer=0000000000000000 outcome=error start_unix_ns=2000 end_unix_ns=8000 duration_ns=6000 request=0 attempt=0 tag=16' > "$scratch/tag-trace-failed.txt"
+tag_failed=$(awk -v client_file="$scratch/tag-client-failed.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-failed.txt")
+grep -q $'\trequest_error\tclient_or_http_failure$' <<<"$tag_failed"
+grep -qx '# http_failures=1' <<<"$tag_failed"
+grep -qx '# correlation_status=errors' <<<"$tag_failed"
+printf '16\t0\t1000\t9000\t1100\t0\t7000\tfalse\n' > "$scratch/tag-client-transmit.tsv"
+: > "$scratch/tag-trace-transmit.txt"
+tag_transmit=$(awk -v client_file="$scratch/tag-client-transmit.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-transmit.txt")
+grep -q $'\ttransmit_failure\tno_response_headers$' <<<"$tag_transmit"
+grep -qx '# transmit_failures=1' <<<"$tag_transmit"
+grep -qx '# correlation_status=errors' <<<"$tag_transmit"
 # The upload allowlist must not accidentally include raw logs or arbitrary text.
 workflow="$here/../.github/workflows/performance.yml"
 ! grep -Fq 'before-ack-sampled-diagnostics/*.txt' "$workflow"
@@ -295,13 +358,14 @@ for mode in normal normal-live ring sampled shifted before-first after-last no-w
  diagnostic=0
  live=0
  slot_samples=0
+ tag_samples=0
  [[ $mode != *-live ]] || live=1
  [[ $mode != ring ]] || diagnostic=1
- [[ $mode != sampled ]] || { diagnostic=1; live=1; slot_samples=1; }
+ [[ $mode != sampled ]] || { diagnostic=1; live=1; slot_samples=1; tag_samples=1; }
  [[ $mode != shifted && $mode != client-fail && $mode != client-fail-live && $mode != cleanup-fail && $mode != client-fail-cleanup-fail && $mode != client-fail-cleanup-fail-live && $mode != copy-fail && $mode != node-shutdown-fail && $mode != node-timeout && $mode != docker-timeout ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_RECORD_BUILD_ID="$slot_samples" RHIZA_SERVER_BENCH_LIVE_PROGRESS="$live" RHIZA_SERVER_BENCH_SLOT_SAMPLES="$slot_samples" RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_RECORD_BUILD_ID="$slot_samples" RHIZA_SERVER_BENCH_LIVE_PROGRESS="$live" RHIZA_SERVER_BENCH_SLOT_SAMPLES="$slot_samples" RHIZA_SERVER_BENCH_TAG_SAMPLES="$tag_samples" RHIZA_SERVER_BENCH_LATENCY_DIAGNOSTICS="$diagnostic" RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal || $mode == normal-live || $mode == ring || $mode == sampled ]]; then
   [[ $status == 0 ]]
@@ -314,9 +378,11 @@ for mode in normal normal-live ring sampled shifted before-first after-last no-w
   if [[ $mode == ring ]]; then grep -qx 'survivor_buffered_events=possibly_lost' "$scratch/$mode/result-cleanup-status.txt"; fi
   if [[ $mode == sampled ]]; then
    grep -q -- '-live-progress-slot-samples' "$scratch/$mode/bench.args"
+   grep -q -- '-live-progress-tag-samples' "$scratch/$mode/bench.args"
    [[ $(grep -c '^1$' "$scratch/$mode/node-sampling") == 3 ]]
    grep -qx 'tagged=1' "$scratch/$mode/result-build.txt"
    grep -qx 'slot_samples=1' "$scratch/$mode/result-build.txt"
+   grep -qx 'tag_samples=1' "$scratch/$mode/result-build.txt"
    grep -Eq '^server_sha256=[a-f0-9]{64}$' "$scratch/$mode/result-build.txt"
    grep -Eq '^client_sha256=[a-f0-9]{64}$' "$scratch/$mode/result-build.txt"
   else

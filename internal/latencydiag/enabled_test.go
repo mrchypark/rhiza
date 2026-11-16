@@ -5,6 +5,7 @@ package latencydiag
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -37,6 +38,24 @@ func TestObserveSampledSub100msEvent(t *testing.T) {
 	observe("before_ack_wait", 16, "", nil, time.Now())
 	events, dropped := ring.drain()
 	if dropped != 0 || len(events) != 1 || events[0].stage != "before_ack_wait" || events[0].slot != 16 || events[0].outcome != "ok" {
+		t.Fatalf("events=%+v dropped=%d", events, dropped)
+	}
+}
+
+func TestTaggedEventsUseOnlySampledOpaqueTags(t *testing.T) {
+	flushMu.Lock()
+	defer flushMu.Unlock()
+	ring.drain()
+	ctx := WithTag(context.Background(), 32)
+	if Tag(ctx) != 32 || Tag(context.Background()) != 0 || Tag(nil) != 0 {
+		t.Fatal("tag correlation failed")
+	}
+	for _, tag := range []uint64{0, 15, 16, 32} {
+		TraceTag("http_receive", tag, 0, nil, time.Now())
+	}
+	TraceHTTPResponse(16, http.StatusBadRequest, time.Now())
+	events, dropped := ring.drain()
+	if dropped != 0 || len(events) != 3 || events[0].tag != 16 || events[1].tag != 32 || events[2].stage != "http_response" || events[2].count != http.StatusBadRequest || events[2].outcome != "error" {
 		t.Fatalf("events=%+v dropped=%d", events, dropped)
 	}
 }
