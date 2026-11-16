@@ -173,11 +173,15 @@ managed_functional_write_load_script() {
 set -u
 mode=$1
 n=0
-stage=initial
+# Survivor runs pin their stage so the shared mutable stage file cannot relabel requests.
+fixed_stage=${RHIZA_FUNCTIONAL_LOAD_STAGE:-}
+stage=${fixed_stage:-initial}
 while [ ! -f /work/stop ]; do
   n=$((n+1))
-  next_stage=$(cat /work/stage 2>/dev/null || :)
-  [ -z "$next_stage" ] || stage=$next_stage
+  if [ -z "$fixed_stage" ]; then
+    next_stage=$(cat /work/stage 2>/dev/null || :)
+    [ -z "$next_stage" ] || stage=$next_stage
+  fi
   if [ "$mode" = write ]; then
     case "$stage" in
       one-survivor) row_base=900000 ;;
@@ -328,8 +332,8 @@ managed_functional_start_survivor_load() {
   # shellcheck disable=SC2016 # The remote shell owns $! and wait targets.
   k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c '
     rm -f /work/stop /work/one-done
-    sh /load/load.sh write > /work/one-write.tsv 2> /work/one-write.script.stderr & w=$!
-    sh /load/load.sh linear > /work/one-read.tsv 2> /work/one-read.script.stderr & r=$!
+    RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor sh /load/load.sh write > /work/one-write.tsv 2> /work/one-write.script.stderr & w=$!
+    RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor sh /load/load.sh linear > /work/one-read.tsv 2> /work/one-read.script.stderr & r=$!
     wait $w
     wait $r
     touch /work/one-done
@@ -1200,7 +1204,7 @@ managed_functional_self_test() (
   printf '1\tup-3\twrite\t1\t200\t0\t{"status":"committed"}\n2\tone-survivor\twrite\t2\t503\t0\toperation unavailable\n' > "$scratch/writes.tsv"
   printf '1\tup-3\tlinearizable-read\t1\t200\t0\t{"rows":[[1]]}\n2\tone-survivor\tlinearizable-read\t2\t000\t28\t\n' > "$scratch/reads.tsv"
   logs=$scratch managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/summary.json"
-  jq -e '.stages.up3.http503==0 and .failures.http503.total==1 and .failures.deadline.total==1' "$scratch/summary.json" >/dev/null
+  jq -e '.stages.up3.http503==0 and .stages.oneSurvivor.writes==1 and .stages.oneSurvivor.committedWrites==0 and .failures.http503.writes==1 and .failures.deadline.reads==1' "$scratch/summary.json" >/dev/null
   cat "$scratch/reads.tsv" > "$scratch/bad-reads.tsv"
   printf '3\tone-survivor\tlinearizable-read\t3\t200\t0\t{"rows":[[1]]}\n' >> "$scratch/bad-reads.tsv"
   if logs=$scratch managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/bad-reads.tsv" "$scratch/bad-summary.json" 2>/dev/null; then return 1; fi
@@ -1233,6 +1237,8 @@ case "$count" in
   2) printf 'up-3' > "$LOAD_WORK/stage" ;;
   3) : > "$LOAD_WORK/stop" ;;
 esac
+  request=$(cat)
+  printf '%s' "$request" > "$LOAD_WORK/request-$count"
 [ "$count" = 2 ] && printf '%s\n' 'curl: simulated timeout in stderr only' >&2
 [ "$count" = 3 ] || [ -z "$out" ] || printf '%s' '{"slot":1,"status":"committed","rows_affected":1,"last_insert_id":100001,"retry_through_slot":1}' > "$out"
 [ "$count" = 3 ] && printf '000' || printf '200'
@@ -1244,6 +1250,19 @@ EOF
   if grep -F 'curl:' "$scratch/stage-per-request.tsv" >/dev/null; then return 1; fi
   grep -Fx 'curl: simulated timeout in stderr only' "$scratch/work/down-2-write.curl.stderr" >/dev/null
   [ ! -s "$scratch/work/up-3-write.body" ]
+  rm -f "$scratch/work/stop" "$scratch/work/count"
+  printf 'initial' > "$scratch/work/stage"
+  PATH="$scratch:$PATH" LOAD_WORK="$scratch/work" RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor \
+    sh "$scratch/load-test.sh" write > "$scratch/fixed-stage-write.tsv"
+  [ "$(awk -F '\t' '{printf "%s%s",sep,$2; sep=","}' "$scratch/fixed-stage-write.tsv")" = one-survivor,one-survivor,one-survivor ]
+  grep -F '"request_id":"functional-one-survivor-write-1-' "$scratch/work/request-1" >/dev/null
+  grep -F '"request_id":"functional-one-survivor-write-2-' "$scratch/work/request-2" >/dev/null
+  if grep -F 'functional-initial-write' "$scratch/work/request-1" "$scratch/work/request-2" >/dev/null; then return 1; fi
+  rm -f "$scratch/work/stop" "$scratch/work/count"
+  printf 'initial' > "$scratch/work/stage"
+  PATH="$scratch:$PATH" LOAD_WORK="$scratch/work" RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor \
+    sh "$scratch/load-test.sh" linear > "$scratch/fixed-stage-read.tsv"
+  [ "$(awk -F '\t' '{printf "%s%s",sep,$2; sep=","}' "$scratch/fixed-stage-read.tsv")" = one-survivor,one-survivor,one-survivor ]
   printf 'not-a-row\n' > "$scratch/writes.tsv"
   if managed_functional_load_oracle "$scratch/writes.tsv" "$scratch/reads.tsv" "$scratch/bad.json" 2>/dev/null; then return 1; fi
   logs=$scratch
@@ -1529,8 +1548,8 @@ leave-u5'
   }
   managed_functional_start_survivor_load
   wait "$functional_survivor_pid"
-  grep -F '/load/load.sh write' "$scratch/survivor-command" >/dev/null
-  grep -F '/load/load.sh linear' "$scratch/survivor-command" >/dev/null
+  grep -F 'RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor sh /load/load.sh write' "$scratch/survivor-command" >/dev/null
+  grep -F 'RHIZA_FUNCTIONAL_LOAD_STAGE=one-survivor sh /load/load.sh linear' "$scratch/survivor-command" >/dev/null
   # shellcheck disable=SC2016 # Verify the remote shell retains its variables.
   grep -F 'wait $w' "$scratch/survivor-command" >/dev/null
   # shellcheck disable=SC2016 # Verify the remote shell retains its variables.
