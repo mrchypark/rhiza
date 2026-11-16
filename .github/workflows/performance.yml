@@ -171,6 +171,7 @@ jobs:
         run: |
           sh benchmarks/run-ci-benchmarks_test.sh
           bash benchmarks/run-server-reference_test.sh
+          bash benchmarks/before_ack_median_test.sh
 
       - name: Run interleaved base and candidate benchmarks
         run: |
@@ -261,15 +262,56 @@ jobs:
                 "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-$sample.json"
             fi
           done
+          # BEGIN before_ack_median
+          before_ack_median() {
+            local field=$1
+            shift
+            if (( $# != 3 )); then
+              printf 'before-ack median requires exactly 3 samples\n' >&2
+              return 1
+            fi
+            local -a files=("$@")
+            local unique
+            unique=$(printf '%s\n' "${files[@]}" | sort -u | wc -l | tr -d ' ')
+            if (( unique != 3 )); then
+              printf 'before-ack median received duplicate sample files\n' >&2
+              return 1
+            fi
+            local file
+            for file in "${files[@]}"; do
+              if [[ ! -f $file ]]; then
+                printf 'before-ack sample file missing: %s\n' "$file" >&2
+                return 1
+              fi
+            done
+            jq -s -e --arg field "$field" '
+              if length != 3 then error("expected exactly 3 samples") else . end
+              | map(getpath($field | split(".")))
+              | if any(. == null or (type != "number") or isnan or isinfinite) then error("sample field must be finite numeric") else . end
+              | sort
+              | .[1]
+            ' "${files[@]}"
+          }
+          # END before_ack_median
+          before_ack_base_files=(
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-1.json"
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-2.json"
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-3.json"
+          )
+          before_ack_candidate_files=(
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-1.json"
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-2.json"
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-3.json"
+          )
           rhiza_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
           rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
-          before_ack_base_ops=$(jq -sr '[.[].result.success_ops_per_sec] | sort | .[length / 2 | floor] | floor' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
-          before_ack_base_p99=$(jq -sr '[.[].result.p99_ms] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
-          before_ack_base_http=$(jq -sr '[.[].object_store_delta.http_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
-          before_ack_candidate_ops=$(jq -sr '[.[].result.success_ops_per_sec] | sort | .[length / 2 | floor] | floor' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
-          before_ack_candidate_p99=$(jq -sr '[.[].result.p99_ms] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
-          before_ack_candidate_http=$(jq -sr '[.[].object_store_delta.http_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
-          before_ack_candidate_put=$(jq -sr '[.[].object_store_delta.http_put_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
+          before_ack_base_ops=$(before_ack_median result.success_ops_per_sec "${before_ack_base_files[@]}")
+          before_ack_base_p99=$(before_ack_median result.p99_ms "${before_ack_base_files[@]}")
+          before_ack_base_http=$(before_ack_median object_store_delta.http_requests "${before_ack_base_files[@]}")
+          before_ack_candidate_ops=$(before_ack_median result.success_ops_per_sec "${before_ack_candidate_files[@]}")
+          before_ack_candidate_p99=$(before_ack_median result.p99_ms "${before_ack_candidate_files[@]}")
+          before_ack_candidate_http=$(before_ack_median object_store_delta.http_requests "${before_ack_candidate_files[@]}")
+          before_ack_candidate_put=$(before_ack_median object_store_delta.http_put_requests "${before_ack_candidate_files[@]}")
           # shellcheck disable=SC2016
           {
             printf '\n## Rhiza leaderless availability qualification\n\n'
