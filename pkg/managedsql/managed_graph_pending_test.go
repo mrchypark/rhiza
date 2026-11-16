@@ -175,19 +175,18 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 		}
 	}
 	target := configs[1].Runtime.NodeID
-	push := make(chan uint64, 64)
 	background, native, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var backgroundOnce, nativeOnce, releaseOnce sync.Once
 	var held, cancelAtNative atomic.Bool
+	var lastEvent atomic.Value
+	lastEvent.Store("")
 	observation, cancelObservation := context.WithCancel(ctx)
 	defer cancelObservation()
 	restore := localtesthooks.Set(func(event string) {
-		if slot, matched := managedGraphLearnedSlot(event, string(target)); held.Load() && matched {
-			select {
-			case push <- slot:
-			case <-ctx.Done():
-				return
-			}
+		if strings.Contains(event, "node="+string(target)) {
+			lastEvent.Store(event)
+		}
+		if _, matched := managedGraphLearnedSlot(event, string(target)); held.Load() && matched {
 			<-release
 		}
 		if held.Load() && event == "node:catchup-peer:phase=before-local-replay:node="+string(target) {
@@ -222,20 +221,28 @@ func testManagedGraphPublicPending(t *testing.T, mode string) {
 		t.Fatal("other actual voter has not applied the original", err)
 	}
 	before, err := hosts[1].node.ManagedState()
-	originalDelivered := false
+	lastStateErr := err
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
 	for {
-		if err != nil || before.AppliedTip >= ack.Slot {
-			t.Fatal("actual target certified/apply gap escaped its barrier", before, err)
-		}
-		if originalDelivered && before.CertifiedTip >= ack.Slot {
-			break
+		if err == nil {
+			if before.AppliedTip >= ack.Slot {
+				t.Fatal("actual target certified/apply gap escaped its barrier", before)
+			}
+			if before.CertifiedTip >= ack.Slot {
+				break
+			}
+		} else if !errors.Is(err, network.ErrNotReady) {
+			t.Fatal("actual target state observation failed", before, err)
 		}
 		select {
-		case slot := <-push:
-			originalDelivered = originalDelivered || slot == ack.Slot
+		case <-tick.C:
 			before, err = hosts[1].node.ManagedState()
+			lastStateErr = err
 		case <-ctx.Done():
-			t.Fatal("exact original Graph certificate/prefix was not observed", ctx.Err())
+			observed, observeErr := hosts[1].node.ManagedState()
+			last, _ := lastEvent.Load().(string)
+			t.Fatalf("exact original Graph certificate/prefix was not observed: required_slot=%d certified_tip=%d applied_tip=%d recorder_tip=%d state_error=%v last_state_error=%v last_event=%q: %v", ack.Slot, observed.CertifiedTip, observed.AppliedTip, observed.RecorderTip, observeErr, lastStateErr, last, ctx.Err())
 		}
 	}
 	// Both other replicas have applied this command. No new application command
