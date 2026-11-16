@@ -23,6 +23,8 @@ function overlaps(start_a, end_a, start_b, end_b) {
   return start_a + 2048 < end_b && end_a - 2048 > start_b
 }
 BEGIN {
+  max_client_tags = 64
+  max_pair_checks = max_client_tags * max_client_tags
   if (client_file == "") { print "# status=invalid missing_client_file"; exit 2 }
   while ((getline line < client_file) > 0) {
     split(line, cols, "\t")
@@ -32,8 +34,8 @@ BEGIN {
       exit 2
     }
     if (tag in selected) { print "# status=invalid duplicate_client_tag"; exit 2 }
+    if (++tag_count > max_client_tags) { print "# status=invalid too_many_client_tags"; exit 2 }
     selected[tag] = 1
-    tags[++tag_count] = tag
     client_slot[tag] = cols[2]
     client_latency[tag] = cols[7]
     succeeded[tag] = cols[8]
@@ -59,8 +61,8 @@ BEGIN {
   else if (stage == "pre_enqueue_validate") { validate_start[tag] = start; validate_end[tag] = finish }
   else if (stage == "pre_enqueue_fingerprint") { fingerprint_start[tag] = start; fingerprint_end[tag] = finish }
   else if (stage == "pre_enqueue_encode") { encode_start[tag] = start; encode_end[tag] = finish }
-  else if (stage == "request_lock_wait") { lock_start[tag] = start; lock_end[tag] = finish; lock_outcome[tag] = outcome; lock_shard[tag] = count }
-  else if (stage == "request_lock_hold") { hold_start[tag] = start; hold_end[tag] = finish; hold_shard[tag] = count }
+  else if (stage == "request_lock_wait") { lock_start[tag] = start; lock_end[tag] = finish; lock_outcome[tag] = outcome; lock_shard[tag] = count; lock_file[tag] = FILENAME; wait_tags[tag] = 1 }
+  else if (stage == "request_lock_hold") { hold_start[tag] = start; hold_end[tag] = finish; hold_shard[tag] = count; hold_file[tag] = FILENAME; hold_tags[tag] = 1 }
   else if (stage == "materializer_receipt_pre_enqueue") { receipt_start[tag] = start; receipt_end[tag] = finish }
   else if (stage == "batcher_enqueue") { enqueue_start[tag] = start; enqueue_end[tag] = finish; enqueue_outcome[tag] = outcome }
   else if (stage == "mutation_admission") { admission_end[tag] = finish }
@@ -69,8 +71,7 @@ BEGIN {
 END {
   print "# Pre-enqueue stages use fixed numeric fields; missing values are NA and are never zero-filled."
   print "# tag\tslot\tlock_shard\tclone_ns\tvalidate_ns\tfingerprint_ns\tencode_ns\tlock_wait_ns\tlock_outcome\treceipt_ns\tenqueue_ns\tenqueue_outcome\tadmission_to_enqueue_ns\tclient_latency_ns\tcorrelation\treason"
-  for (i = 1; i <= tag_count; i++) {
-    tag = tags[i]
+  for (tag in selected) {
     correlation = "valid"; reason = "complete"
     if (succeeded[tag] != "true") {
       correlation = "request_error"; reason = "client_failure"; client_failures++
@@ -93,14 +94,16 @@ END {
     admission_to_enqueue = (tag in admission_end && tag in enqueue_end) ? enqueue_end[tag] - admission_end[tag] : ""
     print tag "\t" client_slot[tag] "\t" show(lock_shard[tag]) "\t" show(duration(clone_start[tag], clone_end[tag])) "\t" show(duration(validate_start[tag], validate_end[tag])) "\t" show(duration(fingerprint_start[tag], fingerprint_end[tag])) "\t" show(duration(encode_start[tag], encode_end[tag])) "\t" show(duration(lock_start[tag], lock_end[tag])) "\t" show(lock_outcome[tag]) "\t" show(duration(receipt_start[tag], receipt_end[tag])) "\t" show(duration(enqueue_start[tag], enqueue_end[tag])) "\t" show(enqueue_outcome[tag]) "\t" show(admission_to_enqueue) "\t" show(client_latency[tag]) "\t" correlation "\t" reason
   }
-  for (i = 1; i <= tag_count; i++) {
-    waiter = tags[i]
-    if (!(waiter in lock_shard) || succeeded[waiter] != "true") continue
-    for (j = 1; j <= tag_count; j++) {
-      holder = tags[j]
-      if (holder == waiter || !(holder in hold_shard) || succeeded[holder] != "true") continue
+  # gawk 5.2.1 faults on the old indexed tags[] pair traversal.
+  for (waiter in wait_tags) {
+    if (succeeded[waiter] != "true") continue
+    for (holder in hold_tags) {
+      if (holder == waiter || succeeded[holder] != "true") continue
+      if (++pair_checks > max_pair_checks) { pair_limit_exceeded = 1; fatal++; break }
+      if (lock_file[waiter] != hold_file[holder]) continue
       if (lock_shard[waiter] == hold_shard[holder] && overlaps(lock_start[waiter], lock_end[waiter], hold_start[holder], hold_end[holder])) same_shard_overlaps++
     }
+    if (pair_limit_exceeded) break
   }
   status = fatal > 0 ? "invalid" : (client_failures > 0 ? "errors" : ((incomplete + pre_enqueue_drops > 0) ? "incomplete" : "valid"))
   print "# status=" status
@@ -116,6 +119,9 @@ END {
   print "# enqueue_outcome_failures=" enqueue_failures + 0
   print "# order_invalid=" order_invalid + 0
   print "# positive_lock_waits_over_2048ns=" positive_lock_waits + 0
+  print "# pair_checks=" pair_checks + 0
+  print "# pair_check_limit=" max_pair_checks
+  print "# pair_limit_exceeded=" pair_limit_exceeded + 0
   print "# same_shard_wait_hold_overlaps=" same_shard_overlaps + 0
   print "# hold_end_semantics=timestamp_before_release_lower_bound"
   print "# overlap_rule=wait_overlaps_recorded_conservative_hold"

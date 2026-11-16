@@ -2,7 +2,7 @@
 set -euo pipefail
 
 emit_required() {
-	for relative in README.txt commit.txt calibration-status.txt concurrency-status.txt concurrency-before.json concurrency-after.json; do
+	for relative in README.txt commit.txt calibration-status.txt analysis-tools.txt concurrency-status.txt concurrency-before.json concurrency-after.json; do
 		printf 'nonempty\t%s\n' "$relative"
 	done
 	for phase in off-1 on-1 on-2 off-2; do
@@ -18,9 +18,15 @@ emit_required() {
 			"$phase-client-slots.txt" "$phase-slot-overlap.txt" "$phase-client-tags.txt" \
 			"$phase.validation-exit" "$phase-tag-overlap.txt" "$phase-tag-collection.exit" \
 			"$phase-tag-validation.exit" "$phase-pre-enqueue-latency.txt" \
+			"$phase-pre-enqueue-awk.exit" "$phase-pre-enqueue-sort.exit" \
 			"$phase-pre-enqueue-collection.exit" "$phase-pre-enqueue-validation.exit" \
 			"$phase-live-progress.jsonl"; do
 			printf 'nonempty\t%s\n' "$relative"
+		done
+		for relative in \
+			"$phase-pre-enqueue-awk.stderr" "$phase-pre-enqueue-sort.stderr" \
+			"$phase-pre-enqueue-unsorted.txt"; do
+			printf 'exists\t%s\n' "$relative"
 		done
 	done
 }

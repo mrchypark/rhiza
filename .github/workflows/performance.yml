@@ -685,9 +685,11 @@ jobs:
           }
           trap finish EXIT
           git rev-parse HEAD > "$dir/commit.txt"
+          bash scripts/ci/capture-analysis-tool-versions.sh "$dir/analysis-tools.txt" awk sort
           printf '%s\n' 'Temporary diagnostic, remove after investigation: fixed 1/16 client tags and 1/16 slots, up to 64 slowest retained completed samples each; not representative p99. Tags connect client send, HTTP receive, mutation admission, batcher proposal, result and response without logging request IDs or request content. The tag header is unauthenticated. Correlation is supported only for one trusted benchmark client against an isolated loopback target; an untrusted client can forge an in-domain tag, and duplicate traffic can consume the fixed 256-entry ring. In-domain tags absent from the retained 64 samples are reported as unpaired sampled tags, not foreign, but cannot be proven genuine. Out-of-domain tags, duplicate boundaries and proposal/result slot mismatches fail the join. A retry keeps one logical tag; repeated forwarded boundaries make that tag ambiguous and it is excluded. HTTP response status is retained as a fixed numeric field and status 400 or above produces outcome=error. Handler return versus client header receipt within 2048 ns is unknown, not an ordered duration. Apply target slots are the requested through value, not the actual batch endpoint. WAL worker batching and lock intervals start when the worker runs and exclude earlier queue delay; batching-and-lock includes the lock interval. Final slot result has a request ID and no inferred batch. IDs are process-local. Off/on compares the complete tagged instrumentation against untagged, not merely sampling. Same-runner calibration is approximate; runner noise and unmeasured effects remain. Ring loss and killed processes can hide events; missing records are unknown and are never filled or correlated. Artifacts contain only fixed-schema traces and synthetic test aggregate data; raw process logs and raw error samples are excluded.' > "$dir/README.txt"
           printf '%s\n' 'Archive timer is actual elapsed time. Load, acquire, confirm, release, extent build and HEAD refresh events measure whole named operations and may include multiple provider calls, retries, validation, or local work. They are not individual HTTP spans and may overlap other intervals. A missing event is unknown, never zero.' >> "$dir/README.txt"
           printf '%s\n' 'Pre-enqueue stages are fixed numeric tag boundaries. pre_enqueue_dropped is a subset of total ring drops for those stages; any nonzero value makes the pre-enqueue assessment incomplete. Shard is only the low 12-bit request-lock selector in 0..4095 and never a request ID; out-of-range values fail assessment. request_lock_hold records its end immediately before release as a conservative lower bound; actual release may occur later if the goroutine is descheduled, so overlap detection may under-report but cannot extend the hold after release. Collection success and causal validation are separate exit artifacts. artifact-completeness.txt individually verifies the files expected from a successful diagnostic run; off-phase traces may be empty but must exist; on-phase traces and analysis outputs must be nonempty; partial artifacts are marked incomplete rather than treated as complete.' >> "$dir/README.txt"
+          printf '%s\n' 'Analysis tool paths and versions, plus separate awk and sort exit codes and stderr, are retained for the pre-enqueue analyzer. The stderr files are confined to analyzer/tool diagnostics and must not contain input rows, request content, credentials, or request identifiers.' >> "$dir/README.txt"
           for phase in off-1 on-1 on-2 off-2; do
             case "$phase" in on-*) diag=1 ;; *) diag=0 ;; esac
             rc=0
@@ -737,7 +739,7 @@ jobs:
             if [ "$tag_collect" -eq 0 ] && grep -qx '# correlation_status=valid' "$dir/$phase-tag-overlap.txt" && grep -Eq '^# valid_correlations=[1-9][0-9]*$' "$dir/$phase-tag-overlap.txt"; then tag_valid=0; fi
             printf '%s\n' "$tag_valid" > "$dir/$phase-tag-validation.exit"
             pre_collect=0
-            awk -v client_file="$dir/$phase-client-tags.txt" -f scripts/ci/assess-preenqueue-latency.awk "$dir/$phase"-node-*-trace.txt | sort -n -k1,1 > "$dir/$phase-pre-enqueue-latency.txt" || pre_collect=$?
+            bash scripts/ci/assess-preenqueue-pipeline.sh "$dir" "$phase" awk sort || pre_collect=$?
             printf '%s\n' "$pre_collect" > "$dir/$phase-pre-enqueue-collection.exit"
             pre_valid=1
             if [ "$pre_collect" -eq 0 ] && bash scripts/ci/check-preenqueue-assessment.sh "$dir/$phase-client-tags.txt" "$dir/$phase-pre-enqueue-latency.txt"; then pre_valid=0; fi
@@ -760,13 +762,19 @@ jobs:
             ${{ runner.temp }}/before-ack-sampled-diagnostics/README.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/commit.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/calibration-status.txt
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/analysis-tools.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-build.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-trace.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-client-slots.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-slot-overlap.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-client-tags.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-tag-overlap.txt
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-unsorted.txt
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-latency.txt
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-awk.exit
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-sort.exit
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-awk.stderr
+            ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-sort.stderr
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-tag-validation.exit
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-pre-enqueue-validation.exit
             ${{ runner.temp }}/before-ack-sampled-diagnostics/*-collection.exit
