@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"runtime"
@@ -65,29 +64,18 @@ func TestMutationAdmissionCountAndAggregateByteCaps(t *testing.T) {
 	}
 }
 
-func TestRequestStripeWaitHonorsCancellationAndShutdown(t *testing.T) {
+func TestRequestLockWaitHonorsCancellationAndShutdown(t *testing.T) {
 	server := NewServer(nil, nil, "cluster", false, nil)
 	defer server.Close()
 	id := "same-id"
-	hash := sha256.Sum256([]byte(id))
-	stripe := uint16(hash[0])<<4 | uint16(hash[1])>>4
-	other := ""
-	for i := 0; ; i++ {
-		candidate := fmt.Sprintf("stripe-%d", i)
-		otherHash := sha256.Sum256([]byte(candidate))
-		if uint16(otherHash[0])<<4|uint16(otherHash[1])>>4 == stripe {
-			other = candidate
-			break
-		}
-	}
 	unlock, err := server.lockRequest(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := server.lockRequest(ctx, other); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("stripe wait error=%v", err)
+	if _, err := server.lockRequest(ctx, id); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same-ID wait error=%v", err)
 	}
 	unlock()
 	unlock, err = server.lockRequest(context.Background(), "shutdown")
@@ -183,11 +171,10 @@ func TestBlockedStripeRetainsOnlyAdmittedMutationInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ids := make([]string, maxAdmittedBytes/charge)
-	stripeFor := func(id string) uint16 { h := sha256.Sum256([]byte(id)); return uint16(h[0])<<4 | uint16(h[1])>>4 }
 	found := 0
 	for i := 0; found < len(ids); i++ {
 		id := fmt.Sprintf("blocked-%06d", i)
-		if stripeFor(id) == stripeFor("hold") {
+		if requestLockShard(id) == requestLockShard("hold") {
 			ids[found] = id
 			found++
 		}

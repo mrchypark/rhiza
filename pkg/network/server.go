@@ -108,7 +108,9 @@ type Server struct {
 	kvBatcher            *mutationBatcher[types.KVCommand]
 	transport            *Transport
 	applyMu              sync.Mutex
-	requestLocks         [4096]chan struct{}
+	requestLocks         sync.Map // map[uint16]chan struct{}, up to 65,536 entries for the server lifetime
+	requestLocksMu       sync.RWMutex
+	requestLocksClosed   bool
 	mutationMu           sync.Mutex
 	mutationAdmission    mutationAdmission
 	durability           func(context.Context, quepaxa.Slot) error
@@ -281,8 +283,10 @@ func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	hash := sha256.Sum256([]byte(id))
-	lock := s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
+	lock := s.requestLock(requestLockShard(id))
+	if lock == nil {
+		return nil, ErrNotReady
+	}
 	select {
 	case lock <- struct{}{}:
 		if err := ctx.Err(); err != nil {
@@ -301,6 +305,30 @@ func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
 	case <-s.proposalCtx.Done():
 		return nil, ErrNotReady
 	}
+}
+
+func requestLockShard(id string) uint16 {
+	hash := sha256.Sum256([]byte(id))
+	return uint16(hash[0])<<8 | uint16(hash[1])
+}
+
+func (s *Server) requestLock(shard uint16) chan struct{} {
+	if lock, ok := s.requestLocks.Load(shard); ok {
+		return lock.(chan struct{})
+	}
+	s.requestLocksMu.RLock()
+	defer s.requestLocksMu.RUnlock()
+	if lock, ok := s.requestLocks.Load(shard); ok {
+		return lock.(chan struct{})
+	}
+	if s.requestLocksClosed {
+		return nil
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:request-lock:first-miss")
+	}
+	lock, _ := s.requestLocks.LoadOrStore(shard, make(chan struct{}, 1))
+	return lock.(chan struct{})
 }
 
 type proposalCall struct {
@@ -378,9 +406,6 @@ func newServerForProfile(core *quepaxa.Core, material *materializer.Materializer
 		localMode:        localMode,
 		syncLimit:        make(chan struct{}, 2),
 		readReplayLimit:  make(chan struct{}, 2),
-	}
-	for i := range s.requestLocks {
-		s.requestLocks[i] = make(chan struct{}, 1)
 	}
 	admission, err := newReadAdmission(defaultReadAdmissionLimits)
 	if err != nil {
@@ -521,6 +546,9 @@ func (s *Server) Close() {
 		s.handlerMu.Unlock()
 		s.proposeMu.Lock()
 		s.closing = true
+		s.requestLocksMu.Lock()
+		s.requestLocksClosed = true
+		s.requestLocksMu.Unlock()
 		s.signalAdmissionLocked(true)
 		s.proposalStop()
 		s.proposeMu.Unlock()

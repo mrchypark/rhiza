@@ -295,7 +295,7 @@ jobs:
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestReadRestoreBoundary$/^node-order$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestArchiveRestoreDoesNotRegressConcurrentLinearizableRead$' -count=1 -timeout=60s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestArchiveRestoreDoesNotRegressConcurrentLinearizableRead$' -count=1 -timeout=60s
-          go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose|TestRequestLocksConcurrentFirstMissCreatesSingleEntry)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestLearned.*|TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix|TestControlLearnedRepairsScheduleAndWaitsForDurability)$' -count=1 -timeout=3m
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
@@ -315,7 +315,7 @@ jobs:
         env:
           CGO_ENABLED: 1
         run: |
-          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose|TestRequestLocksConcurrentFirstMissCreatesSingleEntry)$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestLearned.*|TestLearnGapBlocksQuorumUntilCatchUpInstallsPrefix|TestControlLearnedRepairsScheduleAndWaitsForDurability)$' -count=1 -timeout=3m
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s

@@ -4,7 +4,6 @@ package network
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -42,14 +41,10 @@ func TestMutationAdmissionPeakRSS(t *testing.T) {
 	}
 	count := maxAdmittedBytes / charge
 	ids := make([]string, count)
-	stripe := func(id string) uint16 {
-		hash := sha256.Sum256([]byte(id))
-		return uint16(hash[0])<<4 | uint16(hash[1])>>4
-	}
 	found := 0
 	for i := 0; found < count; i++ {
 		id := fmt.Sprintf("rss-%06d", i)
-		if stripe(id) == stripe("hold-rss") {
+		if requestLockShard(id) == requestLockShard("hold-rss") {
 			ids[found] = id
 			found++
 		}
