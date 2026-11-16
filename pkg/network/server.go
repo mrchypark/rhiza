@@ -2716,6 +2716,9 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 }
 
 func (s *Server) applyDecisionsWithPeerLifetime(ctx context.Context, through quepaxa.Slot, peer context.Context) error {
+	if localtesthooks.Enabled {
+		ctx = localtesthooks.WithGraphApplyNode(ctx, string(s.core.NodeID()))
+	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	if peer != nil {

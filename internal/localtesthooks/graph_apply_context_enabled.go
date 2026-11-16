@@ -12,6 +12,17 @@ var graphApplyContext struct {
 	hook func(context.Context) context.Context
 }
 
+type graphApplyNodeKey struct{}
+
+func WithGraphApplyNode(ctx context.Context, node string) context.Context {
+	return context.WithValue(ctx, graphApplyNodeKey{}, node)
+}
+
+func GraphApplyNode(ctx context.Context) string {
+	node, _ := ctx.Value(graphApplyNodeKey{}).(string)
+	return node
+}
+
 func SetGraphApplyContext(hook func(context.Context) context.Context) func() {
 	graphApplyContext.Lock()
 	previous := graphApplyContext.hook

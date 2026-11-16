@@ -19,6 +19,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/quic-go/quic-go"
@@ -28,6 +29,16 @@ func TestLearnedGraphSlowQuorumProbe(t *testing.T) {
 	t.Run("remote-only", func(t *testing.T) { runLearnedGraphSlowQuorumProbe(t, "") })
 	t.Run("server-close", func(t *testing.T) { runLearnedGraphSlowQuorumProbe(t, "server") })
 	t.Run("peer-close", func(t *testing.T) { runLearnedGraphSlowQuorumProbe(t, "peer") })
+}
+
+func assertGraphSnapshot(t *testing.T, stage string, snapshot materializer.GraphApplySnapshot, sqliteTip, graphTip, durableTip uint64, status types.MutationStatus) {
+	t.Helper()
+	if snapshot.SQLiteTip != sqliteTip || snapshot.GraphTip != graphTip || snapshot.GraphDurableTip != durableTip {
+		t.Fatalf("%s tips SQLite=%d Graph=%d durable=%d, want %d/%d/%d", stage, snapshot.SQLiteTip, snapshot.GraphTip, snapshot.GraphDurableTip, sqliteTip, graphTip, durableTip)
+	}
+	if !snapshot.ReceiptFound || snapshot.Receipt.Slot != 1 || snapshot.Receipt.Status != status || !snapshot.Receipt.Applied {
+		t.Fatalf("%s receipt=%+v found=%t", stage, snapshot.Receipt, snapshot.ReceiptFound)
+	}
 }
 
 func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
@@ -91,11 +102,33 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 		t.Fatal(err)
 	}
 	slot := quepaxa.Slot(1)
-	entered, release, fast := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	var enteredOnce, slowResponse atomic.Bool
+	type graphGate struct {
+		snapshot materializer.GraphApplySnapshot
+		err      error
+	}
+	entered, release, fast := make(chan graphGate, 1), make(chan struct{}), make(chan struct{})
+	graphCanceled := make(chan struct{}, 1)
+	var slowResponse atomic.Bool
 	var releaseOnce, fastOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }); fastOnce.Do(func() { close(fast) }) }
 	t.Cleanup(unblock)
+	restoreGraph := localtesthooks.SetGraphApplyContext(func(applyCtx context.Context) context.Context {
+		if localtesthooks.GraphApplyNode(applyCtx) != "n3" {
+			return applyCtx
+		}
+		snapshot, err := p.materials["n3"].TestGraphApplySnapshot("graph-probe")
+		entered <- graphGate{snapshot: snapshot, err: err}
+		<-release
+		if shutdown != "" {
+			select {
+			case <-applyCtx.Done():
+			case <-ctx.Done():
+			}
+			graphCanceled <- struct{}{}
+		}
+		return applyCtx
+	})
+	t.Cleanup(restoreGraph)
 	observed := make(chan learnedStreamEvent, 8)
 	handlerResult := make(chan string, 2)
 	testLearnedStreamEvents.Store(&observed)
@@ -116,12 +149,6 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 			case <-ctx.Done():
 			}
 		}
-		if event == "materializer:graph:after-native-before-sqlite" {
-			if enteredOnce.CompareAndSwap(false, true) {
-				close(entered)
-				<-release
-			}
-		}
 	})
 	t.Cleanup(restore)
 	done := make(chan error, 1)
@@ -132,13 +159,19 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 		}
 		done <- err
 	}()
+	var native materializer.GraphApplySnapshot
 	select {
-	case <-entered:
+	case gate := <-entered:
+		if gate.err != nil {
+			t.Fatal(gate.err)
+		}
+		native = gate.snapshot
 	case err := <-done:
 		t.Fatalf("complete before graph gate: %v", err)
 	case <-ctx.Done():
 		t.Fatal("graph gate not reached")
 	}
+	assertGraphSnapshot(t, "native gate", native, 0, 1, 1, types.MutationCommitted)
 	var streamCtx context.Context
 	for streamCtx == nil {
 		select {
@@ -183,6 +216,11 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 		}
 		releaseOnce.Do(func() { close(release) })
 		select {
+		case <-graphCanceled:
+		case <-ctx.Done():
+			t.Fatal("Graph apply did not observe local cancellation")
+		}
+		select {
 		case err := <-closed:
 			if err != nil {
 				t.Fatal(err)
@@ -205,6 +243,11 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 		case <-ctx.Done():
 			t.Fatal("handler result not observed")
 		}
+		rolledBack, err := p.materials["n3"].TestGraphSnapshot("graph-probe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertGraphSnapshot(t, "canceled apply", rolledBack, 0, 1, 1, types.MutationCommitted)
 		if _, err := p.materials["n3"].GraphQuery(ctx, `MATCH (n:Item) RETURN n.id`, nil); err == nil || !strings.Contains(err.Error(), "does not match SQLite tip") {
 			t.Fatalf("paired read must reject native ahead: %v", err)
 		}
@@ -224,6 +267,12 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 			t.Fatal(err)
 		}
 		p.materials["n3"] = reopened
+		p.servers["n3"].material = reopened
+		reopenedNative, err := reopened.TestGraphSnapshot("graph-probe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertGraphSnapshot(t, "reopened native", reopenedNative, 0, 1, 1, types.MutationCommitted)
 		if _, err := reopened.GraphQuery(ctx, `MATCH (n:Item) RETURN n.id`, nil); err == nil || !strings.Contains(err.Error(), "does not match SQLite tip") {
 			t.Fatalf("reopened paired read must reject native ahead: %v", err)
 		}
@@ -240,6 +289,35 @@ func runLearnedGraphSlowQuorumProbe(t *testing.T, shutdown string) {
 		}
 		if receipt, found, err := reopened.GraphMutationReceipt(ctx, "graph-probe"); err != nil || !found || receipt.Status != types.MutationCommitted || receipt.Slot != 1 {
 			t.Fatalf("replay receipt=%+v found=%t err=%v", receipt, found, err)
+		}
+		replayed, err := reopened.TestGraphSnapshot("graph-probe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertGraphSnapshot(t, "replayed", replayed, 1, 1, 1, types.MutationCommitted)
+		history, err := reopened.ManagedGraphHistory(ctx)
+		if err != nil || history != native.History || history.LastGraphSlot != uint64(slot) {
+			t.Fatalf("replayed Graph history=%+v native=%+v err=%v", history, native.History, err)
+		}
+		decision, err := p.cores["n1"].TestCertifiedDecision(decisions[0])
+		if err != nil {
+			t.Fatalf("certified replay decision: %v", err)
+		}
+		authenticatedSender := p.config.Members[0]
+		if authenticatedSender.ID != "n1" || decision.Slot != decisions[0].Slot || decision.Proposal.Hash != decisions[0].Hash || !bytes.Equal(decision.Proposal.Value, decisions[0].Value) {
+			t.Fatalf("replayed learned ACK identity sender=%s decision_slot=%d value_slot=%d", authenticatedSender.ID, decision.Slot, decisions[0].Slot)
+		}
+		request := &peerfb.RequestT{Operation: peerfb.OperationLearned, ClusterId: "foreground-api", ConfigId: 1, SenderId: "n1", Decision: decisionToWire(decision)}
+		response, err := p.peerServers[2].handle(ctx, authenticatedSender.PublicKey[:], request)
+		if err != nil || response == nil || response.Error != "" {
+			t.Fatalf("replayed learned ACK response=%+v err=%v", response, err)
+		}
+		acked, err := reopened.TestGraphSnapshot("graph-probe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if acked != replayed {
+			t.Fatalf("learned ACK changed state: before=%+v after=%+v", replayed, acked)
 		}
 		if err := p.peerServers[2].Close(); err != nil {
 			t.Fatal(err)
