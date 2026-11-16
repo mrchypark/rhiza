@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestPreEnqueueTraceIsTaggedFixedAndBounded(t *testing.T) {
@@ -192,5 +193,73 @@ func TestPreEnqueueDropAccountingSurvivesConcurrentDrain(t *testing.T) {
 		drops.preEnqueueCapacity != each || drops.preEnqueueTryLock != each ||
 		drops.preEnqueueReasonIncomplete != 0 {
 		t.Fatalf("writer/drain drops=%+v", drops)
+	}
+}
+
+func TestDiagnosticRingCapacityContract(t *testing.T) {
+	const (
+		expectedCapacity       = 384
+		previousCapacity       = 256
+		ringStorageBudgetBytes = 64 << 10
+		peakFlushBudgetBytes   = 112 << 10
+	)
+	eventBytes := unsafe.Sizeof(event{})
+	ringBytes := eventBytes * uintptr(capacity)
+	previousRingBytes := eventBytes * uintptr(previousCapacity)
+	maxFlushCopyBytes := ringBytes
+	previousMaxFlushCopyBytes := previousRingBytes
+	steadyDelta := int64(ringBytes - previousRingBytes)
+	transientDelta := int64(maxFlushCopyBytes - previousMaxFlushCopyBytes)
+	peakFlushDelta := steadyDelta + transientDelta
+	t.Logf("capacity=%d event_bytes=%d ring_bytes=%d previous_ring_bytes=%d steady_delta_bytes=%d max_flush_copy_bytes=%d previous_max_flush_copy_bytes=%d transient_alloc_delta_bytes=%d peak_flush_memory_delta_bytes=%d",
+		capacity, eventBytes, ringBytes, previousRingBytes, steadyDelta,
+		maxFlushCopyBytes, previousMaxFlushCopyBytes, transientDelta, peakFlushDelta)
+	if capacity != expectedCapacity ||
+		ringBytes > ringStorageBudgetBytes ||
+		maxFlushCopyBytes > ringStorageBudgetBytes ||
+		ringBytes+maxFlushCopyBytes > peakFlushBudgetBytes {
+		t.Fatalf("capacity=%d event_bytes=%d ring_bytes=%d max_flush_copy_bytes=%d", capacity, eventBytes, ringBytes, maxFlushCopyBytes)
+	}
+}
+
+func TestPreEnqueueRingHighLoadKeepsBoundedFIFOAndAccounting(t *testing.T) {
+	var bounded eventRing
+	const attempts = capacity*4 + 17
+	for i := 0; i < attempts; i++ {
+		bounded.add(event{stage: StagePreEnqueueClone, family: familyPreEnqueue, tag: uint64(i + 1), start: time.Now(), end: time.Now()})
+	}
+	events, drops := bounded.drainWithDropStats()
+	const dropped = attempts - capacity
+	if len(events) != capacity || drops.total != dropped || drops.preEnqueue != dropped ||
+		drops.preEnqueueCapacity != dropped || drops.preEnqueueTryLock != 0 ||
+		drops.preEnqueueReasonIncomplete != 0 {
+		t.Fatalf("events=%d drops=%+v", len(events), drops)
+	}
+	if events[0].tag != dropped+1 || events[len(events)-1].tag != attempts {
+		t.Fatalf("FIFO bounds first=%d last=%d", events[0].tag, events[len(events)-1].tag)
+	}
+}
+
+func TestPreEnqueueRingConcurrentHighLoadAccounting(t *testing.T) {
+	var bounded eventRing
+	const writers = 8
+	const attempts = writers * capacity
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for writer := 0; writer < writers; writer++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < capacity; i++ {
+				bounded.add(event{stage: StageRequestLockHold, family: familyPreEnqueue, tag: uint64(i + 1), start: time.Now(), end: time.Now()})
+			}
+		}()
+	}
+	wg.Wait()
+	events, drops := bounded.drainWithDropStats()
+	if len(events)+int(drops.total) != attempts ||
+		drops.preEnqueue != drops.total ||
+		drops.preEnqueue != drops.preEnqueueCapacity+drops.preEnqueueTryLock ||
+		drops.preEnqueueReasonIncomplete != 0 {
+		t.Fatalf("events=%d drops=%+v", len(events), drops)
 	}
 }

@@ -14,7 +14,9 @@ import (
 )
 
 const Enabled = true
-const capacity = 256
+
+// 384 is a bounded diagnostic heuristic; losses remain possible and are reported.
+const capacity = 384
 
 type slotKey struct{}
 type syncKey struct{}
