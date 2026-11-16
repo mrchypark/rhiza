@@ -44,6 +44,9 @@ BEGIN {
 }
 /^rhiza_latency dropped=/ { split($2, pair, "="); server_drops += pair[2]; next }
 /^rhiza_latency pre_enqueue_dropped=/ { split($2, pair, "="); pre_enqueue_drops += pair[2]; next }
+/^rhiza_latency pre_enqueue_dropped_capacity=/ { split($2, pair, "="); pre_enqueue_capacity_drops += pair[2]; next }
+/^rhiza_latency pre_enqueue_dropped_trylock=/ { split($2, pair, "="); pre_enqueue_trylock_drops += pair[2]; next }
+/^rhiza_latency pre_enqueue_dropped_reason_incomplete=/ { split($2, pair, "="); pre_enqueue_reason_incomplete += pair[2]; next }
 /^rhiza_latency stage=/ {
   stage = field($0, "stage")
   tag = field($0, "tag")
@@ -105,6 +108,9 @@ END {
     }
     if (pair_limit_exceeded) break
   }
+  drop_reason_mismatch = pre_enqueue_capacity_drops + pre_enqueue_trylock_drops > pre_enqueue_drops
+  if (drop_reason_mismatch || pre_enqueue_reason_incomplete > 0) fatal++
+  pre_enqueue_unclassified_drops = pre_enqueue_drops - pre_enqueue_capacity_drops - pre_enqueue_trylock_drops
   status = fatal > 0 ? "invalid" : (client_failures > 0 ? "errors" : ((incomplete + pre_enqueue_drops > 0) ? "incomplete" : "valid"))
   print "# status=" status
   print "# client_tags=" tag_count
@@ -126,6 +132,11 @@ END {
   print "# hold_end_semantics=timestamp_before_release_lower_bound"
   print "# overlap_rule=wait_overlaps_recorded_conservative_hold"
   print "# pre_enqueue_drops=" pre_enqueue_drops + 0
+  print "# pre_enqueue_dropped_capacity=" pre_enqueue_capacity_drops + 0
+  print "# pre_enqueue_dropped_trylock=" pre_enqueue_trylock_drops + 0
+  print "# pre_enqueue_dropped_unclassified=" pre_enqueue_unclassified_drops + 0
+  print "# drop_reason_mismatch=" drop_reason_mismatch + 0
+  print "# pre_enqueue_dropped_reason_incomplete=" pre_enqueue_reason_incomplete + 0
   print "# server_drops=" server_drops + 0
   expected = "pre_enqueue_clone pre_enqueue_validate pre_enqueue_fingerprint pre_enqueue_encode request_lock_wait request_lock_hold materializer_receipt_pre_enqueue batcher_enqueue mutation_admission batch_proposal"
   count_expected = split(expected, names, " ")

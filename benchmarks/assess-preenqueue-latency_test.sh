@@ -99,6 +99,49 @@ printf '%s\n' 'rhiza_latency pre_enqueue_dropped=212' >> "$scratch/drop-trace.tx
 drop=$(awk -v client_file="$scratch/client.tsv" -f "$assess" "$scratch/drop-trace.txt")
 grep -qx '# status=incomplete' <<<"$drop"
 grep -qx '# pre_enqueue_drops=212' <<<"$drop"
+grep -qx '# pre_enqueue_dropped_unclassified=212' <<<"$drop"
+grep -qx '# drop_reason_mismatch=0' <<<"$drop"
+grep -qx '# pre_enqueue_dropped_reason_incomplete=0' <<<"$drop"
+
+cp "$scratch/normal-trace.txt" "$scratch/typed-drop-trace.txt"
+printf '%s\n' \
+	'rhiza_latency pre_enqueue_dropped=212' \
+	'rhiza_latency pre_enqueue_dropped_capacity=200' \
+	'rhiza_latency pre_enqueue_dropped_trylock=12' \
+	'rhiza_latency pre_enqueue_dropped_reason_incomplete=0' >> "$scratch/typed-drop-trace.txt"
+typed_drop=$(awk -v client_file="$scratch/client.tsv" -f "$assess" "$scratch/typed-drop-trace.txt")
+grep -qx '# status=incomplete' <<<"$typed_drop"
+grep -qx '# pre_enqueue_dropped_capacity=200' <<<"$typed_drop"
+grep -qx '# pre_enqueue_dropped_trylock=12' <<<"$typed_drop"
+grep -qx '# pre_enqueue_dropped_unclassified=0' <<<"$typed_drop"
+grep -qx '# drop_reason_mismatch=0' <<<"$typed_drop"
+grep -qx '# pre_enqueue_dropped_reason_incomplete=0' <<<"$typed_drop"
+
+cp "$scratch/normal-trace.txt" "$scratch/mismatched-drop-trace.txt"
+printf '%s\n' \
+	'rhiza_latency pre_enqueue_dropped=212' \
+	'rhiza_latency pre_enqueue_dropped_capacity=200' \
+	'rhiza_latency pre_enqueue_dropped_trylock=13' \
+	'rhiza_latency pre_enqueue_dropped_reason_incomplete=0' >> "$scratch/mismatched-drop-trace.txt"
+if awk -v client_file="$scratch/client.tsv" -f "$assess" "$scratch/mismatched-drop-trace.txt" > "$scratch/mismatched-drop.out"; then
+	printf 'mismatched drop reason counts accepted\n' >&2
+	exit 1
+fi
+grep -qx '# status=invalid' "$scratch/mismatched-drop.out"
+grep -qx '# drop_reason_mismatch=1' "$scratch/mismatched-drop.out"
+
+cp "$scratch/normal-trace.txt" "$scratch/incomplete-drop-reason-trace.txt"
+printf '%s\n' \
+	'rhiza_latency pre_enqueue_dropped=212' \
+	'rhiza_latency pre_enqueue_dropped_capacity=200' \
+	'rhiza_latency pre_enqueue_dropped_trylock=12' \
+	'rhiza_latency pre_enqueue_dropped_reason_incomplete=1' >> "$scratch/incomplete-drop-reason-trace.txt"
+if awk -v client_file="$scratch/client.tsv" -f "$assess" "$scratch/incomplete-drop-reason-trace.txt" > "$scratch/incomplete-drop-reason.out"; then
+	printf 'incomplete drop reason counts accepted\n' >&2
+	exit 1
+fi
+grep -qx '# status=invalid' "$scratch/incomplete-drop-reason.out"
+grep -qx '# pre_enqueue_dropped_reason_incomplete=1' "$scratch/incomplete-drop-reason.out"
 
 awk '!($0 ~ /stage=pre_enqueue_encode / && $0 ~ /tag=16$/)' "$scratch/normal-trace.txt" > "$scratch/missing-trace.txt"
 missing=$(awk -v client_file="$scratch/client.tsv" -f "$assess" "$scratch/missing-trace.txt")
@@ -156,6 +199,9 @@ for stage in pre_enqueue_clone pre_enqueue_validate pre_enqueue_fingerprint pre_
 	grep -Fq "$stage" "$workflow"
 done
 grep -Fq 'pre_enqueue_dropped' "$workflow"
+grep -Fq 'pre_enqueue_dropped_capacity' "$workflow"
+grep -Fq 'pre_enqueue_dropped_trylock' "$workflow"
+grep -Fq 'pre_enqueue_dropped_reason_incomplete' "$workflow"
 grep -Fq 'tag-collection.exit' "$workflow"
 grep -Fq 'pre-enqueue-collection.exit' "$workflow"
 grep -Fq 'check-preenqueue-assessment.sh' "$workflow"

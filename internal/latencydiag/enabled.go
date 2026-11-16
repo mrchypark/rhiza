@@ -61,12 +61,24 @@ const (
 	familyPreEnqueue
 )
 
+type dropReason uint8
+
+const (
+	dropReasonTryLock dropReason = iota
+	dropReasonCapacity
+)
+
+type dropStats struct {
+	total, preEnqueue, preEnqueueCapacity, preEnqueueTryLock, preEnqueueReasonIncomplete uint64
+}
+
 type eventRing struct {
-	mu                sync.Mutex
-	items             [capacity]event
-	start, count      int
-	dropped           atomic.Uint64
-	preEnqueueDropped atomic.Uint64
+	mu                       sync.Mutex
+	items                    [capacity]event
+	start, count             int
+	dropped                  atomic.Uint64
+	preEnqueueDropState      atomic.Uint64
+	preEnqueueDropIncomplete atomic.Bool
 }
 
 var ring eventRing
@@ -94,12 +106,12 @@ func (r *eventRing) add(e event) {
 	if testLossless.Load() {
 		r.mu.Lock()
 	} else if !r.mu.TryLock() {
-		r.recordDrop(e)
+		r.recordDrop(e, dropReasonTryLock)
 		return
 	}
 	defer r.mu.Unlock()
 	if r.count == capacity {
-		r.recordDrop(r.items[r.start])
+		r.recordDrop(r.items[r.start], dropReasonCapacity)
 		r.start = (r.start + 1) % capacity
 		r.count--
 	}
@@ -107,10 +119,40 @@ func (r *eventRing) add(e event) {
 	r.count++
 }
 
-func (r *eventRing) recordDrop(e event) {
+func (r *eventRing) recordDrop(e event, reason dropReason) {
 	r.dropped.Add(1)
 	if e.family == familyPreEnqueue {
-		r.preEnqueueDropped.Add(1)
+		r.addPreEnqueueDrop(reason)
+	}
+}
+
+func (r *eventRing) addPreEnqueueDrop(reason dropReason) {
+	// Pack both reasons so flush gets one exact snapshot without blocking drops.
+	const maxLane = uint64(^uint32(0))
+	for {
+		state := r.preEnqueueDropState.Load()
+		capacity := uint64(uint32(state >> 32))
+		tryLock := uint64(uint32(state))
+		switch reason {
+		case dropReasonCapacity:
+			if capacity == maxLane {
+				r.preEnqueueDropIncomplete.Store(true)
+				return
+			}
+			capacity++
+		case dropReasonTryLock:
+			if tryLock == maxLane {
+				r.preEnqueueDropIncomplete.Store(true)
+				return
+			}
+			tryLock++
+		default:
+			r.preEnqueueDropIncomplete.Store(true)
+			return
+		}
+		if r.preEnqueueDropState.CompareAndSwap(state, capacity<<32|tryLock) {
+			return
+		}
 	}
 }
 
@@ -120,6 +162,11 @@ func (r *eventRing) drain() ([]event, uint64) {
 }
 
 func (r *eventRing) drainWithStats() ([]event, uint64, uint64) {
+	events, drops := r.drainWithDropStats()
+	return events, drops.total, drops.preEnqueue
+}
+
+func (r *eventRing) drainWithDropStats() ([]event, dropStats) {
 	r.mu.Lock()
 	events := make([]event, r.count)
 	for i := range events {
@@ -127,7 +174,21 @@ func (r *eventRing) drainWithStats() ([]event, uint64, uint64) {
 	}
 	r.start, r.count = 0, 0
 	r.mu.Unlock()
-	return events, r.dropped.Swap(0), r.preEnqueueDropped.Swap(0)
+	preEnqueueState := r.preEnqueueDropState.Swap(0)
+	preEnqueueCapacity := uint64(uint32(preEnqueueState >> 32))
+	preEnqueueTryLock := uint64(uint32(preEnqueueState))
+	preEnqueueReasonIncomplete := uint64(0)
+	if r.preEnqueueDropIncomplete.Load() {
+		preEnqueueReasonIncomplete = 1
+	}
+	drops := dropStats{
+		total:                      r.dropped.Swap(0),
+		preEnqueue:                 preEnqueueCapacity + preEnqueueTryLock,
+		preEnqueueCapacity:         preEnqueueCapacity,
+		preEnqueueTryLock:          preEnqueueTryLock,
+		preEnqueueReasonIncomplete: preEnqueueReasonIncomplete,
+	}
+	return events, drops
 }
 func start() {
 	startWriter.Do(func() {
@@ -145,12 +206,15 @@ func start() {
 func Flush() {
 	flushMu.Lock()
 	defer flushMu.Unlock()
-	events, dropped, preEnqueueDropped := ring.drainWithStats()
-	if dropped > 0 {
-		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", dropped)
+	events, drops := ring.drainWithDropStats()
+	if drops.total > 0 {
+		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", drops.total)
 	}
-	if preEnqueueDropped > 0 {
-		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped=%d\n", preEnqueueDropped)
+	if drops.preEnqueue > 0 {
+		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped=%d\n", drops.preEnqueue)
+		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_capacity=%d\n", drops.preEnqueueCapacity)
+		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_trylock=%d\n", drops.preEnqueueTryLock)
+		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_reason_incomplete=%d\n", drops.preEnqueueReasonIncomplete)
 	}
 	for _, e := range events {
 		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d tag=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt, e.tag)
