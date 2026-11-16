@@ -45,6 +45,22 @@ BEGIN {
   split($2, pair, "="); drops += pair[2]
   next
 }
+/^rhiza_latency proposal_gap_dropped=/ {
+  split($2, pair, "="); proposal_gap_drops += pair[2]
+  next
+}
+/^rhiza_latency proposal_gap_dropped_capacity=/ {
+  split($2, pair, "="); proposal_gap_capacity_drops += pair[2]
+  next
+}
+/^rhiza_latency proposal_gap_dropped_trylock=/ {
+  split($2, pair, "="); proposal_gap_trylock_drops += pair[2]
+  next
+}
+/^rhiza_latency proposal_gap_dropped_reason_incomplete=/ {
+  split($2, pair, "="); proposal_gap_reason_incomplete += pair[2]
+  next
+}
 /^rhiza_latency stage=/ {
   stage = field($0, "stage"); tag = field($0, "tag"); slot = field($0, "slot")
   if (tag == "0" || stage == "") next
@@ -59,7 +75,15 @@ BEGIN {
     fatal++
     next
   }
-  if (stage !~ /^(http_receive|http_response|mutation_entry|mutation_admission|batch_proposal|batch_result)$/) next
+  if (stage !~ /^(http_receive|http_response|mutation_entry|mutation_admission|batch_proposal|batch_result|proposal_mu_wait|proposal_permit_wait|proposal_worker_start)$/) next
+  start = field($0, "start_unix_ns"); finish = field($0, "end_unix_ns")
+  if (stage == "proposal_mu_wait") {
+    proposal_mu_events++
+    proposal_mu_count[tag]++
+    if (!(tag in proposal_mu_first) || start < proposal_mu_first[tag]) proposal_mu_first[tag] = start
+    if (!(tag in proposal_mu_last) || finish > proposal_mu_last[tag]) proposal_mu_last[tag] = finish
+    next
+  }
   key = tag SUBSEP stage
   if (event_seen[key]++) {
     duplicate_server_events++
@@ -67,7 +91,6 @@ BEGIN {
     fatal++
     next
   }
-  start = field($0, "start_unix_ns"); finish = field($0, "end_unix_ns")
   if ((stage == "batch_proposal" || stage == "batch_result") && (slot == "0" || slot != cslot[tag])) {
     if (!slot_mismatch[tag]) { slot_mismatches++; fatal++ }
     slot_mismatch[tag] = 1
@@ -80,6 +103,13 @@ BEGIN {
   else if (stage == "mutation_admission") { admission_start[tag] = start; admission_end[tag] = finish }
   else if (stage == "batch_proposal") { proposal_start[tag] = start; proposal_end[tag] = finish; proposal_slot[tag] = slot }
   else if (stage == "batch_result") { result_end[tag] = finish; result_slot[tag] = slot }
+  else if (stage == "proposal_permit_wait") {
+    proposal_permit_events++; proposal_permit_count[tag] = 1; proposal_permit_start[tag] = start; proposal_permit_end[tag] = finish
+    proposal_permit_code[tag] = field($0, "count"); proposal_permit_outcome[tag] = field($0, "outcome")
+  } else if (stage == "proposal_worker_start") {
+    proposal_worker_events++; proposal_worker_count[tag] = 1; proposal_worker_start[tag] = start; proposal_worker_end[tag] = finish
+    proposal_worker_outcome[tag] = field($0, "outcome")
+  }
 }
 END {
   print "# epoch_ns floats have finite precision; differences within 2048 ns are unknown"
@@ -93,6 +123,31 @@ END {
     if (!(tag in proposal_start)) { missing_proposal++; missing++ }
     if (!(tag in result_end)) { missing_result++; missing++ }
     if (!(tag in handler_end)) { missing_response++; missing++ }
+    if (csucceeded[tag] == "true") {
+      if (!(tag in proposal_mu_count)) { missing_proposal_mu++; missing++ }
+      if (!(tag in proposal_worker_count)) { missing_proposal_worker++; missing++ }
+    }
+
+    if (csucceeded[tag] == "true" && (tag in proposal_start)) {
+      if ((tag in proposal_mu_first) && (proposal_mu_first[tag] + 2048 < proposal_start[tag] || proposal_mu_last[tag] - 2048 > proposal_end[tag])) {
+        proposal_stage_bounds_invalid++; invalid[tag] = 1; fatal++
+      }
+      if ((tag in proposal_permit_start) && (proposal_permit_start[tag] + 2048 < proposal_start[tag] || proposal_permit_end[tag] - 2048 > proposal_end[tag])) {
+        proposal_stage_bounds_invalid++; invalid[tag] = 1; fatal++
+      }
+      if ((tag in proposal_worker_start) && (proposal_worker_start[tag] + 2048 < proposal_start[tag] || proposal_worker_end[tag] - 2048 > proposal_end[tag])) {
+        proposal_stage_bounds_invalid++; invalid[tag] = 1; fatal++
+      }
+      if ((tag in proposal_permit_code) && proposal_permit_code[tag] !~ /^[1-7]$/) {
+        proposal_permit_code_invalid++; invalid[tag] = 1; fatal++
+      }
+      if ((tag in proposal_permit_outcome) && proposal_permit_outcome[tag] != "ok") {
+        proposal_permit_outcome_invalid++; invalid[tag] = 1; fatal++
+      }
+      if ((tag in proposal_worker_outcome) && proposal_worker_outcome[tag] != "ok") {
+        proposal_worker_outcome_invalid++; invalid[tag] = 1; fatal++
+      }
+    }
 
     correlation = "valid"; reason = "complete"
     if (csend[tag] == "0" || cheader[tag] == "0") {
@@ -127,6 +182,9 @@ END {
     if (correlation == "valid" && r2c == "") { cross_process_order_unknown++; reason = "complete_cross_process_order_unknown" }
     print tag "\t" cstart[tag] "\t" cend[tag] "\t" clatency[tag] "\t" csend[tag] "\t" cheader[tag] "\t" cslot[tag] "\t" csucceeded[tag] "\t" show(http_outcome[tag]) "\t" show(http_status[tag]) "\t" show(receive[tag]) "\t" show(entry[tag]) "\t" show(admission_start[tag]) "\t" show(admission_end[tag]) "\t" show(proposal_start[tag]) "\t" show(proposal_end[tag]) "\t" show(proposal_slot[tag]) "\t" show(result_end[tag]) "\t" show(result_slot[tag]) "\t" show(handler_end[tag]) "\t" show(s2r) "\t" show(r2e) "\t" show(e2a) "\t" show(a2p) "\t" show(r2c) "\t" correlation "\t" reason
   }
+  proposal_gap_unclassified = proposal_gap_drops - proposal_gap_capacity_drops - proposal_gap_trylock_drops
+  proposal_gap_drop_reason_mismatch = (proposal_gap_capacity_drops + proposal_gap_trylock_drops > proposal_gap_drops)
+  if (proposal_gap_drops > 0 || proposal_gap_unclassified > 0 || proposal_gap_drop_reason_mismatch || proposal_gap_reason_incomplete > 0) fatal++
   status = fatal > 0 ? "invalid" : ((transmit_failures + http_failures + client_failures) > 0 ? "errors" : (incomplete_correlations > 0 ? "incomplete" : "valid"))
   print "# correlation_status=" status
   print "# client_tags=" count
@@ -150,5 +208,20 @@ END {
   print "# missing_result=" missing_result + 0
   print "# missing_response=" missing_response + 0
   print "# server_drops=" drops + 0
+  print "# proposal_mu_events=" proposal_mu_events + 0
+  print "# proposal_permit_events=" proposal_permit_events + 0
+  print "# proposal_worker_events=" proposal_worker_events + 0
+  print "# missing_proposal_mu=" missing_proposal_mu + 0
+  print "# missing_proposal_worker=" missing_proposal_worker + 0
+  print "# proposal_stage_bounds_invalid=" proposal_stage_bounds_invalid + 0
+  print "# proposal_permit_code_invalid=" proposal_permit_code_invalid + 0
+  print "# proposal_permit_outcome_invalid=" proposal_permit_outcome_invalid + 0
+  print "# proposal_worker_outcome_invalid=" proposal_worker_outcome_invalid + 0
+  print "# proposal_gap_drops=" proposal_gap_drops + 0
+  print "# proposal_gap_dropped_capacity=" proposal_gap_capacity_drops + 0
+  print "# proposal_gap_dropped_trylock=" proposal_gap_trylock_drops + 0
+  print "# proposal_gap_dropped_unclassified=" proposal_gap_unclassified + 0
+  print "# proposal_gap_dropped_reason_incomplete=" proposal_gap_reason_incomplete + 0
+  print "# proposal_gap_drop_reason_mismatch=" proposal_gap_drop_reason_mismatch + 0
   if (fatal > 0) exit 1
 }

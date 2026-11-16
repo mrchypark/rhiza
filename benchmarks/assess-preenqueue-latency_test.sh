@@ -202,6 +202,12 @@ grep -Fq 'pre_enqueue_dropped' "$workflow"
 grep -Fq 'pre_enqueue_dropped_capacity' "$workflow"
 grep -Fq 'pre_enqueue_dropped_trylock' "$workflow"
 grep -Fq 'pre_enqueue_dropped_reason_incomplete' "$workflow"
+for stage in proposal_mu_wait proposal_permit_wait proposal_worker_start; do
+	grep -Fq "$stage" "$workflow"
+done
+for counter in proposal_gap_dropped proposal_gap_dropped_capacity proposal_gap_dropped_trylock proposal_gap_dropped_reason_incomplete; do
+	grep -Fq "$counter" "$workflow"
+done
 grep -Fq 'tag-collection.exit' "$workflow"
 grep -Fq 'pre-enqueue-collection.exit' "$workflow"
 grep -Fq 'check-preenqueue-assessment.sh' "$workflow"

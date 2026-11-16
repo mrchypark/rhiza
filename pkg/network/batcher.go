@@ -424,6 +424,11 @@ func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 	var proposalStarted time.Time
 	if latencydiag.Enabled {
+		tags := make([]uint64, 0, len(items))
+		for _, item := range items {
+			tags = append(tags, latencydiag.Tag(item.ctx))
+		}
+		ctx = latencydiag.WithTags(ctx, tags)
 		proposalStarted = latencydiag.Start()
 	}
 	slot, err := b.propose(ctx, value)

@@ -3,10 +3,16 @@
 package latencydiag
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -52,6 +58,167 @@ func TestPreEnqueueTraceSkipsUnsampledAndCancellationIsClassified(t *testing.T) 
 	if len(events) != 1 || events[0].tag != 32 || events[0].outcome != "cancelled" {
 		t.Fatalf("events=%+v", events)
 	}
+}
+
+func TestProposalTraceCarriesEverySampledBatchTag(t *testing.T) {
+	flushMu.Lock()
+	defer flushMu.Unlock()
+	ring.drain()
+
+	ctx := WithTags(context.Background(), []uint64{15, 16, 32, 33})
+	many := make([]uint64, maxTags*2)
+	for i := range many {
+		many[i] = uint64(i+1) * 16
+	}
+	if got := len(Tags(WithTags(context.Background(), many))); got != maxTags {
+		t.Fatalf("bounded tags=%d want=%d", got, maxTags)
+	}
+	started := StartTagged(ctx)
+	if started.IsZero() {
+		t.Fatal("sampled batch did not start tagged trace")
+	}
+	TraceProposalStage(ctx, StageProposalPermitWait, ProposalWaitLocalCap|ProposalWaitOperationCap, nil, started)
+	carried := CarryTags(context.Background(), ctx)
+	TraceProposalStage(carried, StageProposalWorkerStart, 0, context.Canceled, started)
+
+	events, drops := ring.drainWithDropStats()
+	if drops.total != 0 || drops.proposalGap != 0 || len(events) != 4 {
+		t.Fatalf("events=%+v drops=%+v", events, drops)
+	}
+	if events[0].tag != 16 || events[1].tag != 32 || events[0].count != 3 || events[0].outcome != "ok" {
+		t.Fatalf("permit events=%+v", events[:2])
+	}
+	if events[2].tag != 16 || events[3].tag != 32 || events[2].stage != StageProposalWorkerStart || events[2].outcome != "cancelled" {
+		t.Fatalf("worker events=%+v", events[2:])
+	}
+}
+
+func TestProposalTraceDropAccountingIsSeparateAndBounded(t *testing.T) {
+	var bounded eventRing
+	for i := 0; i < capacity+3; i++ {
+		bounded.add(event{stage: StageProposalMuWait, family: familyProposalGap, tag: uint64(i + 1), start: time.Now(), end: time.Now()})
+	}
+	events, drops := bounded.drainWithDropStats()
+	if len(events) != capacity || drops.total != 3 || drops.proposalGap != 3 || drops.proposalGapCapacity != 3 ||
+		drops.proposalGapTryLock != 0 || drops.proposalGapReasonIncomplete != 0 || drops.preEnqueue != 0 {
+		t.Fatalf("events=%d drops=%+v", len(events), drops)
+	}
+}
+
+func TestClassifiedDropIncompleteSurvivesZeroSnapshot(t *testing.T) {
+	var counter atomic.Uint64
+	var incomplete atomic.Bool
+	incomplete.Store(true)
+	_, _, reason := snapshotClassifiedDrop(&counter, &incomplete)
+	if reason != 1 {
+		t.Fatal("zero snapshot cleared incomplete state")
+	}
+	counter.Store(uint64(capacity) << 32)
+	_, _, reason = snapshotClassifiedDrop(&counter, &incomplete)
+	if reason != 1 {
+		t.Fatal("following nonzero snapshot lost incomplete state")
+	}
+}
+
+func TestProposalDropZeroSnapshotWriterBoundaryKeepsIncomplete(t *testing.T) {
+	var bounded eventRing
+	bounded.proposalGapDropIncomplete.Store(true)
+	if _, drops := bounded.drainWithDropStats(); drops.proposalGap != 0 || drops.proposalGapReasonIncomplete != 1 {
+		t.Fatalf("zero snapshot=%+v", drops)
+	}
+
+	start := make(chan struct{})
+	result := make(chan uint64, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		bounded.recordDrop(event{family: familyProposalGap}, dropReasonCapacity)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, drops := bounded.drainWithDropStats()
+		result <- drops.proposalGapCapacity
+	}()
+	close(start)
+	wg.Wait()
+	close(result)
+	var seen uint64
+	for capacity := range result {
+		seen += capacity
+	}
+	_, drops := bounded.drainWithDropStats()
+	if seen+drops.proposalGapCapacity != 1 || drops.proposalGapReasonIncomplete != 1 {
+		t.Fatalf("raced seen=%d final=%+v", seen, drops)
+	}
+}
+
+func TestFlushZeroDropIncompleteFailsTaggedAnalyzer(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	flushCmd := exec.Command(os.Args[0], "-test.run=^TestFlushZeroDropIncompleteChild$")
+	flushCmd.Env = append(os.Environ(), "RHIZA_LATENCYDIAG_FLUSH_CHILD=1")
+	flushCmd.Stdout = &stdout
+	flushCmd.Stderr = &stderr
+	if err := flushCmd.Run(); err != nil {
+		t.Fatalf("flush child: %v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+	output := stderr.String()
+	for _, line := range []string{
+		"rhiza_latency pre_enqueue_dropped=0",
+		"rhiza_latency pre_enqueue_dropped_reason_incomplete=1",
+		"rhiza_latency proposal_gap_dropped=0",
+		"rhiza_latency proposal_gap_dropped_capacity=0",
+		"rhiza_latency proposal_gap_dropped_trylock=0",
+		"rhiza_latency proposal_gap_dropped_reason_incomplete=1",
+	} {
+		if !strings.Contains(output, line+"\n") {
+			t.Fatalf("flush output missing %q: %q", line, output)
+		}
+	}
+
+	clientFile := filepath.Join(t.TempDir(), "client.tsv")
+	if err := os.WriteFile(clientFile, []byte("16\t0\t1000\t9000\t1100\t8500\t7000\ttrue\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate latencydiag test source")
+	}
+	analyzer := filepath.Join(filepath.Dir(source), "..", "..", "scripts", "ci", "assess-tagged-latency.awk")
+	cmd := exec.Command("awk", "-v", "client_file="+clientFile, "-f", analyzer)
+	cmd.Stdin = strings.NewReader(output)
+	assessment, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("analyzer accepted zero-drop incomplete marker: %s", assessment)
+	}
+	if !strings.Contains(string(assessment), "# correlation_status=invalid\n") ||
+		!strings.Contains(string(assessment), "# proposal_gap_dropped_reason_incomplete=1\n") {
+		t.Fatalf("analyzer did not fail closed on flush output: %s", assessment)
+	}
+
+	preAnalyzer := filepath.Join(filepath.Dir(source), "..", "..", "scripts", "ci", "assess-preenqueue-latency.awk")
+	preCmd := exec.Command("awk", "-v", "client_file="+clientFile, "-f", preAnalyzer)
+	preCmd.Stdin = strings.NewReader(output)
+	preAssessment, err := preCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("pre-enqueue analyzer accepted zero-drop incomplete marker: %s", preAssessment)
+	}
+	if !strings.Contains(string(preAssessment), "# status=invalid\n") ||
+		!strings.Contains(string(preAssessment), "# pre_enqueue_dropped_reason_incomplete=1\n") {
+		t.Fatalf("pre-enqueue analyzer did not fail closed on flush output: %s", preAssessment)
+	}
+}
+
+func TestFlushZeroDropIncompleteChild(t *testing.T) {
+	if os.Getenv("RHIZA_LATENCYDIAG_FLUSH_CHILD") != "1" {
+		t.Skip("flush child")
+	}
+	DisableBackgroundWriterForTest()
+	ring.preEnqueueDropIncomplete.Store(true)
+	ring.proposalGapDropIncomplete.Store(true)
+	Flush()
 }
 
 func TestPreEnqueueRingOverflowCountsOnlyDroppedFamily(t *testing.T) {

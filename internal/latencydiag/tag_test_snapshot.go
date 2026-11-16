@@ -23,7 +23,7 @@ func TagTestSnapshot() ([]TagTestEvent, uint64, uint64) {
 	events, dropped, preEnqueueDropped := ring.drainWithStats()
 	result := make([]TagTestEvent, 0, len(events))
 	for _, event := range events {
-		if event.family != familyPreEnqueue {
+		if event.family != familyPreEnqueue && event.family != familyProposalGap {
 			continue
 		}
 		result = append(result, TagTestEvent{

@@ -16,11 +16,15 @@ import (
 const Enabled = true
 
 // 384 is a bounded diagnostic heuristic; losses remain possible and are reported.
-const capacity = 384
+const (
+	capacity = 384
+	maxTags  = 64
+)
 
 type slotKey struct{}
 type syncKey struct{}
 type tagKey struct{}
+type tagsKey struct{}
 
 func WithSync(ctx context.Context, id uint64) context.Context {
 	return context.WithValue(ctx, syncKey{}, id)
@@ -40,6 +44,46 @@ func Tag(ctx context.Context) uint64 {
 	}
 	tag, _ := ctx.Value(tagKey{}).(uint64)
 	return tag
+}
+
+func Tags(ctx context.Context) []uint64 {
+	if ctx == nil {
+		return nil
+	}
+	tags, _ := ctx.Value(tagsKey{}).([]uint64)
+	return tags
+}
+
+// WithTags attaches the bounded sampled tags represented by one shared batch.
+// It retains only sampled opaque identifiers, never request content.
+func WithTags(ctx context.Context, tags []uint64) context.Context {
+	sampled := make([]uint64, 0, min(len(tags), maxTags))
+	for _, tag := range tags {
+		if SampleTag(tag) {
+			sampled = append(sampled, tag)
+			if len(sampled) == maxTags {
+				break
+			}
+		}
+	}
+	if len(sampled) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, tagsKey{}, sampled)
+}
+
+// CarryTags preserves only the sampled diagnostic tags of src on dst.
+func CarryTags(dst, src context.Context) context.Context {
+	if src == nil {
+		return dst
+	}
+	if tags, ok := src.Value(tagsKey{}).([]uint64); ok {
+		return WithTags(dst, tags)
+	}
+	if tag := Tag(src); SampleTag(tag) {
+		return WithTag(dst, tag)
+	}
+	return dst
 }
 func Start() time.Time { return time.Now() }
 
@@ -61,6 +105,7 @@ type eventFamily uint8
 const (
 	familyOther eventFamily = iota
 	familyPreEnqueue
+	familyProposalGap
 )
 
 type dropReason uint8
@@ -72,15 +117,18 @@ const (
 
 type dropStats struct {
 	total, preEnqueue, preEnqueueCapacity, preEnqueueTryLock, preEnqueueReasonIncomplete uint64
+	proposalGap, proposalGapCapacity, proposalGapTryLock, proposalGapReasonIncomplete    uint64
 }
 
 type eventRing struct {
-	mu                       sync.Mutex
-	items                    [capacity]event
-	start, count             int
-	dropped                  atomic.Uint64
-	preEnqueueDropState      atomic.Uint64
-	preEnqueueDropIncomplete atomic.Bool
+	mu                        sync.Mutex
+	items                     [capacity]event
+	start, count              int
+	dropped                   atomic.Uint64
+	preEnqueueDropState       atomic.Uint64
+	preEnqueueDropIncomplete  atomic.Bool
+	proposalGapDropState      atomic.Uint64
+	proposalGapDropIncomplete atomic.Bool
 }
 
 var ring eventRing
@@ -123,39 +171,55 @@ func (r *eventRing) add(e event) {
 
 func (r *eventRing) recordDrop(e event, reason dropReason) {
 	r.dropped.Add(1)
-	if e.family == familyPreEnqueue {
-		r.addPreEnqueueDrop(reason)
+	switch e.family {
+	case familyPreEnqueue:
+		r.addClassifiedDrop(&r.preEnqueueDropState, &r.preEnqueueDropIncomplete, reason)
+	case familyProposalGap:
+		r.addClassifiedDrop(&r.proposalGapDropState, &r.proposalGapDropIncomplete, reason)
 	}
 }
 
-func (r *eventRing) addPreEnqueueDrop(reason dropReason) {
+func (r *eventRing) addClassifiedDrop(counter *atomic.Uint64, incomplete *atomic.Bool, reason dropReason) {
 	// Pack both reasons so flush gets one exact snapshot without blocking drops.
 	const maxLane = uint64(^uint32(0))
 	for {
-		state := r.preEnqueueDropState.Load()
+		state := counter.Load()
 		capacity := uint64(uint32(state >> 32))
 		tryLock := uint64(uint32(state))
 		switch reason {
 		case dropReasonCapacity:
 			if capacity == maxLane {
-				r.preEnqueueDropIncomplete.Store(true)
+				incomplete.Store(true)
 				return
 			}
 			capacity++
 		case dropReasonTryLock:
 			if tryLock == maxLane {
-				r.preEnqueueDropIncomplete.Store(true)
+				incomplete.Store(true)
 				return
 			}
 			tryLock++
 		default:
-			r.preEnqueueDropIncomplete.Store(true)
+			incomplete.Store(true)
 			return
 		}
-		if r.preEnqueueDropState.CompareAndSwap(state, capacity<<32|tryLock) {
+		if counter.CompareAndSwap(state, capacity<<32|tryLock) {
 			return
 		}
 	}
+}
+
+func snapshotClassifiedDrop(counter *atomic.Uint64, incomplete *atomic.Bool) (uint64, uint64, uint64) {
+	state := counter.Swap(0)
+	capacity := uint64(uint32(state >> 32))
+	tryLock := uint64(uint32(state))
+	reasonIncomplete := uint64(0)
+	// Keep the saturation marker sticky. An empty counter snapshot must not
+	// erase evidence that later nonzero samples cannot be classified exactly.
+	if incomplete.Load() {
+		reasonIncomplete = 1
+	}
+	return capacity, tryLock, reasonIncomplete
 }
 
 func (r *eventRing) drain() ([]event, uint64) {
@@ -176,19 +240,18 @@ func (r *eventRing) drainWithDropStats() ([]event, dropStats) {
 	}
 	r.start, r.count = 0, 0
 	r.mu.Unlock()
-	preEnqueueState := r.preEnqueueDropState.Swap(0)
-	preEnqueueCapacity := uint64(uint32(preEnqueueState >> 32))
-	preEnqueueTryLock := uint64(uint32(preEnqueueState))
-	preEnqueueReasonIncomplete := uint64(0)
-	if r.preEnqueueDropIncomplete.Load() {
-		preEnqueueReasonIncomplete = 1
-	}
+	preEnqueueCapacity, preEnqueueTryLock, preEnqueueReasonIncomplete := snapshotClassifiedDrop(&r.preEnqueueDropState, &r.preEnqueueDropIncomplete)
+	proposalGapCapacity, proposalGapTryLock, proposalGapReasonIncomplete := snapshotClassifiedDrop(&r.proposalGapDropState, &r.proposalGapDropIncomplete)
 	drops := dropStats{
-		total:                      r.dropped.Swap(0),
-		preEnqueue:                 preEnqueueCapacity + preEnqueueTryLock,
-		preEnqueueCapacity:         preEnqueueCapacity,
-		preEnqueueTryLock:          preEnqueueTryLock,
-		preEnqueueReasonIncomplete: preEnqueueReasonIncomplete,
+		total:                       r.dropped.Swap(0),
+		preEnqueue:                  preEnqueueCapacity + preEnqueueTryLock,
+		preEnqueueCapacity:          preEnqueueCapacity,
+		preEnqueueTryLock:           preEnqueueTryLock,
+		preEnqueueReasonIncomplete:  preEnqueueReasonIncomplete,
+		proposalGap:                 proposalGapCapacity + proposalGapTryLock,
+		proposalGapCapacity:         proposalGapCapacity,
+		proposalGapTryLock:          proposalGapTryLock,
+		proposalGapReasonIncomplete: proposalGapReasonIncomplete,
 	}
 	return events, drops
 }
@@ -212,11 +275,17 @@ func Flush() {
 	if drops.total > 0 {
 		fmt.Fprintf(os.Stderr, "rhiza_latency dropped=%d\n", drops.total)
 	}
-	if drops.preEnqueue > 0 {
+	if drops.preEnqueue > 0 || drops.preEnqueueReasonIncomplete > 0 {
 		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped=%d\n", drops.preEnqueue)
 		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_capacity=%d\n", drops.preEnqueueCapacity)
 		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_trylock=%d\n", drops.preEnqueueTryLock)
 		fmt.Fprintf(os.Stderr, "rhiza_latency pre_enqueue_dropped_reason_incomplete=%d\n", drops.preEnqueueReasonIncomplete)
+	}
+	if drops.proposalGap > 0 || drops.proposalGapReasonIncomplete > 0 {
+		fmt.Fprintf(os.Stderr, "rhiza_latency proposal_gap_dropped=%d\n", drops.proposalGap)
+		fmt.Fprintf(os.Stderr, "rhiza_latency proposal_gap_dropped_capacity=%d\n", drops.proposalGapCapacity)
+		fmt.Fprintf(os.Stderr, "rhiza_latency proposal_gap_dropped_trylock=%d\n", drops.proposalGapTryLock)
+		fmt.Fprintf(os.Stderr, "rhiza_latency proposal_gap_dropped_reason_incomplete=%d\n", drops.proposalGapReasonIncomplete)
 	}
 	for _, e := range events {
 		fmt.Fprintf(os.Stderr, "rhiza_latency stage=%s batch=%d slot=%d count=%d peer=%x outcome=%s start_unix_ns=%d end_unix_ns=%d duration_ns=%d request=%d attempt=%d tag=%d\n", e.stage, e.batch, e.slot, e.count, e.peer, e.outcome, e.start.UnixNano(), e.end.UnixNano(), e.end.Sub(e.start).Nanoseconds(), e.request, e.attempt, e.tag)
@@ -262,10 +331,39 @@ func TraceTag(stage string, tag, slot uint64, err error, begin time.Time) {
 
 // StartTagged avoids taking a timestamp for untagged or unsampled requests.
 func StartTagged(ctx context.Context) time.Time {
-	if !SampleTag(Tag(ctx)) {
+	if len(Tags(ctx)) == 0 && !SampleTag(Tag(ctx)) {
 		return time.Time{}
 	}
 	return time.Now()
+}
+
+// TraceProposalStage records one sampled server proposal boundary. A shared
+// batch emits the same boundary for each of its sampled tags.
+func TraceProposalStage(ctx context.Context, stage string, code uint64, err error, begin time.Time) {
+	if begin.IsZero() {
+		return
+	}
+	tags := Tags(ctx)
+	if len(tags) == 0 {
+		if tag := Tag(ctx); SampleTag(tag) {
+			tags = []uint64{tag}
+		}
+	}
+	if len(tags) == 0 {
+		return
+	}
+	start()
+	end := time.Now()
+	outcome := taggedOutcome(err)
+	for _, tag := range tags {
+		if !SampleTag(tag) {
+			continue
+		}
+		ring.add(event{
+			stage: stage, family: familyProposalGap, tag: tag, count: int(code),
+			start: begin, end: end, outcome: outcome,
+		})
+	}
 }
 
 // TraceTaggedStage records one bounded pre-enqueue boundary. Error values are

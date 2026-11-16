@@ -16,6 +16,17 @@ const (
 	StageRequestLockHold       = "request_lock_hold"
 	StageMaterializerReceipt   = "materializer_receipt_pre_enqueue"
 	StageBatcherEnqueue        = "batcher_enqueue"
+	StageProposalMuWait        = "proposal_mu_wait"
+	StageProposalPermitWait    = "proposal_permit_wait"
+	StageProposalWorkerStart   = "proposal_worker_start"
+)
+
+// Proposal permit waits use a fixed bit set. Values never contain an
+// admission reason string, request ID, SQL, or operation content.
+const (
+	ProposalWaitLocalCap uint64 = 1 << iota
+	ProposalWaitOperationCap
+	ProposalWaitBytes
 )
 
 // SampleTag keeps the tagged diagnostic to one fixed 1/16 request sample.

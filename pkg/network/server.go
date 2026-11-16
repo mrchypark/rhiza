@@ -48,6 +48,8 @@ type proposalAdmissionOverload struct{}
 func (proposalAdmissionOverload) Error() string { return ErrOverloaded.Error() }
 func (proposalAdmissionOverload) Unwrap() error { return ErrOverloaded }
 
+var errProposalAdmissionWaitExpired = errors.New("proposal admission wait expired")
+
 // CommitUnknownError means a mutation may commit despite the failed call.
 // Retrying the same request ID resolves the outcome without duplicating it.
 type CommitUnknownError struct {
@@ -743,10 +745,19 @@ func (s *Server) signalAdmissionLocked(invalidate bool) {
 	s.admissionChanged = make(chan struct{})
 }
 
-func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult) (quepaxa.Slot, error) {
+func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult) (slot quepaxa.Slot, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	var permitWaitStarted time.Time
+	var permitWaitCode uint64
+	finishPermitWait := func(err error) {
+		if !permitWaitStarted.IsZero() {
+			latencydiag.TraceProposalStage(ctx, latencydiag.StageProposalPermitWait, permitWaitCode, err, permitWaitStarted)
+			permitWaitStarted = time.Time{}
+		}
+	}
+	defer func() { finishPermitWait(retErr) }()
 	hash := sha256.Sum256(value)
 	var admissionDeadline time.Time
 	if admissionBudget > 0 {
@@ -758,7 +769,9 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			}
 		}
 	}
+	muWaitStarted := latencydiag.StartTagged(ctx)
 	s.proposeMu.Lock()
+	latencydiag.TraceProposalStage(ctx, latencydiag.StageProposalMuWait, 0, nil, muWaitStarted)
 	epoch := s.admissionEpoch
 	for {
 		if err := ctx.Err(); err != nil {
@@ -779,6 +792,7 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 				return 0, ErrInvalidRequest
 			}
 			s.proposeMu.Unlock()
+			finishPermitWait(nil)
 			if trace != nil {
 				trace.MarkAccepted()
 				result.reason = localtesthooks.BatchAdmissionJoinedExisting
@@ -803,9 +817,11 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			return 0, proposalAdmissionOverload{}
 		}
 		blocked := ""
+		var blockedCode uint64
 		switch {
 		case len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB:
 			blocked = "network:proposal-admission:byte-budget-rejected"
+			blockedCode = latencydiag.ProposalWaitBytes
 		default:
 			select {
 			case s.localCap <- struct{}{}:
@@ -814,9 +830,11 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 				default:
 					<-s.localCap
 					blocked = "network:proposal-admission:operation-cap-rejected"
+					blockedCode = latencydiag.ProposalWaitOperationCap
 				}
 			default:
 				blocked = "network:proposal-admission:local-cap-rejected"
+				blockedCode = latencydiag.ProposalWaitLocalCap
 			}
 		}
 		if blocked != "" {
@@ -830,13 +848,24 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			if trace != nil {
 				trace.MarkWait()
 			}
+			if permitWaitStarted.IsZero() {
+				permitWaitStarted = latencydiag.StartTagged(ctx)
+			}
+			permitWaitCode |= blockedCode
 			s.proposeMu.Unlock()
 			timer := time.NewTimer(time.Until(admissionDeadline))
+			var waitErr error
 			select {
 			case <-changed:
 			case <-ctx.Done():
+				waitErr = ctx.Err()
 			case <-s.proposalCtx.Done():
+				waitErr = ErrNotReady
 			case <-timer.C:
+				waitErr = errProposalAdmissionWaitExpired
+			}
+			if waitErr != nil {
+				finishPermitWait(waitErr)
 			}
 			if !timer.Stop() {
 				select {
@@ -844,7 +873,9 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 				default:
 				}
 			}
+			muWaitStarted = latencydiag.StartTagged(ctx)
 			s.proposeMu.Lock()
+			latencydiag.TraceProposalStage(ctx, latencydiag.StageProposalMuWait, 0, nil, muWaitStarted)
 			s.admissionWaiters--
 			continue
 		}
@@ -881,11 +912,13 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			trace.MarkAccepted()
 			result.reason = localtesthooks.BatchAdmissionAccepted
 		}
+		finishPermitWait(nil)
 		s.operationB += len(value)
 		s.localB += len(value)
 		s.proposalWG.Add(1)
 		s.logicalWG.Add(1)
-		go s.runProposal(hash, call, bytes.Clone(value))
+		workerStarted := latencydiag.StartTagged(ctx)
+		go s.runProposal(ctx, hash, call, bytes.Clone(value), workerStarted)
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -957,8 +990,9 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 	}, nil
 }
 
-func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
-	ctx, cancel := s.proposalWorkContext(call)
+func (s *Server) runProposal(source context.Context, hash [32]byte, call *proposalCall, value []byte, workerStarted time.Time) {
+	latencydiag.TraceProposalStage(source, latencydiag.StageProposalWorkerStart, 0, nil, workerStarted)
+	ctx, cancel := s.proposalWorkContext(source, call)
 	defer cancel()
 	var coreStarted, prewriteDenied bool
 	call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
@@ -1008,12 +1042,12 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	s.finishProposalLogical(hash, call, len(value))
 }
 
-func (s *Server) proposalWorkContext(call *proposalCall) (context.Context, context.CancelFunc) {
+func (s *Server) proposalWorkContext(source context.Context, call *proposalCall) (context.Context, context.CancelFunc) {
 	deadline := time.Now().Add(30 * time.Second)
 	if call.hasDeadline && call.deadline.Before(deadline) {
 		deadline = call.deadline
 	}
-	return context.WithDeadline(s.proposalCtx, deadline)
+	return context.WithDeadline(latencydiag.CarryTags(s.proposalCtx, source), deadline)
 }
 
 func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.Slot, error, bool, bool) {

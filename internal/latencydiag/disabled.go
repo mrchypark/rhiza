@@ -26,6 +26,9 @@ func WithSlot(ctx context.Context, _ uint64) context.Context                 { r
 func Slot(_ context.Context) uint64                                          { return 0 }
 func WithTag(ctx context.Context, _ uint64) context.Context                  { return ctx }
 func Tag(_ context.Context) uint64                                           { return 0 }
+func WithTags(ctx context.Context, _ []uint64) context.Context               { return ctx }
+func Tags(_ context.Context) []uint64                                        { return nil }
+func CarryTags(dst, _ context.Context) context.Context                       { return dst }
 func TraceTag(_ string, _, _ uint64, _ error, _ time.Time)                   {}
 func TraceHTTPResponse(_ uint64, _ int, _ time.Time)                         {}
 func StartTagged(_ context.Context) time.Time                                { return time.Time{} }
@@ -33,3 +36,5 @@ func TraceTaggedStage(_ context.Context, _ string, _ error, _ time.Time)     {}
 func TraceRequestLockWait(_ context.Context, _ uint64, _ error, _ time.Time) {}
 func TraceRequestLockHold(_ context.Context, _ uint64, _, _ time.Time)       {}
 func TraceBatcherEnqueue(_ context.Context, _ error, _ time.Time)            {}
+func TraceProposalStage(_ context.Context, _ string, _ uint64, _ error, _ time.Time) {
+}

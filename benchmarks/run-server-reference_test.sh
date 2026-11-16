@@ -97,6 +97,10 @@ printf '%s\n' \
  'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=16' \
  'rhiza_latency stage=mutation_entry batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=3000 end_unix_ns=3000 duration_ns=0 request=0 attempt=0 tag=16' \
  'rhiza_latency stage=mutation_admission batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=3000 end_unix_ns=4000 duration_ns=1000 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=proposal_mu_wait batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5000 end_unix_ns=5010 duration_ns=10 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=proposal_permit_wait batch=0 slot=0 count=3 peer=0000000000000000 outcome=ok start_unix_ns=5010 end_unix_ns=5020 duration_ns=10 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=proposal_worker_start batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5020 end_unix_ns=5030 duration_ns=10 request=0 attempt=0 tag=16' \
+ 'rhiza_latency stage=proposal_mu_wait batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5030 end_unix_ns=5040 duration_ns=10 request=0 attempt=0 tag=16' \
  'rhiza_latency stage=batch_proposal batch=0 slot=2 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5000 end_unix_ns=7000 duration_ns=2000 request=0 attempt=0 tag=16' \
  'rhiza_latency stage=batch_result batch=0 slot=2 count=0 peer=0000000000000000 outcome=ok start_unix_ns=1100 end_unix_ns=7001 duration_ns=5901 request=0 attempt=0 tag=16' \
  'rhiza_latency stage=http_response batch=0 slot=0 count=200 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=8000 duration_ns=6000 request=0 attempt=0 tag=16' > "$scratch/tag-trace.txt"
@@ -105,6 +109,12 @@ grep -q $'^16\t1000\t11500\t10500\t1100\t11000\t2\ttrue\tok\t200\t2000\t3000\t30
 grep -qx '# correlation_status=valid' <<<"$tag_join"
 grep -qx '# missing_result=0' <<<"$tag_join"
 grep -qx '# cross_process_order_unknown=0' <<<"$tag_join"
+grep -qx '# proposal_mu_events=2' <<<"$tag_join"
+grep -qx '# proposal_permit_events=1' <<<"$tag_join"
+grep -qx '# proposal_worker_events=1' <<<"$tag_join"
+grep -qx '# proposal_gap_drops=0' <<<"$tag_join"
+printf '%s\n' "$tag_join" > "$scratch/tag-valid.out"
+bash "$here/../scripts/ci/check-tagged-assessment.sh" "$scratch/tag-valid.out"
 cp "$scratch/tag-trace.txt" "$scratch/tag-trace-unpaired.txt"
 for ((tag=32; tag<=1056; tag+=16)); do
  printf 'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=%d end_unix_ns=%d duration_ns=1 request=0 attempt=0 tag=%d\n' "$((2000 + tag))" "$((2001 + tag))" "$tag" >> "$scratch/tag-trace-unpaired.txt"
@@ -135,11 +145,54 @@ if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-t
  printf 'duplicate server tag accepted\n' >&2; exit 1
 fi
 grep -qx '# duplicate_server_events=1' "$scratch/tag-server-duplicate.out"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-duplicate-proposal.txt"
+printf '%s\n' 'rhiza_latency stage=proposal_worker_start batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5040 end_unix_ns=5050 duration_ns=10 request=0 attempt=0 tag=16' >> "$scratch/tag-trace-duplicate-proposal.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-duplicate-proposal.txt" > "$scratch/tag-duplicate-proposal.out"; then
+ printf 'duplicate proposal tag accepted\n' >&2; exit 1
+fi
+grep -qx '# duplicate_server_events=1' "$scratch/tag-duplicate-proposal.out"
+grep -qx '# correlation_status=invalid' "$scratch/tag-duplicate-proposal.out"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-duplicate-mu.txt"
+printf '%s\n' 'rhiza_latency stage=proposal_mu_wait batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=5040 end_unix_ns=5050 duration_ns=10 request=0 attempt=0 tag=16' >> "$scratch/tag-trace-duplicate-mu.txt"
+tag_duplicate_mu=$(awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-duplicate-mu.txt")
+grep -qx '# correlation_status=valid' <<<"$tag_duplicate_mu"
+grep -qx '# proposal_mu_events=3' <<<"$tag_duplicate_mu"
 sed 's/stage=batch_proposal batch=0 slot=2/stage=batch_proposal batch=0 slot=3/' "$scratch/tag-trace.txt" > "$scratch/tag-trace-slot.txt"
 if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-slot.txt" > "$scratch/tag-slot.out"; then
  printf 'proposal slot mismatch accepted\n' >&2; exit 1
 fi
 grep -qx '# slot_mismatches=1' "$scratch/tag-slot.out"
+sed '/stage=proposal_worker_start /d' "$scratch/tag-trace.txt" > "$scratch/tag-trace-missing-proposal.txt"
+missing_proposal=$(awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-missing-proposal.txt")
+grep -qx '# correlation_status=incomplete' <<<"$missing_proposal"
+grep -qx '# missing_proposal_worker=1' <<<"$missing_proposal"
+printf '%s\n' "$missing_proposal" > "$scratch/tag-missing-proposal.out"
+if bash "$here/../scripts/ci/check-tagged-assessment.sh" "$scratch/tag-missing-proposal.out" >/dev/null 2>&1; then
+ printf 'missing proposal stage passed tagged validation\n' >&2; exit 1
+fi
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-proposal-drop.txt"
+printf '%s\n' \
+ 'rhiza_latency dropped=2' \
+ 'rhiza_latency proposal_gap_dropped=2' \
+ 'rhiza_latency proposal_gap_dropped_capacity=2' \
+ 'rhiza_latency proposal_gap_dropped_trylock=0' \
+ 'rhiza_latency proposal_gap_dropped_reason_incomplete=0' >> "$scratch/tag-trace-proposal-drop.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-proposal-drop.txt" > "$scratch/tag-proposal-drop.out"; then
+ printf 'proposal diagnostic drop passed tagged validation\n' >&2; exit 1
+fi
+grep -qx '# correlation_status=invalid' "$scratch/tag-proposal-drop.out"
+grep -qx '# proposal_gap_drops=2' "$scratch/tag-proposal-drop.out"
+cp "$scratch/tag-trace.txt" "$scratch/tag-trace-proposal-incomplete.txt"
+printf '%s\n' \
+ 'rhiza_latency proposal_gap_dropped=0' \
+ 'rhiza_latency proposal_gap_dropped_capacity=0' \
+ 'rhiza_latency proposal_gap_dropped_trylock=0' \
+ 'rhiza_latency proposal_gap_dropped_reason_incomplete=1' >> "$scratch/tag-trace-proposal-incomplete.txt"
+if awk -v client_file="$scratch/tag-client.tsv" -f "$here/../scripts/ci/assess-tagged-latency.awk" "$scratch/tag-trace-proposal-incomplete.txt" > "$scratch/tag-proposal-incomplete.out"; then
+ printf 'incomplete proposal classification passed tagged validation\n' >&2; exit 1
+fi
+grep -qx '# correlation_status=invalid' "$scratch/tag-proposal-incomplete.out"
+grep -qx '# proposal_gap_dropped_reason_incomplete=1' "$scratch/tag-proposal-incomplete.out"
 printf '16\t0\t1000\t9000\t1100\t8500\t7000\tfalse\n' > "$scratch/tag-client-failed.tsv"
 printf '%s\n' \
  'rhiza_latency stage=http_receive batch=0 slot=0 count=0 peer=0000000000000000 outcome=ok start_unix_ns=2000 end_unix_ns=2001 duration_ns=1 request=0 attempt=0 tag=16' \
@@ -160,6 +213,7 @@ workflow="$here/../.github/workflows/performance.yml"
 ! grep -Fq 'before-ack-sampled-diagnostics/*.log' "$workflow"
 grep -Fq 'before-ack-sampled-diagnostics/*-sanitized.json' "$workflow"
 grep -Fq 'before-ack-sampled-diagnostics/concurrency-after.json' "$workflow"
+grep -Fq 'check-tagged-assessment.sh' "$workflow"
 grep -Fq -- '--slurpfile before' "$workflow"
 overlap_filter="$here/../scripts/ci/assess-performance-overlap.jq"
 pages_filter="$here/../scripts/ci/flatten-performance-pages.jq"
