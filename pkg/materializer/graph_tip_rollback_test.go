@@ -176,6 +176,8 @@ func TestGraphControlRollbackPreservesDurableGraphDecision(t *testing.T) {
 	ctx := &cancelAfterControlTip{Context: context.Background(), graph: m.graph, target: 2, done: make(chan struct{})}
 	if err := m.ApplyBatch(ctx, decisions); err == nil || ctx.Err() != context.Canceled {
 		t.Fatalf("apply: %v, context: %v", err, ctx.Err())
+	} else if errors.Is(err, ErrGraphCommitUnknown) {
+		t.Fatalf("confirmed auto-rollback became commit-unknown: %v", err)
 	}
 	if m.tip != 0 || m.graph.tip != 1 || m.graph.durableTip != 1 {
 		t.Fatalf("SQLite=%d graph=%d durable graph=%d", m.tip, m.graph.tip, m.graph.durableTip)

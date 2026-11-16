@@ -163,8 +163,11 @@ func TestReceiptInterruptedTransactionProbe(t *testing.T) {
 	<-exited
 	running = false
 	origin := recorder.Origin()
-	if !errors.Is(applyErr, sqlite3.INTERRUPT) || !errors.Is(applyErr, ErrGraphCommitUnknown) || !origin.Known || origin.Trigger != applydiag.PoisonRollback || origin.PrimarySite != applydiag.Receipts || !origin.PrimaryCodeKnown || origin.PrimaryCode != int(sqlite3.INTERRUPT) || !origin.CleanupCodeKnown || origin.CleanupCode != int(sqlite3.ERROR) || origin.BatchFirst != 3 || origin.BatchLast != 4 || !origin.TipKnown || origin.TipBeforeReset != 4 || m.Tip() != 2 {
+	if !errors.Is(applyErr, sqlite3.INTERRUPT) || errors.Is(applyErr, ErrGraphCommitUnknown) || origin.Known || m.Tip() != 2 {
 		t.Fatalf("receipt interruption: err=%v origin=%+v tip=%d", applyErr, origin, m.Tip())
+	}
+	if err := m.Health(ctx); err != nil {
+		t.Fatalf("confirmed auto-rollback poisoned materializer: %v", err)
 	}
 	// The reserved connection is no longer owned here; a later connection's
 	// native state cannot witness the failed transaction's error boundary.

@@ -95,7 +95,7 @@ func TestApplyDiagnosticsCommitAcknowledgementLossThenPoison(t *testing.T) {
 	}
 }
 
-func TestApplyDiagnosticsActualRollbackFailureThenPoison(t *testing.T) {
+func TestApplyDiagnosticsConfirmedAutoRollbackThenReplay(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(filepath.Join(t.TempDir(), "state.sqlite"), 1)
 	if err != nil {
@@ -115,6 +115,53 @@ func TestApplyDiagnosticsActualRollbackFailureThenPoison(t *testing.T) {
 		}
 	}
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "lost-savepoint", SQL: "INSERT INTO items VALUES(2)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorder applydiag.Recorder
+	observed := applydiag.WithRecorder(ctx, &recorder)
+	err = m.ApplyBatch(observed, []quepaxa.DecidedValue{{Slot: 3, Value: value}})
+	if errors.Is(err, ErrGraphCommitUnknown) || !errors.Is(err, sqlite3.ERROR) || strings.Contains(err.Error(), "rollback apply batch:") || recorder.Site() != applydiag.ApplyValue || m.Tip() != 2 {
+		t.Fatalf("rollback failure err=%v site=%s tip=%d", err, recorder.Site(), m.Tip())
+	}
+	if err := m.Health(ctx); err != nil {
+		t.Fatalf("confirmed auto-rollback poisoned materializer: %v", err)
+	}
+	if _, found, err := m.MutationReceipt(ctx, types.MutationSQL, "lost-savepoint"); err != nil || found {
+		t.Fatalf("failed receipt found=%t err=%v", found, err)
+	}
+	if _, err := m.writer.ExecContext(ctx, "DROP TRIGGER tr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(observed, []quepaxa.DecidedValue{{Slot: 3, Value: value}}); err != nil {
+		t.Fatalf("certified replay: %v", err)
+	}
+	if receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, "lost-savepoint"); err != nil || !found || receipt.Slot != 3 {
+		t.Fatalf("replayed receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+}
+
+func TestApplyDiagnosticsActualRollbackFailureThenPoison(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "state.sqlite"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	for slot, statement := range []string{
+		"CREATE TABLE items(id INTEGER PRIMARY KEY)",
+		"INSERT INTO items VALUES(1)",
+	} {
+		value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprint(slot), SQL: statement}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Apply(ctx, uint64(slot+1), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	injectRollbackCleanupError(t, m, injectedSQLiteCleanupError{})
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "INSERT INTO items VALUES(1)"}})
 	if err != nil {
 		t.Fatal(err)
 	}

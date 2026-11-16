@@ -25,7 +25,7 @@ type poisonLockCheckingWriter struct {
 	locked bool
 }
 
-func TestFirstSQLitePoisonInterruptedWriteKeepsPrimaryAndRollbackCode(t *testing.T) {
+func TestInterruptedWriteKeepsPrimaryAfterConfirmedAutoRollback(t *testing.T) {
 	ctx, stop := context.WithTimeout(context.Background(), 15*time.Second)
 	defer stop()
 	m, err := Open(filepath.Join(t.TempDir(), "state.sqlite"), 1)
@@ -91,8 +91,11 @@ func TestFirstSQLitePoisonInterruptedWriteKeepsPrimaryAndRollbackCode(t *testing
 	select {
 	case err = <-result:
 		origin := recorder.Origin()
-		if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrGraphCommitUnknown) || !origin.Known || origin.Trigger != applydiag.PoisonRollback || origin.PrimaryClass != applydiag.ErrorCanceled || origin.PrimarySite != applydiag.ApplyValue || !origin.FailedSlotKnown || origin.FailedSlot != 2 || origin.CleanupClass != applydiag.ErrorSQLite || !origin.CleanupCodeKnown || origin.CleanupCode != int(sqlite3.ERROR) || m.Tip() != 1 {
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrGraphCommitUnknown) || origin.Known || m.Tip() != 1 {
 			t.Fatalf("interrupted write origin=%+v err=%v tip=%d", origin, err, m.Tip())
+		}
+		if err := m.Health(ctx); err != nil {
+			t.Fatalf("confirmed auto-rollback poisoned materializer: %v", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("interrupted apply did not return", ctx.Err())
@@ -120,7 +123,7 @@ func TestFirstSQLitePoisonRollbackKeepsOriginalAndLogsOutsideLock(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
-	for i, stmt := range []string{"CREATE TABLE items(id INTEGER PRIMARY KEY)", "CREATE TRIGGER tr AFTER INSERT ON items WHEN new.id=2 BEGIN INSERT INTO items VALUES(9223372036854775807); SELECT RAISE(ROLLBACK,'private-payload'); END"} {
+	for i, stmt := range []string{"CREATE TABLE items(id INTEGER PRIMARY KEY)", "INSERT INTO items VALUES(1)"} {
 		value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprint(i), SQL: stmt}})
 		if err != nil {
 			t.Fatal(err)
@@ -129,7 +132,8 @@ func TestFirstSQLitePoisonRollbackKeepsOriginalAndLogsOutsideLock(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "private-request", SQL: "INSERT INTO items VALUES(2)"}})
+	injectRollbackCleanupError(t, m, injectedSQLiteCleanupError{})
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "INSERT INTO items VALUES(1)"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +149,7 @@ func TestFirstSQLitePoisonRollbackKeepsOriginalAndLogsOutsideLock(t *testing.T) 
 		t.Fatalf("rollback failure: %v tip=%d", err, m.Tip())
 	}
 	origin := recorder.Origin()
-	if !origin.Known || origin.Trigger != applydiag.PoisonRollback || origin.PrimarySite != applydiag.ApplyValue || !origin.FailedSlotKnown || origin.FailedSlot != 4 || !origin.TipKnown || origin.TipBeforeReset != 3 || origin.BatchFirst != 3 || origin.BatchLast != 4 || origin.CleanupClass == applydiag.ErrorNone {
+	if !origin.Known || origin.Trigger != applydiag.PoisonRollback || origin.PrimarySite != applydiag.ApplyValue || !origin.FailedSlotKnown || origin.FailedSlot != 4 || !origin.TipKnown || origin.TipBeforeReset != 3 || origin.BatchFirst != 3 || origin.BatchLast != 4 || origin.CleanupClass != applydiag.ErrorSQLite || !origin.CleanupCodeKnown || origin.CleanupCode != int(sqlite3.ERROR) {
 		t.Fatalf("incorrect first origin: %+v", origin)
 	}
 	err = m.ApplyBatch(observed, []quepaxa.DecidedValue{{Slot: 3, Value: barrier}})
@@ -172,7 +176,7 @@ func TestFirstSQLitePoisonRollbackKeepsOriginalAndLogsOutsideLock(t *testing.T) 
 	}
 	checker.mu.Lock()
 	defer checker.mu.Unlock()
-	if checker.locked || len(checker.lines) != 1 || len(checker.lines[0]) > 1024 || strings.Contains(checker.lines[0], "private") || !strings.Contains(checker.lines[0], "trigger=rollback") || !strings.Contains(checker.lines[0], "failed_slot=4") {
+	if checker.locked || len(checker.lines) != 1 || len(checker.lines[0]) > 1024 || !strings.Contains(checker.lines[0], "trigger=rollback") || !strings.Contains(checker.lines[0], "failed_slot=4") {
 		t.Fatalf("bad first poison event: locked=%v lines=%q", checker.locked, checker.lines)
 	}
 }

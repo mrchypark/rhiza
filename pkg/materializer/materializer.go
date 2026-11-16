@@ -400,7 +400,7 @@ func openMaterializerPolicy(dbPath string, readerCount int, protocol string, ide
 
 func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 	readOnly := strings.Contains(dsn, "mode=ro")
-	return sqlite3driver.Open(dsn, func(conn *sqlite3.Conn) error {
+	init := func(conn *sqlite3.Conn) error {
 		if err := fts5.Register(conn); err != nil {
 			return err
 		}
@@ -428,7 +428,11 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 			}
 		}
 		return setSQLAuthorizer(conn, writer, readOnly, false)
-	})
+	}
+	if writer {
+		return openRollbackWitnessSQLite(dsn, init)
+	}
+	return sqlite3driver.Open(dsn, init)
 }
 
 // sqlFunctionDenylist holds functions a replicated write must not use. The
@@ -1274,13 +1278,31 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	commitAttempted := false
 	var failedSlot, tipBeforeReset uint64
 	var failedSlotKnown, tipKnown bool
+	var rollbackWitness *rollbackWitnessConn
 	makePoison := func(trigger applydiag.PoisonTrigger, primary, cleanup error) applydiag.PoisonOrigin {
 		primaryClass, primaryKnown, primaryCode := poisonErrorClass(primary)
 		cleanupClass, cleanupKnown, cleanupCode := poisonErrorClass(cleanup)
 		return applydiag.PoisonOrigin{Known: true, Trigger: trigger, PrimarySite: diagnostic.Site(), FailedSlotKnown: failedSlotKnown, FailedSlot: failedSlot, TipKnown: tipKnown, TipBeforeReset: tipBeforeReset, BatchFirst: uint64(decisions[0].Slot), BatchLast: uint64(decisions[len(decisions)-1].Slot), PrimaryClass: primaryClass, PrimaryCodeKnown: primaryKnown, PrimaryCode: primaryCode, CleanupClass: cleanupClass, CleanupCodeKnown: cleanupKnown, CleanupCode: cleanupCode}
 	}
 	defer func() {
+		if applyErr != nil && !commitAttempted {
+			_ = conn.Raw(func(driverConn any) error {
+				if witness, ok := driverConn.(*rollbackWitnessConn); ok {
+					rollbackWitness = witness
+					witness.armAutoRollback()
+				}
+				return nil
+			})
+		}
 		rollbackErr := tx.Rollback()
+		if rollbackErr == nil && !commitAttempted && rollbackWitness != nil && rollbackWitness.takeRetire() {
+			retireErr := conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+			if !errors.Is(retireErr, sqldriver.ErrBadConn) {
+				rollbackErr = fmt.Errorf("retire apply connection: %w", retireErr)
+			} else if closeErr := rollbackWitness.closedError(); closeErr != nil {
+				rollbackErr = fmt.Errorf("close apply connection: %w", closeErr)
+			}
+		}
 		if applyErr != nil {
 			m.sqlReceiptRetention = oldRetention
 			if !commitAttempted {

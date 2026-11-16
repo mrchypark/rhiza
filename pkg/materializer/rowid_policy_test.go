@@ -204,7 +204,7 @@ func TestRowIDPolicyPreservesPayloadsAndSchemaLifecycle(t *testing.T) {
 	}
 }
 
-func TestRowIDPolicyLostSavepointFailsApply(t *testing.T) {
+func TestRowIDPolicyLostSavepointAfterConfirmedRollback(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/state.db"
 	m, err := Open(path, 1)
@@ -225,7 +225,65 @@ func TestRowIDPolicyLostSavepointFailsApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = m.Apply(ctx, 3, v); !errors.Is(err, ErrGraphCommitUnknown) || !errors.Is(err, sqlite3.ERROR) || !strings.Contains(err.Error(), "no such savepoint") || !strings.Contains(err.Error(), "rollback apply batch:") {
+	if err = m.Apply(ctx, 3, v); errors.Is(err, ErrGraphCommitUnknown) || !errors.Is(err, sqlite3.ERROR) || !strings.Contains(err.Error(), "no such savepoint") || strings.Contains(err.Error(), "rollback apply batch:") {
+		t.Fatalf("confirmed auto-rollback must preserve the original error: %v", err)
+	}
+	if m.Tip() != 2 {
+		t.Fatal("tip advanced")
+	}
+	if _, ok, e := m.MutationReceipt(ctx, types.MutationSQL, "lost-savepoint"); e != nil || ok {
+		t.Fatal("failed transaction exposed receipt", ok, e)
+	}
+	if err := m.Health(ctx); err != nil {
+		t.Fatalf("confirmed auto-rollback poisoned materializer: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	rows, err := m.QueryResult(ctx, "SELECT COUNT(*) FROM items", nil)
+	if err != nil || rows.Rows[0][0] != int64(0) {
+		t.Fatal(rows, err)
+	}
+	if _, err := m.writer.ExecContext(ctx, "DROP TRIGGER tr"); err != nil {
+		t.Fatal(err)
+	}
+	good, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "safe", SQL: "INSERT INTO items VALUES(3)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Apply(ctx, 3, good); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRowIDPolicyLostSavepointFailsApply(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/state.db"
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	for i, q := range []string{"CREATE TABLE items(id INTEGER PRIMARY KEY)", "CREATE TRIGGER tr BEFORE INSERT ON items WHEN new.id=2 BEGIN SELECT RAISE(ABORT,'later'); END"} {
+		v, e := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprint(i), SQL: q}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = m.Apply(ctx, uint64(i+1), v); e != nil {
+			t.Fatal(e)
+		}
+	}
+	injectRollbackCleanupError(t, m, injectedSQLiteCleanupError{})
+	v, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "INSERT INTO items VALUES(2)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Apply(ctx, 3, v); !errors.Is(err, ErrGraphCommitUnknown) || !errors.Is(err, sqlite3.ERROR) || !strings.Contains(err.Error(), "rollback apply batch:") {
 		t.Fatalf("lost rollback outcome must fail closed: %v", err)
 	}
 	if m.Tip() != 2 {
