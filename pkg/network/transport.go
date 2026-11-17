@@ -1159,7 +1159,11 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		}
 	}
 	callCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 	type result struct {
 		id  quepaxa.NodeID
 		err error
@@ -1171,7 +1175,9 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			continue
 		}
 		pending++
+		wg.Add(1)
 		go func(member quepaxa.Member) {
+			defer wg.Done()
 			req := peer.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
 			trace := ""
