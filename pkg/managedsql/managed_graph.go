@@ -58,10 +58,11 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 }
 
 func (h *Host) graphExecuteAttempt(ctx context.Context, owned types.GraphCommand) (network.GraphExecuteResponse, error, bool) {
-	n, ok := h.openNodeForWrite()
+	n, release, ok := h.openNodeForWrite()
 	if !ok {
 		return network.GraphExecuteResponse{}, network.ErrNotReady, false
 	}
+	defer release()
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return network.GraphExecuteResponse{}, err, true
 	}
