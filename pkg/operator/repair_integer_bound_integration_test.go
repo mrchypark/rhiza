@@ -225,8 +225,7 @@ func TestRepairIntegerBoundAPIServerContract(t *testing.T) {
 		}
 	}
 	applyCRD(unsafeGroup, false)
-	// The float64 schema maximum rounds to 2^63, so the first out-of-range int64 is accepted.
-	probe(unsafeGroup, "bad", "9223372036854775806", true, "")
+	probe(unsafeGroup, "bad", "1", false, "Maximum boundary")
 
 	applyCRD(fixedGroup, true)
 	for i, value := range []string{"1", "9007199254740993", "9223372036854775805"} {
