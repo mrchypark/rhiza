@@ -41,7 +41,7 @@ case "$temporary_dir" in
 esac
 
 mkdir -p "$temporary_dir"
-cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$repo_dir/config_env.go" "$repo_dir/operator_handler.go" "$repo_dir/membership.go" "$temporary_dir/"
+cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$repo_dir/replica_learner_checkpoint.go" "$repo_dir/replica_sync.go" "$repo_dir/config_env.go" "$repo_dir/operator_handler.go" "$repo_dir/membership.go" "$temporary_dir/"
 
 (
     cd "$repo_dir"
