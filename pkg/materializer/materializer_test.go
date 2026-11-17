@@ -2265,3 +2265,38 @@ func policySQL(t testing.TB, query string) []byte {
 	}
 	return value
 }
+
+func TestSQLiteWALCheckpointTruncatesWhenIdle(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(dbPath, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	if err := m.Apply(ctx, 1, policySQL(t, "CREATE TABLE wal_test (id INTEGER PRIMARY KEY, body BLOB)")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i <= 6; i++ {
+		if err := m.Apply(ctx, uint64(i), policySQL(t, "INSERT INTO wal_test(body) VALUES (zeroblob(8192))")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walPath := dbPath + "-wal"
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() == 0 {
+		t.Fatalf("expected non-empty WAL before checkpoint, got 0")
+	}
+	m.checkpointSQLiteWAL(m.db, 1)
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != 0 {
+		t.Fatalf("expected WAL truncated to 0 bytes, got %d", after.Size())
+	}
+}
