@@ -2803,7 +2803,9 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 	c.mu.Lock()
 	for index := first; index <= slot; index++ {
 		c.durable[index] = true
-		c.valueDurable[c.decided[index].Hash] = true
+		if decided, ok := c.decided[index]; ok {
+			c.valueDurable[decided.Hash] = true
+		}
 	}
 	c.mu.Unlock()
 	return nil

@@ -234,6 +234,13 @@ func (w *WAL) loadSegmentsReadOnly() error {
 	}
 	sort.Strings(manifests)
 	latest := manifests[len(manifests)-1]
+	manifestInfo, err := os.Lstat(latest)
+	if err != nil {
+		return err
+	}
+	if !manifestInfo.Mode().IsRegular() {
+		return fmt.Errorf("non-regular WAL manifest %q", filepath.Base(latest))
+	}
 	data, err := os.ReadFile(latest)
 	if err != nil {
 		return err
@@ -321,6 +328,13 @@ func (w *WAL) loadSegments() error {
 	}
 	sort.Strings(manifests)
 	latest := manifests[len(manifests)-1]
+	manifestInfo, err := os.Lstat(latest)
+	if err != nil {
+		return err
+	}
+	if !manifestInfo.Mode().IsRegular() {
+		return fmt.Errorf("non-regular WAL manifest %q", filepath.Base(latest))
+	}
 	data, err := os.ReadFile(latest)
 	if err != nil {
 		return err
@@ -335,6 +349,15 @@ func (w *WAL) loadSegments() error {
 	}
 	for i, ref := range refs {
 		path := w.segmentPath(ref.index)
+		lstatInfo, err := os.Lstat(path)
+		if err != nil {
+			w.closeSegments()
+			return fmt.Errorf("stat manifest segment %d: %w", ref.index, err)
+		}
+		if !lstatInfo.Mode().IsRegular() {
+			w.closeSegments()
+			return fmt.Errorf("non-regular WAL segment %d", ref.index)
+		}
 		f, err := os.OpenFile(path, os.O_RDWR, 0600)
 		if err != nil {
 			w.closeSegments()

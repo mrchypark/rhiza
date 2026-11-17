@@ -1604,7 +1604,8 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					retain[seal.RootHash] = struct{}{}
 					if err := n.checkpoints.GarbageCollectFrom(ctx, retain, 2, archiveFloor, n.config.ObjStoreGCGracePeriod); err != nil {
 						log.Printf("checkpoint GC failed: %v", err)
-					} else if n.archive != nil {
+					}
+					if n.archive != nil {
 						if err := n.archive.Cleanup(ctx, n.config.ObjStoreGCGracePeriod); err != nil {
 							log.Printf("archive GC failed: %v", err)
 						}
