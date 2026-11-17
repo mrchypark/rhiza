@@ -53,6 +53,9 @@ type sqlEvidence struct {
 
 type Host struct {
 	mu sync.Mutex
+	// opMu lets concurrent mutations run in parallel (RLock) while Close()
+	// serializes behind in-flight executions (Lock).
+	opMu sync.RWMutex
 	// replicaMu serializes both public membership entry points and the Host's
 	// external scale coordinator. Status CAS remains the durable authority.
 	replicaMu sync.Mutex
@@ -896,20 +899,25 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	}
 }
 
-func (h *Host) openNodeForWrite() (*node.Node, bool) {
+func (h *Host) openNodeForWrite() (*node.Node, func(), bool) {
+	h.opMu.RLock()
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed || h.node == nil {
-		return nil, false
+		h.mu.Unlock()
+		h.opMu.RUnlock()
+		return nil, nil, false
 	}
-	return h.node, true
+	n := h.node
+	h.mu.Unlock()
+	return n, h.opMu.RUnlock, true
 }
 
 func (h *Host) executeAttempt(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error, bool) {
-	n, ok := h.openNodeForWrite()
+	n, release, ok := h.openNodeForWrite()
 	if !ok {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}, true
 	}
+	defer release()
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return ExecuteResponse{}, err, false
 	}
@@ -978,6 +986,8 @@ func (h *Host) Close() error {
 	if h.stopAdmission != nil {
 		h.stopAdmission()
 	}
+	h.opMu.Lock()
+	defer h.opMu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {

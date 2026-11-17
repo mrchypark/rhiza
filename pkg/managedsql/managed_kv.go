@@ -164,10 +164,11 @@ func (h *Host) KVMutate(ctx context.Context, operation string, req network.KVMut
 }
 
 func (h *Host) kvMutateAttempt(ctx context.Context, original types.KVCommand) (network.KVMutationResponse, error, SQLSubmissionStage) {
-	n, ok := h.openNodeForWrite()
+	n, release, ok := h.openNodeForWrite()
 	if !ok {
 		return network.KVMutationResponse{}, fmt.Errorf("mixed managed Host required"), SQLStageAuthority
 	}
+	defer release()
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return network.KVMutationResponse{}, err, SQLStageAdmission
 	}
