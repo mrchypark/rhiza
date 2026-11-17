@@ -67,18 +67,52 @@ the workflow's 20-minute ceiling and cleanup, but not exceed one hour.
 Direct-host requires exclusive use of the dedicated namespace for the run. It
 preflights fixture names, creates its overlay without adopting existing objects,
 and uses the returned UIDs as deletion preconditions for the overlay and CR.
-Unconfirmed overlay or CR creations are left for the administrator. Cleanup of
-the other exact, preflighted fixture names depends on exclusive namespace use.
+If the create response or exact CR UID was not recorded, cleanup does not infer
+ownership from labels or names and does not delete the CR or its derived access
+objects. A durable create-attempt marker is written before the API request; if
+the marker exists without an exact UID, uncertainty remains even when the CR is
+currently absent because per-UID access remnants cannot be discovered safely.
+The marker path includes a fresh 24-hex attempt identity independent of the
+release token, so markers from earlier attempts remain evidence without making
+a later attempt on the same release fail when it did not try to create a CR.
+Cleanup records the live UID, if any, marks the run failed in
+`residual-resources.txt`, and leaves resources for the administrator. If no
+create was attempted and no matching CR exists, no failure is reported. Cleanup
+of the other exact, preflighted fixture names depends on exclusive namespace use.
+Production semantics remain manual-finalizer controlled. Direct-host teardown
+has a test-only exception only after it obtains the exact UID recorded from the
+successful create response in its TSV. It performs no label/name-based recovery.
+It validates that CR UID, then revokes and deletes
+only its generated RoleBinding, Role and ServiceAccount after exact checks of
+managed-by, cluster UID and name label, access contract/lifecycle labels, full
+Role rules, RoleBinding roleRef and subjects, and object UIDs. Only then does it
+delete the CR, re-read its deletionTimestamp, and submit one JSON Patch whose
+server-side `test` operations bind the CR UID, resourceVersion, deletionTimestamp
+and complete finalizer list before removing only the Rhiza cleanup finalizer.
+Any access cleanup failure leaves the CR and finalizer in place. This forced
+test teardown is not evidence of process termination and is not a production
+cleanup mechanism.
 
-For direct-host only, the runner needs `get`, `list`, `watch`, `create`, and
-`delete` on `rhizaclusters` in the `rhiza.mrchypark.dev` API group in that
-namespace. The fixture uses `watch` when waiting for the `sql` CR to disappear.
+For direct-host only, the runner needs `get`, `list`, `watch`, `create`,
+`update`, `patch`, and `delete` on `rhizaclusters` in the
+`rhiza.mrchypark.dev` API group in that namespace. The fixture uses `watch`
+when waiting for the `sql` CR to disappear. Main-resource `update` is required
+to delegate the operator's cleanup-finalizer permission. `patch` is a
+test-runner-only teardown permission; the operator Role must not receive it.
+The runner also needs, in the test namespace:
+
+- `get`, `list`, `create`, and `delete` on `serviceaccounts`
+- `get`, `list`, `create`, `update`, and `delete` on `roles`
+- `get`, `list`, `create`, and `delete` on `rolebindings`
+
+The role `update` is used only to restore the test-owned direct-host operator
+Role after the gated bootstrap phase. All test-only access deletes remain
+bound to exact object UID, cluster UID, labels, rules/roleRef/subject checks.
 The runner also needs `get` and `update` on `rhizaclusters/status` to delegate
-those verbs to the operator and managed Host Roles. No `update` or `patch` on the
-main `rhizaclusters` resource is needed. The direct-host projection removes
-unused Recovery API rules; the runner must already be allowed to delegate the
-remaining namespace rules. Do not grant `escalate` or `bind` to bypass an RBAC
-refusal.
+those verbs to the operator and managed Host Roles. The direct-host projection
+removes unused Recovery API rules; the runner must already be allowed to
+delegate the remaining namespace rules. Do not grant `escalate` or `bind` to
+bypass an RBAC refusal.
 
 The parent verifies the namespace UID; the driver verifies the original
 ServiceAccount UID and namespace emptiness, then installs the OSS

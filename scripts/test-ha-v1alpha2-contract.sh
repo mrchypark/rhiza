@@ -319,16 +319,21 @@ rules:
   verbs: ["get"]
 - apiGroups: [""]
   resources: ["serviceaccounts"]
-  resourceNames: ["rhiza-managed-host"]
-  verbs: ["get"]
+  verbs: ["get", "list", "create"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles"]
+  verbs: ["get", "list", "create"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["rolebindings"]
+  verbs: ["get", "list", "create"]
 # Controlled Pod status and Secret setup use the CI administrator kubeconfig,
 # never this operator ServiceAccount. In particular, no pods/status writes.
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizaclusters"]
-  verbs: ["get", "list"]
+  verbs: ["get", "list", "update"]
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizaclusters/status"]
-  verbs: ["update"]
+  verbs: ["get", "update"]
 - apiGroups: ["rhiza.mrchypark.dev"]
   resources: ["rhizarecoveries"]
   verbs: ["get", "list", "update", "delete"]
@@ -368,7 +373,7 @@ export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
-contract_pattern=${RHIZA_CONTRACT_TEST_PATTERN:-'^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair|ReplicaScale)APIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$'}
+contract_pattern=${RHIZA_CONTRACT_TEST_PATTERN:-'^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair|ReplicaScale)APIServerContract$|^TestManagedHostAccessAPIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$'}
 go test ./pkg/operator -run "$contract_pattern" -count=1 -timeout=60s
 reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
 reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'

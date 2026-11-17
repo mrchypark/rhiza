@@ -161,6 +161,9 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 		return s, e
 	}
 	if _, ok := status["genesis"]; ok {
+		if err := validateV1Alpha2ManagedHostDeployment(ctx, kube, ref); err != nil {
+			return V1Alpha2StatusSnapshot{}, err
+		}
 		return committed()
 	}
 	if err := validateV1Alpha2ReplicaGenesis(c); err != nil {
@@ -193,14 +196,18 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 	if err != nil || secret.Metadata.Name != profile.ProfileSecretName || secret.Metadata.Namespace != ref.Namespace || secret.Metadata.UID == "" || secret.Metadata.DeletionTimestamp != nil || !reflect.DeepEqual(secretProfile, profile) {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("managed profile Secret differs from installed profile")
 	}
+	serviceAccount, err := V1Alpha2ManagedHostServiceAccountName(ref)
+	if err != nil {
+		return V1Alpha2StatusSnapshot{}, err
+	}
 	var account struct {
 		APIVersion, Kind string
 		Metadata         v1alpha2BootstrapMetadata
 	}
-	if err := kube.Get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/serviceaccounts/"+V1Alpha2ManagedHostServiceAccount, &account); err != nil {
+	if err := kube.Get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/serviceaccounts/"+serviceAccount, &account); err != nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("managed host ServiceAccount unavailable")
 	}
-	if account.APIVersion != "v1" || account.Kind != "ServiceAccount" || account.Metadata.Name != V1Alpha2ManagedHostServiceAccount || account.Metadata.Namespace != ref.Namespace || account.Metadata.UID == "" || account.Metadata.DeletionTimestamp != nil {
+	if account.APIVersion != "v1" || account.Kind != "ServiceAccount" || account.Metadata.Name != serviceAccount || account.Metadata.Namespace != ref.Namespace || account.Metadata.UID == "" || account.Metadata.DeletionTimestamp != nil {
 		return V1Alpha2StatusSnapshot{}, fmt.Errorf("invalid managed host ServiceAccount")
 	}
 	name, err := V1Alpha2GenesisDeploymentName(ref.UID)
@@ -316,8 +323,16 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 	if json.Unmarshal(expectedPod["containers"], &expectedContainers) != nil {
 		return false
 	}
+	var expectedServiceAccount string
+	if raw, ok := expectedPod["serviceAccountName"]; ok {
+		if json.Unmarshal(raw, &expectedServiceAccount) != nil || expectedServiceAccount == "" {
+			return false
+		}
+	}
 	strip(pod, map[string]string{"restartPolicy": `"Always"`, "dnsPolicy": `"ClusterFirst"`, "schedulerName": `"default-scheduler"`, "terminationGracePeriodSeconds": "30"})
-	strip(pod, map[string]string{"serviceAccount": `"rhiza-managed-host"`})
+	if expectedServiceAccount != "" {
+		strip(pod, map[string]string{"serviceAccount": `"` + expectedServiceAccount + `"`})
+	}
 	for _, key := range []string{"containers", "initContainers"} {
 		var containers []map[string]json.RawMessage
 		if json.Unmarshal(pod[key], &containers) != nil {
@@ -631,6 +646,13 @@ func RunV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernetes, int
 	}
 	return runV1Alpha2Initialization(ctx, kube, interval, func() error {
 		return initializeV1Alpha2ListWith(ctx, kube, func(ref V1Alpha2ClusterRef) error {
+			deleting, err := reconcileV1Alpha2ManagedHostClusterLifecycle(ctx, kube, ref)
+			if err != nil || deleting {
+				return err
+			}
+			if _, err := ensureV1Alpha2ManagedHostAccess(ctx, kube, ref); err != nil {
+				return err
+			}
 			if _, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, profile); err != nil {
 				return err
 			}

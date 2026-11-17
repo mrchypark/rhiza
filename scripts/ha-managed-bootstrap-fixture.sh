@@ -566,6 +566,15 @@ fi
 k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s
 k -n "$namespace" get rhizacluster sql -o json > "$logs/committed.json"
+k -n "$namespace" get deployment -l "$selector" -o json > "$logs/greenfield-deployments.json"
+expected_sa="rhiza-managed-host-$(printf '%s\000%s\000%s' "$namespace" sql "$uid" | sha256sum | cut -c1-16)"
+[ "$(jq -r '.items|length' "$logs/greenfield-deployments.json")" = 1 ]
+jq -e --arg sa "$expected_sa" '.items[0].spec.template.spec.serviceAccountName==$sa and .items[0].spec.template.spec.serviceAccount==$sa and .items[0].spec.template.spec.automountServiceAccountToken==true' "$logs/greenfield-deployments.json" >/dev/null
+k -n "$namespace" get pods -l "$selector" -o json > "$logs/greenfield-pods.json"
+jq -e --arg sa "$expected_sa" '.items|length==3 and all(.[]; .spec.serviceAccountName==$sa and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$logs/greenfield-pods.json" >/dev/null
+k -n "$namespace" get serviceaccount,role,rolebinding -o json > "$logs/greenfield-access.json"
+jq -e --arg sa "$expected_sa" 'any(.items[]; .kind=="ServiceAccount" and .metadata.name==$sa and .metadata.ownerReferences==null) and any(.items[]; .kind=="Role" and .metadata.name==$sa and any(.rules[]; .resources==["rhizaclusters/status"] and .resourceNames==["sql"] and (.verbs|index("update"))!=null)) and any(.items[]; .kind=="RoleBinding" and .metadata.name==($sa+"-binding") and .roleRef.name==$sa and .subjects==[{"kind":"ServiceAccount","name":$sa,"namespace":$namespace}]) and all(.items[]; .metadata.name!="rhiza-managed-host")' "$logs/greenfield-access.json" >/dev/null
+printf '%s\n' '{"serviceAccount":"'"$expected_sa"'","legacyServiceAccountAbsent":true,"pods":3}' > "$logs/greenfield-sa.json"
 jq -e '.status.bootstrapPlan.reconfiguration==true' "$logs/committed.json" >/dev/null
 jq -e --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '(.status.applicationInit.plan.applicationProtocol // "")==$protocol and .status.applicationInit.plan.evidenceFormat==$evidence and .status.bootstrapPlan.evidenceFormat==$evidence' "$logs/committed.json" >/dev/null
 sh scripts/ha-managed-bucket-setup oracle-plan "$logs/gated-pods.json" "$logs/committed.json"

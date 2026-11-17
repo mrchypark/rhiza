@@ -27,7 +27,6 @@ const (
 	V1Alpha2ManagedRuntimeProfileKey    = "runtime.json"
 	V1Alpha2ManagedRuntimeProfileVolume = "rhiza-runtime-profile"
 	V1Alpha2BootstrapHandoffPath        = "/var/lib/rhiza/bootstrap.json"
-	V1Alpha2ManagedHostServiceAccount   = "rhiza-managed-host"
 )
 
 // V1Alpha2ManagedPodSecurity is the initial managed profile. Application
@@ -62,7 +61,11 @@ func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimePr
 		return nil, err
 	}
 	init := pod["initContainers"].([]map[string]any)
-	pod["serviceAccountName"] = V1Alpha2ManagedHostServiceAccount
+	serviceAccount, err := V1Alpha2ManagedHostServiceAccountName(ref)
+	if err != nil {
+		return nil, err
+	}
+	pod["serviceAccountName"] = serviceAccount
 	pod["automountServiceAccountToken"] = true
 	main := pod["containers"].([]map[string]any)[0]
 	if containers[0].Resources != nil {
@@ -389,8 +392,11 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC || !sameJSON(p.Spec.SecurityContext, security) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
 			return nil, fmt.Errorf("invalid managed pod security")
 		}
-		if expectedMain != nil && (p.Spec.ServiceAccountName != V1Alpha2ManagedHostServiceAccount || p.Spec.ServiceAccount != "" && p.Spec.ServiceAccount != V1Alpha2ManagedHostServiceAccount || p.Spec.AutomountServiceAccountToken == nil || !*p.Spec.AutomountServiceAccountToken) {
-			return nil, fmt.Errorf("invalid managed host service account")
+		if expectedMain != nil {
+			expectedServiceAccount, err := V1Alpha2ManagedHostServiceAccountName(ref)
+			if err != nil || p.Spec.ServiceAccountName != expectedServiceAccount || p.Spec.ServiceAccount != "" && p.Spec.ServiceAccount != expectedServiceAccount || p.Spec.AutomountServiceAccountToken == nil || !*p.Spec.AutomountServiceAccountToken {
+				return nil, fmt.Errorf("invalid managed host service account")
+			}
 		}
 		dataVolumes, profileVolumes := 0, 0
 		projectionName := ""

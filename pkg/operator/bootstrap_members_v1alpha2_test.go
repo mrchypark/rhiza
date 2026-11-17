@@ -46,6 +46,9 @@ func TestCollectBootstrapValidOwnedPods(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/replicasets/"):
 			return phase2Response(200, rs), nil
 		case strings.HasSuffix(r.URL.Path, "/pods"):
+			if r.URL.Query().Get("labelSelector") != "rhiza.mrchypark.dev/cluster-uid="+phase2Ref.UID {
+				t.Error("unscoped bootstrap Pod discovery")
+			}
 			b, _ := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "PodList", "metadata": map[string]any{"resourceVersion": "4"}, "items": pods})
 			return phase2Response(200, string(b)), nil
 		}

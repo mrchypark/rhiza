@@ -42,15 +42,6 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 		}
 		return out
 	}
-	// Administrative fixture setup, never operator-created RBAC or credentials.
-	account := map[string]any{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": map[string]any{"name": V1Alpha2ManagedHostServiceAccount, "namespace": ns}}
-	kubectl(string(mustManagedJSON(account)), "create", "-f", "-")
-	t.Cleanup(func() {
-		args := []string{"--kubeconfig", required("RHIZA_CONTRACT_KUBECONFIG"), "--context", required("RHIZA_CONTRACT_CONTEXT"), "--namespace", ns, "--request-timeout=10s", "delete", "serviceaccount", V1Alpha2ManagedHostServiceAccount, "--wait=false"}
-		if out, err := exec.Command("kubectl", args...).CombinedOutput(); err != nil {
-			t.Errorf("cleanup owned host ServiceAccount: %v %s", err, out)
-		}
-	})
 	cluster := fmt.Sprintf(`{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaCluster","metadata":{"name":"initializer-contract","namespace":%q},"spec":{"logicalID":"initializer","genesisIntent":"Create","applicationProtocol":"rhiza-managed-request-append-only/v1","voterCount":3,"workload":{"podTemplate":{"spec":{"containers":[{"name":"app","image":"example.invalid/app"}]}}}}}`, ns)
 	var created struct {
 		Metadata struct {
@@ -76,6 +67,18 @@ func TestV1Alpha2InitializerAPIServerContract(t *testing.T) {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
 	t.Cleanup(transport.CloseIdleConnections)
 	kube := &Kubernetes{BaseURL: server, Namespace: ns, TokenFile: required("RHIZA_CONTRACT_TOKEN"), Client: &http.Client{Transport: transport}}
+	serviceAccount, err := ensureV1Alpha2ManagedHostAccess(context.Background(), kube, ref)
+	if err != nil {
+		t.Fatalf("create per-cluster host access: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, object := range []string{"rolebinding/" + managedHostRoleBindingName(serviceAccount), "role/" + serviceAccount, "serviceaccount/" + serviceAccount} {
+			args := []string{"--kubeconfig", required("RHIZA_CONTRACT_KUBECONFIG"), "--context", required("RHIZA_CONTRACT_CONTEXT"), "--namespace", ns, "--request-timeout=10s", "delete", object, "--ignore-not-found", "--wait=false"}
+			if out, err := exec.Command("kubectl", args...).CombinedOutput(); err != nil {
+				t.Errorf("cleanup owned host access: %v %s", err, out)
+			}
+		}
+	})
 
 	// This contract exercises real API-server ownership/defaulting/CAS with
 	// controlled public status, not kubelet execution of the reference image.

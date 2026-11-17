@@ -122,7 +122,11 @@ func TestManagedInitializationConnected(t *testing.T) {
 		t.Fatal("candidate not created inertly")
 	}
 	pod := deployment["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
-	if pod["serviceAccountName"] != V1Alpha2ManagedHostServiceAccount || pod["automountServiceAccountToken"] != true {
+	serviceAccount, err := V1Alpha2ManagedHostServiceAccountName(phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod["serviceAccountName"] != serviceAccount || pod["automountServiceAccountToken"] != true {
 		t.Fatal("dedicated host account omitted")
 	}
 	main := pod["containers"].([]any)[0].(map[string]any)
@@ -218,6 +222,25 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	var meta struct{ Name, Namespace, UID string }
 	_ = json.Unmarshal(cluster["metadata"], &meta)
 	ref := V1Alpha2ClusterRef{Name: meta.Name, Namespace: meta.Namespace, UID: meta.UID}
+	serviceAccount, _ := V1Alpha2ManagedHostServiceAccountName(ref)
+	replaceServiceAccount := func(object map[string]json.RawMessage, isDeployment bool) map[string]json.RawMessage {
+		var objectMap map[string]any
+		if json.Unmarshal(mustManagedJSON(object), &objectMap) != nil {
+			t.Fatal("captured object is invalid")
+		}
+		pod := objectMap["spec"].(map[string]any)
+		if isDeployment {
+			pod = pod["template"].(map[string]any)["spec"].(map[string]any)
+		}
+		pod["serviceAccountName"], pod["serviceAccount"] = serviceAccount, serviceAccount
+		update := map[string]json.RawMessage{}
+		_ = json.Unmarshal(mustManagedJSON(objectMap), &update)
+		return update
+	}
+	deployment = replaceServiceAccount(deployment, true)
+	for i := range pods {
+		pods[i] = replaceServiceAccount(pods[i], false)
+	}
 	var spec struct {
 		Workload struct {
 			PodTemplate struct {
@@ -393,7 +416,8 @@ func managedFixturePods(ref V1Alpha2ClusterRef, rsName, rsUID string, spec json.
 }
 
 func managedFixtureServiceAccount(ref V1Alpha2ClusterRef) map[string]any {
-	return map[string]any{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": map[string]any{"name": V1Alpha2ManagedHostServiceAccount, "namespace": ref.Namespace, "uid": "host-account-uid", "resourceVersion": "1"}}
+	name, _ := V1Alpha2ManagedHostServiceAccountName(ref)
+	return map[string]any{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": map[string]any{"name": name, "namespace": ref.Namespace, "uid": "host-account-uid", "resourceVersion": "1"}}
 }
 
 func managedFixtureAdmitPodToken(spec map[string]any) {
@@ -433,14 +457,14 @@ func TestManagedInitializationRequiresInstalledHostAccountBeforePost(t *testing.
 	}
 }
 
-func TestManagedHostInstallOnlyWritesCRStatus(t *testing.T) {
+func TestManagedRBACAllowsOnlyPerClusterAccessProvisioning(t *testing.T) {
 	b, err := os.ReadFile("../../deploy/operator/rbac.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	d := yaml.NewDecoder(bytes.NewReader(b))
-	account, binding, operatorRead := false, false, false
 	grants := map[string]map[string]bool{}
+	hostObjects := 0
 	for {
 		var doc map[string]any
 		if err := d.Decode(&doc); err == io.EOF {
@@ -450,102 +474,69 @@ func TestManagedHostInstallOnlyWritesCRStatus(t *testing.T) {
 		}
 		meta, _ := doc["metadata"].(map[string]any)
 		if meta["name"] == V1Alpha2ManagedHostServiceAccount {
-			if meta["namespace"] != "rhiza" {
-				t.Fatal("host install is not namespace scoped")
-			}
-			switch doc["kind"] {
-			case "ServiceAccount":
-				account = true
-			case "Role":
-				for _, raw := range doc["rules"].([]any) {
-					r := raw.(map[string]any)
-					verbs := r["verbs"].([]any)
-					for _, resource := range r["resources"].([]any) {
-						name := resource.(string)
-						if grants[name] != nil {
-							t.Fatal("duplicate host resource rule")
-						}
-						grants[name] = map[string]bool{}
-						for _, verb := range verbs {
-							grants[name][verb.(string)] = true
-						}
-						if !managedHostVerbsAllowed(name, grants[name]) {
-							t.Fatalf("host has unexpected permissions for %s: %v", name, verbs)
-						}
-					}
-				}
-			case "RoleBinding":
-				ref := doc["roleRef"].(map[string]any)
-				subjects := doc["subjects"].([]any)
-				if ref["kind"] != "Role" || ref["name"] != V1Alpha2ManagedHostServiceAccount || len(subjects) != 1 {
-					t.Fatal("host binding has unexpected role/subjects")
-				}
-				subject := subjects[0].(map[string]any)
-				binding = subject["kind"] == "ServiceAccount" && subject["name"] == V1Alpha2ManagedHostServiceAccount && subject["namespace"] == "rhiza"
-			default:
-				t.Fatal("unexpected managed host install object")
-			}
+			hostObjects++
 		}
 		if doc["kind"] == "Role" && meta["name"] == "rhiza-operator" {
 			for _, raw := range doc["rules"].([]any) {
 				r := raw.(map[string]any)
+				verbs, _ := r["verbs"].([]any)
 				for _, resource := range r["resources"].([]any) {
-					if resource == "serviceaccounts" {
-						names := r["resourceNames"].([]any)
-						verbs := r["verbs"].([]any)
-						operatorRead = len(names) == 1 && names[0] == V1Alpha2ManagedHostServiceAccount && len(verbs) == 1 && verbs[0] == "get"
+					grants[resource.(string)] = map[string]bool{}
+					for _, verb := range verbs {
+						grants[resource.(string)][verb.(string)] = true
 					}
 				}
 			}
 		}
 	}
-	if !account || !binding || !operatorRead || len(grants) != 5 {
-		t.Fatal("incomplete or overprivileged managed host installation")
+	if hostObjects != 0 {
+		t.Fatal("shared managed host RBAC remains in the install manifest")
 	}
-	for _, resource := range []string{"rhizaclusters", "rhizaclusters/status", "pods", "replicasets", "deployments"} {
-		if !grants[resource]["get"] {
-			t.Fatalf("host missing GET %s", resource)
+	for _, resource := range []string{"serviceaccounts", "roles", "rolebindings"} {
+		want := map[string]bool{"get": true, "list": true, "create": true}
+		if len(grants[resource]) != len(want) {
+			t.Fatalf("operator cannot provision %s", resource)
 		}
+		for verb := range grants[resource] {
+			if !want[verb] {
+				t.Fatalf("operator has excess %s verb %s", resource, verb)
+			}
+		}
+	}
+	if !grants["rhizaclusters"]["get"] || !grants["rhizaclusters"]["list"] || !grants["rhizaclusters"]["update"] || len(grants["rhizaclusters"]) != 3 {
+		t.Fatal("operator cannot install the cluster cleanup finalizer")
+	}
+	if grants["clusterroles"] != nil || grants["clusterrolebindings"] != nil {
+		t.Fatal("cluster-scoped RBAC is not required")
 	}
 }
 
-func managedHostVerbsAllowed(resource string, verbs map[string]bool) bool {
-	want := []string{"get"}
-	switch resource {
-	case "rhizaclusters/status":
-		want = append(want, "update")
-	case "pods":
-		want = append(want, "list")
+func TestManagedHostRoleIsBoundToOneCluster(t *testing.T) {
+	ref := V1Alpha2ClusterRef{Name: "alpha", Namespace: "ns", UID: "uid-alpha"}
+	deployment, _ := V1Alpha2GenesisDeploymentName(ref.UID)
+	rules := managedHostRoleRules(ref, deployment)
+	if len(rules) != 5 {
+		t.Fatalf("unexpected host rule count: %d", len(rules))
 	}
-	if len(verbs) != len(want) {
-		return false
-	}
-	for _, verb := range want {
-		if !verbs[verb] {
-			return false
+	for _, raw := range rules[:2] {
+		rule := raw.(map[string]any)
+		names := rule["resourceNames"].([]string)
+		if len(names) != 1 || names[0] != ref.Name {
+			t.Fatalf("host CR rule is not name-scoped: %v", raw)
 		}
 	}
-	return true
-}
-
-func TestManagedHostInstallRejectsNonStatusWriteGrants(t *testing.T) {
-	for _, resource := range []string{"pods", "rhizaclusters", "replicasets", "deployments"} {
-		for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection", "*"} {
-			t.Run(resource+"/"+verb, func(t *testing.T) {
-				verbs := map[string]bool{"get": true, verb: true}
-				if resource == "pods" {
-					verbs["list"] = true
-				}
-				if managedHostVerbsAllowed(resource, verbs) {
-					t.Fatalf("host accepted non-status write grant: %s %v", resource, verbs)
-				}
-			})
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		for _, verb := range rule["verbs"].([]string) {
+			if verb != "get" && verb != "list" && verb != "update" {
+				t.Fatalf("host has an unexpected verb: %s", verb)
+			}
 		}
-	}
-	if managedHostVerbsAllowed("deployments", map[string]bool{"get": true, "list": true}) ||
-		managedHostVerbsAllowed("pods", map[string]bool{"get": true, "watch": true}) ||
-		managedHostVerbsAllowed("rhizaclusters/status", map[string]bool{"get": true, "patch": true}) {
-		t.Fatal("host accepted unexpected read or status verbs")
+		for _, resource := range rule["resources"].([]string) {
+			if resource == "deployments/scale" || resource == "secrets" || resource == "rolebindings" || resource == "roles" {
+				t.Fatalf("host has an unexpected resource: %s", resource)
+			}
+		}
 	}
 }
 

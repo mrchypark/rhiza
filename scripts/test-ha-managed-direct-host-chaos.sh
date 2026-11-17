@@ -34,18 +34,26 @@ printf '%s\n' "$execution_mode" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTE
 private=$(mktemp -d "$RUNNER_TEMP/ha-managed-direct-host-private.XXXXXX")
 chmod 700 "$private"
 nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+attempt_id=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+case "$attempt_id" in ''|*[!0-9a-f]*) echo 'attempt identity unavailable' >&2; exit 1;; esac
+[ "${#attempt_id}" -eq 24 ] || { echo 'attempt identity must contain 24 hex characters' >&2; exit 1; }
 namespace=$RHIZA_HOST_NAMESPACE
 release="rhiza-direct-chaos-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 image=$RHIZA_RELEASE_IMAGE
 bucket_pid=
 fault_name=
 owned=0
+cluster_create_attempt="$logs/direct-cluster-create-attempted.$attempt_id"
+printf '%s\t%s\n' "$release" "$attempt_id" > "$logs/direct-cluster-attempt-id.txt"
 # Exact names from the internal fixture, including both replacement phases.
 fixture_jobs='create-sql insert-sql query mixed-prefault query-after-replacement mixed-first-replacement query-after-second-replacement mixed-second-replacement mixed-restart query-after-restart insert-after-chaos query-after-chaos'
 h() { kubectl --kubeconfig "$RHIZA_HOST_KUBECONFIG" --context "$RHIZA_HOST_CONTEXT" --request-timeout=20s "$@"; }
 hn() { h -n "$namespace" "$@"; }
 k() { hn "$@"; }
-host_guard() { [ "$(hn get serviceaccount rhiza-chaos-runner -o jsonpath='{.metadata.uid}')" = "$RHIZA_HOST_SERVICEACCOUNT_UID" ]; }
+host_guard() {
+  [ "$(hn get namespace "$namespace" -o jsonpath='{.metadata.uid}')" = "$RHIZA_HOST_NAMESPACE_UID" ] &&
+    [ "$(hn get serviceaccount rhiza-chaos-runner -o jsonpath='{.metadata.uid}')" = "$RHIZA_HOST_SERVICEACCOUNT_UID" ]
+}
 assert_names_absent() {
   resource=$1
   shift
@@ -65,7 +73,7 @@ assert_names_absent() {
 project_direct_overlay() {
   jq -e '
     ([.items[] | [.kind,.metadata.name] | join("/")] | sort) as $names |
-    if $names != (["Deployment/rhiza-operator","Role/rhiza-operator","Role/rhiza-managed-host","RoleBinding/rhiza-operator","RoleBinding/rhiza-managed-host","ServiceAccount/rhiza-operator","ServiceAccount/rhiza-managed-host"]|sort) then error("unexpected direct-host overlay scope") else . end |
+    if $names != (["Deployment/rhiza-operator","Role/rhiza-operator","RoleBinding/rhiza-operator","ServiceAccount/rhiza-operator"]|sort) then error("unexpected direct-host overlay scope") else . end |
     (.items[] | select(.kind=="Role" and .metadata.name=="rhiza-operator") | .rules) |= map(select(.resources!=["rhizarecoveries"] and .resources!=["rhizarecoveries/status"])) |
     if any(.items[] | select(.kind=="Role") | .rules[] | .resources[]; startswith("rhizarecoveries")) then error("unexpected recovery rule") else . end
   ' "$1"
@@ -74,18 +82,119 @@ direct_overlay_path() {
   case "$1/$2" in
     RhizaCluster/sql) api=apis/rhiza.mrchypark.dev/v1alpha2 resource=rhizaclusters ;;
     Deployment/rhiza-operator) api=apis/apps/v1 resource=deployments ;;
-    Role/rhiza-operator|Role/rhiza-managed-host) api=apis/rbac.authorization.k8s.io/v1 resource=roles ;;
-    RoleBinding/rhiza-operator|RoleBinding/rhiza-managed-host) api=apis/rbac.authorization.k8s.io/v1 resource=rolebindings ;;
-    ServiceAccount/rhiza-operator|ServiceAccount/rhiza-managed-host) api=api/v1 resource=serviceaccounts ;;
+    Role/rhiza-operator) api=apis/rbac.authorization.k8s.io/v1 resource=roles ;;
+    RoleBinding/rhiza-operator) api=apis/rbac.authorization.k8s.io/v1 resource=rolebindings ;;
+    ServiceAccount/rhiza-operator) api=api/v1 resource=serviceaccounts ;;
     *) return 1 ;;
   esac
   printf '/%s/namespaces/%s/%s/%s\n' "$api" "$namespace" "$resource" "$2"
 }
 create_direct_cluster() {
   host_guard || return 1
+  printf 'sql\n' > "$cluster_create_attempt" || return 1
   hn create --validate=strict -f "$1" -o json > "$private/overlay-create.json" || return 1
   uid=$(jq -er --arg ns "$namespace" 'select(.kind=="RhizaCluster" and .metadata.namespace==$ns and .metadata.name=="sql") | .metadata.uid | select(type=="string" and length>0)' "$private/overlay-create.json") || return 1
   printf 'RhizaCluster\tsql\t%s\n' "$uid" >> "$logs/direct-overlay-created.tsv"
+}
+report_unrecorded_cluster() {
+  recorded_uid=$(awk -F '\t' '$1=="RhizaCluster" && $2=="sql" {print $3}' "$logs/direct-overlay-created.tsv" 2>/dev/null || true)
+  if ! hn get rhizacluster sql -o json > "$private/residual-cluster.json" 2>"$private/residual-cluster.err"; then
+    if grep -F NotFound "$private/residual-cluster.err" >/dev/null; then
+      if [ -n "$recorded_uid" ] || [ ! -f "$cluster_create_attempt" ]; then return 0; fi
+      printf 'FAIL: CR create was attempted without a recorded UID and the CR is now absent; per-CR access remnants cannot be located safely. automatic cleanup skipped\n' > "$logs/residual-resources.txt"
+      return 1
+    fi
+    return 1
+  fi
+  live_uid=$(jq -er '.metadata.uid | select(type=="string" and length>0)' "$private/residual-cluster.json") || return 1
+  if [ -z "$recorded_uid" ] && [ ! -f "$cluster_create_attempt" ]; then
+    printf 'FAIL: unrecorded RhizaCluster sql exists without a create-attempt record live_uid=%s; automatic CR/access deletion skipped\n' "$live_uid" > "$logs/residual-resources.txt"
+    return 1
+  fi
+  if [ -z "$recorded_uid" ]; then
+    printf 'FAIL: CR create was attempted without a recorded UID live_uid=%s; automatic CR/access deletion skipped\n' "$live_uid" > "$logs/residual-resources.txt"
+    return 1
+  fi
+  note="unrecorded RhizaCluster sql requires manual cleanup"
+  [ "$live_uid" = "$recorded_uid" ] && note="recorded RhizaCluster sql cleanup failed; CR and access may remain"
+  printf 'FAIL: %s live_uid=%s recorded_uid=%s; automatic CR/access deletion skipped\n' "$note" "$live_uid" "${recorded_uid:-missing}" > "$logs/residual-resources.txt"
+  return 1
+}
+force_release_test_owned_managed_finalizer() {
+  kind=$1 name=$2 created_uid=$3
+  [ "$kind" = RhizaCluster ] || return 0
+  [ -n "$created_uid" ] || return 1
+  if ! hn get rhizacluster "$name" -o json > "$private/test-owned-cluster.json" 2>"$private/test-owned-cluster.err"; then
+    grep -F NotFound "$private/test-owned-cluster.err" >/dev/null && return 0
+    return 1
+  fi
+  [ "$(jq -er '.metadata.uid' "$private/test-owned-cluster.json")" = "$created_uid" ] || return 1
+  [ "$(jq -er '.metadata.resourceVersion | select(type=="string" and length>0)' "$private/test-owned-cluster.json")" ] || return 1
+  [ "$(jq -er '.metadata.deletionTimestamp | select(type=="string" and length>0)' "$private/test-owned-cluster.json")" ] || return 1
+  jq -e --arg f rhiza.mrchypark.dev/managed-host-cleanup '((.metadata.finalizers // [])|index($f))!=null' "$private/test-owned-cluster.json" >/dev/null || return 1
+  finalizer_patch=$(jq -c --arg uid "$created_uid" --arg rv "$(jq -er .metadata.resourceVersion "$private/test-owned-cluster.json")" --arg f rhiza.mrchypark.dev/managed-host-cleanup '
+    (.metadata.deletionTimestamp | select(type=="string" and length>0)) as $deletion |
+    (.metadata.finalizers | index($f)) as $i |
+    if $i == null then error("cleanup finalizer absent") else
+    [
+      {op:"test",path:"/metadata/uid",value:$uid},
+      {op:"test",path:"/metadata/resourceVersion",value:$rv},
+      {op:"test",path:"/metadata/deletionTimestamp",value:$deletion},
+      {op:"test",path:"/metadata/finalizers",value:.metadata.finalizers},
+      {op:"test",path:"/metadata/finalizers/\($i)",value:$f},
+      {op:"replace",path:"/metadata/finalizers",value:[.metadata.finalizers[]|select(.!=$f)]}
+    ] end
+  ' "$private/test-owned-cluster.json") || return 1
+  hn patch rhizacluster "$name" --type=json -p "$finalizer_patch"
+}
+delete_test_owned_managed_access() {
+  created_uid=${1-}
+  [ -n "${uid-}" ] && [ "$created_uid" = "$uid" ] || return 1
+  sa="rhiza-managed-host-$(printf '%s\000%s\000%s' "$namespace" sql "$uid" | sha256sum | cut -c1-16)"
+  deployment="rhiza-$(printf '%s' "$uid" | sha256sum | cut -c1-20)-g0"
+  present_sa=0 present_role=0 present_binding=0
+  if hn get serviceaccount "$sa" -o json > "$private/test-owned-sa.json" 2>"$private/test-owned-sa.err"; then present_sa=1; elif ! grep -F NotFound "$private/test-owned-sa.err" >/dev/null; then return 1; fi
+  if hn get role "$sa" -o json > "$private/test-owned-role.json" 2>"$private/test-owned-role.err"; then present_role=1; elif ! grep -F NotFound "$private/test-owned-role.err" >/dev/null; then return 1; fi
+  if hn get rolebinding "$sa-binding" -o json > "$private/test-owned-binding.json" 2>"$private/test-owned-binding.err"; then present_binding=1; elif ! grep -F NotFound "$private/test-owned-binding.err" >/dev/null; then return 1; fi
+  for object in sa role binding; do
+    eval "present=\$present_$object"
+    [ "$present" = 1 ] || continue
+    file="$private/test-owned-$object.json"
+    jq -e --arg uid "$uid" --arg namespace "$namespace" --arg name "$sa" --arg binding "$sa-binding" --arg deployment "$deployment" --arg kind "$object" '
+      .metadata.namespace==$namespace and
+      .metadata.labels["app.kubernetes.io/managed-by"]=="rhiza-operator" and
+      .metadata.labels["rhiza.mrchypark.dev/cluster-uid"]==$uid and
+      .metadata.labels["rhiza.mrchypark.dev/cluster-name"]=="sql" and
+      .metadata.labels["rhiza.mrchypark.dev/access-contract"]=="v1alpha2-host-v1" and
+      .metadata.labels["rhiza.mrchypark.dev/access-lifecycle"]=="retain-until-manual-cleanup" and
+      (.metadata.uid|type=="string" and length>0) and
+      if $kind=="sa" then .kind=="ServiceAccount" and .metadata.name==$name
+      elif $kind=="role" then .kind=="Role" and .metadata.name==$name and
+        .rules==[
+          {apiGroups:["rhiza.mrchypark.dev"],resources:["rhizaclusters"],resourceNames:["sql"],verbs:["get"]},
+          {apiGroups:["rhiza.mrchypark.dev"],resources:["rhizaclusters/status"],resourceNames:["sql"],verbs:["get","update"]},
+          {apiGroups:[""],resources:["pods"],verbs:["get","list"]},
+          {apiGroups:["apps"],resources:["deployments"],resourceNames:[$deployment],verbs:["get"]},
+          {apiGroups:["apps"],resources:["replicasets"],verbs:["get"]}
+        ]
+      else .kind=="RoleBinding" and .metadata.name==$binding and
+        .roleRef=={apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$name} and
+        .subjects==[{kind:"ServiceAccount",name:$name,namespace:$namespace}]
+      end
+    ' "$file" >/dev/null || return 1
+  done
+  for spec in "rolebindings/$sa-binding" "roles/$sa" "serviceaccounts/$sa"; do
+    resource=${spec%%/*}
+    name=${spec#*/}
+    file="$private/test-owned-binding.json"
+    case "$resource" in roles) file="$private/test-owned-role.json" ;; serviceaccounts) file="$private/test-owned-sa.json" ;; esac
+    case "$resource" in rolebindings) [ "$present_binding" = 1 ] || continue ;; roles) [ "$present_role" = 1 ] || continue ;; serviceaccounts) [ "$present_sa" = 1 ] || continue ;; esac
+    object_uid=$(jq -er '.metadata.uid' "$file") || return 1
+    api=apis/rbac.authorization.k8s.io/v1
+    [ "$resource" != serviceaccounts ] || api=api/v1
+    jq -nc --arg uid "$object_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$private/test-owned-delete.json" || return 1
+    hn delete --raw "/$api/namespaces/$namespace/$resource/$name" -f "$private/test-owned-delete.json" || return 1
+  done
 }
 create_direct_overlay() {
   host_guard || return 1
@@ -118,7 +227,13 @@ delete_direct_overlay() {
   while IFS="$(printf '\t')" read -r kind name created_uid; do
     if [ -z "$created_uid" ] || ! url=$(direct_overlay_path "$kind" "$name"); then delete_result=1; continue; fi
     jq -nc --arg uid "$created_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid},propagationPolicy:"Foreground"}' > "$private/overlay-delete.json" || return 1
-    hn delete --raw "$url" -f "$private/overlay-delete.json" || delete_result=1
+    if [ "$kind" = RhizaCluster ]; then
+      if ! delete_test_owned_managed_access "$created_uid"; then delete_result=1; continue; fi
+    fi
+    if ! hn delete --raw "$url" -f "$private/overlay-delete.json"; then delete_result=1; continue; fi
+    case "$kind" in
+      RhizaCluster) force_release_test_owned_managed_finalizer "$kind" "$name" "$created_uid" || { delete_result=1; continue; } ;;
+    esac
     case "$kind" in
       Deployment|RhizaCluster) hn wait --for=delete "$kind/$name" --timeout=45s || delete_result=1 ;;
     esac
@@ -156,6 +271,7 @@ cleanup() {
       hn delete podchaos --field-selector "metadata.name=$fault_name" -l "rhiza-ci-run=$release" --wait=true --timeout=45s > "$logs/fault-cleanup.txt" 2>&1 || result=1
     fi
     delete_direct_overlay > "$logs/overlay-cleanup.txt" 2>&1 || result=1
+    report_unrecorded_cluster > "$logs/residual-cluster-check.txt" 2>&1 || result=1
     if [ -n "${uid-}" ]; then hn delete pods,deployments -l "rhiza.mrchypark.dev/cluster-uid=$uid" --wait=true --timeout=45s --ignore-not-found > "$logs/sql-workload-cleanup.txt" 2>&1 || result=1; fi
     hn delete deployment/floci service/floci service/bootstrap-client pod/floci-service-links-probe --wait=true --timeout=45s --ignore-not-found > "$logs/workload-cleanup.txt" 2>&1 || result=1
     # Keep deletion restricted to names preflighted in the exclusive namespace.
@@ -177,7 +293,8 @@ cleanup() {
   fi
   if [ -n "$bucket_pid" ]; then kill "$bucket_pid" 2>/dev/null || :; wait "$bucket_pid" 2>/dev/null || :; kill -0 "$bucket_pid" 2>/dev/null && result=1 || :; fi
   rm -f "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/forward.log" "$private/port-forward.log" "$private/preflight-list.json" "$RUNNER_TEMP/ha-managed-direct-host-bucket-setup"
-  rm -f "$private/managed-install.jsonl" "$private/managed-install-direct.json" "$private/direct-overlay.jsonl" "$private/overlay-create.json" "$private/direct-status-update.json" "$private/overlay-delete.json" || result=1
+  rm -f "$private/managed-install.jsonl" "$private/managed-install-direct.json" "$private/direct-overlay.jsonl" "$private/residual-cluster.json" "$private/residual-cluster.err" "$private/overlay-create.json" "$private/direct-status-update.json" "$private/overlay-delete.json" || result=1
+  rm -f "$private/test-owned-cluster.json" "$private/test-owned-cluster.err" "$private/test-owned-sa.json" "$private/test-owned-role.json" "$private/test-owned-binding.json" "$private/test-owned-delete.json" "$private/test-owned-sa.err" "$private/test-owned-role.err" "$private/test-owned-binding.err" || result=1
   rmdir "$private" || result=1
   [ "$original_result" -eq 0 ] || result=$original_result
   printf '%s\n' "$result" > "$logs/driver.exit"

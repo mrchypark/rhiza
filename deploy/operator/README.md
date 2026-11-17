@@ -199,7 +199,8 @@ path means one epoch leader submits first, not that one voter decides alone.
 
 The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses:
 the operator Role includes Pod and Secret creation/deletion, Service creation,
-and recovery-object permissions. The Host Role can read cluster resources
+and recovery-object permissions. It can replace `RhizaCluster` metadata
+finalizers but never removes them automatically. The Host Role can read cluster resources
 and update their status across the namespace by default. These grants do not
 imply that a Service or DR controller runs. Use a trusted namespace and scope
 the Host's cluster and status rules to known CR names where practical.
@@ -223,6 +224,76 @@ available on ready nodes. Restore the original quorum or stop for separately
 authorized DR. The operator does not currently implement automatic generation
 recovery. A Pod deletion or timeout is not proof of process termination,
 recreation prevention or completion of outstanding storage work.
+
+### Managed host deletion is administrator-approved
+
+The operator installs
+`rhiza.mrchypark.dev/managed-host-cleanup` on active managed `RhizaCluster`
+objects. Once deletion starts, the operator does not delete Pods, access
+objects, storage, or the finalizer. API absence of a Pod and Deployment scale
+down are not evidence that the old process and its in-flight work are gone.
+
+After obtaining independent evidence that the old runtime, containers and
+in-flight storage work are terminated, an administrator with existing `get`
+and `patch` permissions on the main `rhizaclusters` resource completes
+deletion. The operator itself does not receive `patch`:
+
+The same administrator must also have `get` and `delete` on the exact
+`serviceaccounts`, `roles`, and `rolebindings` objects being retired, plus
+whatever Pod/Deployment observation permission their independent evidence
+workflow uses. Kubernetes RBAC cannot scope `delete` to object names in the
+same request, so the client must verify cluster UID, object UID, labels,
+rules, roleRef, and subjects before each delete.
+
+1. Record the exact CR namespace, name, UID and cleanup finalizer.
+2. Verify the generated Deployment, SA, Role and RoleBinding carry the exact
+   managed-by, cluster UID/name, access-contract/lifecycle, rules, roleRef,
+   subjects, and object UIDs expected by the contract. Do not adopt or delete
+   unlabeled, shared, legacy, or other-UID objects.
+3. Delete the exact RoleBinding, Role and SA with UID preconditions, in that
+   order, after the independent runtime/work evidence is accepted.
+4. Remove only the cleanup finalizer. Preserve every other finalizer.
+
+Use the CR UID, not the current name alone, for the generated access names:
+
+```sh
+sa="rhiza-managed-host-$(printf '%s\000%s\000%s' "$namespace" "$cr" "$uid" | sha256sum | cut -c1-16)"
+binding="$sa-binding"
+printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}' "$object_uid" \
+  | kubectl delete --raw "/apis/rbac.authorization.k8s.io/v1/namespaces/$namespace/rolebindings/$binding" -f -
+```
+
+Repeat the raw conditional delete for the Role and ServiceAccount using their
+object UIDs. Finally, build a JSON Patch from one GET and submit it as one
+server-side operation. The `test` operations make UID, resourceVersion and the
+complete finalizer list preconditions of the same atomic patch:
+
+```sh
+kubectl get rhizacluster "$cr" -n "$namespace" -o json \
+  | jq --arg uid "$uid" --arg f rhiza.mrchypark.dev/managed-host-cleanup \
+      'if (.metadata.deletionTimestamp | type) != "string" then error("CR not deleting") else
+      (.metadata.finalizers | index($f)) as $i |
+      if $i == null then error("cleanup finalizer absent") else [
+        {op:"test",path:"/metadata/uid",value:$uid},
+        {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
+        {op:"test",path:"/metadata/deletionTimestamp",value:.metadata.deletionTimestamp},
+        {op:"test",path:"/metadata/finalizers",value:.metadata.finalizers},
+        {op:"test",path:"/metadata/finalizers/\($i)",value:$f},
+        {op:"replace",path:"/metadata/finalizers",value:[.metadata.finalizers[]|select(.!=$f)]}
+      ] end end' > /tmp/rhiza-finalizer-patch.json
+kubectl patch rhizacluster "$cr" -n "$namespace" \
+  --type=json --patch-file /tmp/rhiza-finalizer-patch.json
+```
+
+The API server evaluates every `test` op before the replacement. A changed CR
+UID, resourceVersion, deletionTimestamp or finalizer list rejects the entire
+patch without changing the finalizer. An active CR cannot be approved by this
+command because the timestamp test fails. No client-side comparison is the
+approval boundary.
+
+No annotation, ConfigMap, CR status field, or operator-generated token is an
+approval mechanism: those are forgeable or have confused-deputy semantics. The
+main-resource metadata update itself is the administrator approval boundary.
 
 ## Approved automatic-attempt policy, not implemented or qualified
 

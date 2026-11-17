@@ -775,11 +775,32 @@ func TestPhase9InitializerRefusesSpecChangeBeforeCAS(t *testing.T) {
 
 func TestPhase9InitializerManagedLoopCommitsAndCancels(t *testing.T) {
 	s, _ := phase9Setup(t, phase9CurrentManagedCluster())
+	access := newManagedHostAccessAPI(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	kube := phase2Store(t, func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
 			return phase2Response(200, `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[`+phase9CurrentManagedCluster()+`]}`), nil
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/ns/rhizaclusters/cluster" {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				return nil, err
+			}
+			s.mu9.Lock()
+			s.cluster = string(body)
+			s.mu9.Unlock()
+			return phase2Response(200, string(body)), nil
+		}
+		if strings.Contains(r.URL.Path, "/rhizaclusters/") {
+			response, err := s.roundTrip(r)
+			if r.Method == http.MethodPut && err == nil && response.StatusCode == 200 {
+				cancel()
+			}
+			return response, err
+		}
+		if response, handled, err := access.roundTrip(r); handled {
+			return response, err
 		}
 		response, err := s.roundTrip(r)
 		if r.Method == http.MethodPut && err == nil && response.StatusCode == 200 {

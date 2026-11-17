@@ -47,12 +47,13 @@ func TestManagedOptionalContractFieldOmitted(t *testing.T) {
 }
 
 func TestManagedCandidateCanonicalResources(t *testing.T) {
-	want := json.RawMessage(`{"template":{"metadata":{},"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"0.1","memory":"1Gi"}}}],"initContainers":[]}}}`)
-	actual := json.RawMessage(`{"template":{"metadata":{},"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"100m","memory":"1024Mi"}}}],"initContainers":[]}}}`)
+	serviceAccount := "rhiza-managed-host-0123456789abcdef"
+	want := json.RawMessage(`{"template":{"metadata":{},"spec":{"serviceAccountName":"` + serviceAccount + `","containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"0.1","memory":"1Gi"}}}],"initContainers":[]}}}`)
+	actual := json.RawMessage(`{"template":{"metadata":{},"spec":{"serviceAccountName":"` + serviceAccount + `","serviceAccount":"` + serviceAccount + `","containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"100m","memory":"1024Mi"}}}],"initContainers":[]}}}`)
 	if !managedCandidateSpecMatches(actual, want) {
 		t.Fatal("equivalent Kubernetes quantities must match")
 	}
-	bad := json.RawMessage(`{"template":{"metadata":{},"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"101m","memory":"1024Mi"}}}],"initContainers":[]}}}`)
+	bad := json.RawMessage(`{"template":{"metadata":{},"spec":{"serviceAccountName":"` + serviceAccount + `","containers":[{"name":"app","image":"app:v1","resources":{"requests":{"cpu":"101m","memory":"1024Mi"}}}],"initContainers":[]}}}`)
 	if managedCandidateSpecMatches(bad, want) {
 		t.Fatal("changed request was accepted")
 	}
@@ -60,7 +61,7 @@ func TestManagedCandidateCanonicalResources(t *testing.T) {
 
 func TestEmbeddedManagedPodPreservesCommandAndGates(t *testing.T) {
 	profile := V1Alpha2RuntimeProfile{InitImage: "init", ProfileSecretName: "runtime"}
-	ref := V1Alpha2ClusterRef{UID: "uid", Name: "cluster"}
+	ref := V1Alpha2ClusterRef{UID: "uid", Name: "cluster", Namespace: "ns"}
 	containers := []V1Alpha2Container{{Name: "app", Image: "app-image", Command: []string{"/app"}, Args: []string{"serve"}, Resources: &V1Alpha2Resources{Requests: map[string]string{"cpu": "250m", "memory": "128Mi"}}}}
 	pod, err := V1Alpha2ManagedSQLPodSpec(ref, profile, containers, true)
 	if err != nil {
