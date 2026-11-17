@@ -1568,7 +1568,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return nil
 		})
 	}
-	if n.config.Local && n.checkpoints != nil && n.config.ObjStoreGCInterval > 0 {
+	if n.checkpoints != nil && n.managedStartup == nil && n.config.ObjStoreGCInterval > 0 {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
