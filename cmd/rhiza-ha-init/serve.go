@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -66,8 +67,6 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 }
 
 func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
 	last := ""
 	for {
 		if ctx.Err() != nil {
@@ -87,10 +86,13 @@ func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg m
 			log.Printf("managed replacement %s", outcome)
 			last = outcome
 		}
+		wait := 2*time.Second + time.Duration(rand.IntN(1000))*time.Millisecond
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
