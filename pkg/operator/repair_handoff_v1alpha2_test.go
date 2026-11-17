@@ -295,6 +295,10 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 	if addCompletion["type"] != "object" || addCompletion["properties"].(map[string]any)["finalVoterIDs"].(map[string]any)["maxItems"] != 64 {
 		t.Fatal("ADD proof schema missing or exceeds the existing voter bound")
 	}
+	state := repair["properties"].(map[string]any)["state"].(map[string]any)
+	if got := state["enum"].([]any); !slices.Equal(got, []any{"Preparing", "Closed", "Completed", "Aborted"}) {
+		t.Fatalf("repair state enum lost preparing/manual boundary states: %v", got)
+	}
 	head := properties["head"].(map[string]any)
 	pattern := regexp.MustCompile(head["pattern"].(string))
 	max := head["maxLength"].(int)
@@ -344,10 +348,39 @@ func TestRepairV1Alpha2HandoffSchema(t *testing.T) {
 	for _, operationScopedRule := range []string{
 		`!has(oldSelf.repair) || !has(self.repair) || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.plan == oldSelf.repair.plan`,
 		`!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state == "Closed" || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair == oldSelf.repair`,
-		`self.repair.plan.operationID == oldSelf.repair.plan.operationID || (oldSelf.repair.state != "Closed" && self.repair.state == "Closed"`,
+		`oldSelf.repair.state == "Preparing" && self.repair.state == "Closed" && self.repair.plan == oldSelf.repair.plan`,
+		`(oldSelf.repair.state == "Completed" || oldSelf.repair.state == "Aborted") && has(oldSelf.repair.completion)`,
+		`&& (self.repair.state == "Preparing" || self.repair.state == "Closed") &&`,
 	} {
 		if !strings.Contains(joined, operationScopedRule) {
 			t.Fatalf("existing operation boundary or terminal predecessor guard changed: %s", operationScopedRule)
+		}
+	}
+	validationRules := map[string]string{}
+	for _, validation := range status["x-kubernetes-validations"].([]any) {
+		entry := validation.(map[string]any)
+		validationRules[entry["message"].(string)] = entry["rule"].(string)
+	}
+	const wantClosedTransitionRule = `!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state != "Closed" || self.repair.plan.operationID != oldSelf.repair.plan.operationID || self.repair.state == "Closed" || self.repair.state == "Completed" || self.repair.state == "Aborted"`
+	if got := validationRules["closed repair cannot return to preparing"]; got != wantClosedTransitionRule {
+		t.Fatalf("closed repair transition must be explicitly one-way; got %q", got)
+	}
+	const wantPreparingAuthorityRule = `!has(oldSelf.repair) || !has(self.repair) || oldSelf.repair.state != "Preparing" || (has(oldSelf.authority) && has(self.authority) && self.authority == oldSelf.authority)`
+	if got := validationRules["preparing repair freezes application authority"]; got != wantPreparingAuthorityRule {
+		t.Fatalf("preparing authority freeze changed; got %q", got)
+	}
+	authorityBindingRule := validationRules["active repair must match authority and cannot overlap a transition"]
+	for _, fragment := range []string{
+		`self.repair.state != "Preparing"`,
+		`self.repair.state != "Closed"`,
+		`!has(self.authority.transition)`,
+		`self.repair.plan.clusterUID == self.authority.owner.uid`,
+		`self.repair.plan.generation == self.authority.generation`,
+		`self.repair.plan.deploymentUID == self.authority.binding.deploymentUID`,
+		`self.repair.plan.storageID == self.authority.binding.storageID`,
+	} {
+		if !strings.Contains(authorityBindingRule, fragment) {
+			t.Fatalf("active repair authority binding lost %s: %q", fragment, authorityBindingRule)
 		}
 	}
 	for _, fragment := range []string{

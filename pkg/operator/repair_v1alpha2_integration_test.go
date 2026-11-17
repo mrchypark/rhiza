@@ -794,7 +794,35 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 			t.Fatalf("expected %q: %v: %s", want, e, out)
 		}
 	}
-	// Diagnostic dry-runs use the actual Begin PUT body and the exact same
+	const authorityRule = "active repair must match authority and cannot overlap a transition"
+	for _, tc := range []struct {
+		name   string
+		mutate func(*V1Alpha2RepairPlan)
+	}{
+		{"cluster-uid", func(p *V1Alpha2RepairPlan) { p.ClusterUID += "-other" }},
+		{"generation", func(p *V1Alpha2RepairPlan) { p.Generation++ }},
+		{"deployment-uid", func(p *V1Alpha2RepairPlan) { p.DeploymentUID += "-other" }},
+		{"storage-id", func(p *V1Alpha2RepairPlan) { p.StorageID += "-other" }},
+	} {
+		bad := plan
+		tc.mutate(&bad)
+		patch(map[string]any{"repair": map[string]any{"plan": bad, "state": "Preparing"}}, authorityRule)
+	}
+	patch(map[string]any{"authority": map[string]any{"transition": map[string]any{"id": "preexisting"}}}, "")
+	transitioned, err := LoadV1Alpha2Admission(ctx, store, ref)
+	if err != nil || !hasV1Alpha2Transition(transitioned.transition) {
+		t.Fatalf("seed pre-existing authority transition: %v", err)
+	}
+	patch(map[string]any{"repair": map[string]any{"plan": plan, "state": "Preparing"}}, authorityRule)
+	patch(map[string]any{"authority": map[string]any{"transition": nil}}, "")
+	pending, err = LoadV1Alpha2Admission(ctx, store, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := pending.Repair(); exists {
+		t.Fatal("rejected preparing authority mismatches wrote a repair record")
+	}
+	// Diagnostic dry-runs use the actual Prepare PUT body and the exact same
 	// pre-reservation snapshot. They never establish CAS ownership.
 	diagnostic.before = func(req *http.Request) error {
 		diagnostic.before = nil
@@ -884,7 +912,26 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 		}
 		return nil
 	}
-	closed, obs, err := BeginV1Alpha2Repair(ctx, store, pending, pending.Authority(), plan)
+	prepared, obs, err := PrepareV1Alpha2Repair(ctx, store, pending, pending.Authority(), plan)
+	if err != nil || obs != V1Alpha2CASApplied || prepared.SQLReservationsClosed() {
+		t.Fatalf("prepare: %s %v", obs, err)
+	}
+	if record, ok := prepared.Repair(); !ok || record.State != "Preparing" {
+		t.Fatalf("API server did not retain preparing state: %+v", record)
+	}
+	const preparingAuthorityRule = "preparing repair freezes application authority"
+	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": "changed"}}}, preparingAuthorityRule)
+	patch(map[string]any{"authority": map[string]any{"transition": map[string]any{"id": "other"}}}, preparingAuthorityRule)
+	patch(map[string]any{"repair": map[string]any{"plan": map[string]any{"oldWALIdentity": "changed"}}}, "repair intent is immutable per operation")
+	var afterPreparingRejections map[string]json.RawMessage
+	if err := store.Kube.Get(ctx, "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/"+ns+"/rhizaclusters/"+ref.Name, &afterPreparingRejections); err != nil {
+		t.Fatal(err)
+	}
+	if !sameJSON(afterPreparingRejections["metadata"], prepared.status.object["metadata"]) || !sameJSON(afterPreparingRejections["status"], prepared.status.object["status"]) {
+		t.Fatal("rejected preparing authority or plan mutation changed the live snapshot")
+	}
+	patch(map[string]any{"repair": map[string]any{"state": "Completed"}}, "repair state and completion must agree")
+	closed, obs, err := CloseV1Alpha2RepairReservations(ctx, store, prepared, prepared.Authority(), plan)
 	if err != nil || obs != V1Alpha2CASApplied || !closed.SQLReservationsClosed() {
 		t.Fatalf("close: %s %v", obs, err)
 	}
@@ -897,10 +944,12 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 	if err != nil || !sameJSON(unchangedSnapshot.object["status"], closed.status.object["status"]) {
 		t.Fatalf("identical closed/pending changed status: %v", err)
 	}
+	const closedTransitionRule = "closed repair cannot return to preparing"
+	patch(map[string]any{"repair": map[string]any{"state": "Preparing"}}, closedTransitionRule)
+	patch(map[string]any{"repair": map[string]any{"state": "Aborting"}}, `Unsupported value: "Aborting"`)
 	patch(map[string]any{"repair": map[string]any{"plan": map[string]any{"oldWALIdentity": "changed"}}}, "repair intent is immutable per operation")
-	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": "changed"}}}, "closed repair must match authority")
-	patch(map[string]any{"authority": map[string]any{"transition": map[string]any{"id": "other"}}}, "closed repair must match authority")
-	const authorityRule = "closed repair must match authority"
+	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": "changed"}}}, authorityRule)
+	patch(map[string]any{"authority": map[string]any{"transition": map[string]any{"id": "other"}}}, authorityRule)
 	patch(map[string]any{"authority": map[string]any{"owner": map[string]any{"uid": nil}}}, authorityRule)
 	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"deploymentUID": nil}}}, authorityRule)
 	patch(map[string]any{"authority": map[string]any{"binding": map[string]any{"storageID": nil}}}, authorityRule)
@@ -977,15 +1026,35 @@ func TestV1Alpha2RepairAPIServerContract(t *testing.T) {
 		t.Fatal("reader did not accept exact completion")
 	}
 	patch(map[string]any{"repair": map[string]any{"completion": map[string]any{"hash": strings.Repeat("c", 64)}}}, "terminal repair is immutable per operation")
+	const predecessorRule = "replacement repair requires a terminal predecessor and advanced position"
+	for _, tc := range []struct {
+		name     string
+		revision uint64
+	}{
+		{"equal-prior-position", plan.ExpectedConfigID},
+		{"regressed-behind-terminal", completion.ConfigID - 1},
+	} {
+		bad := plan
+		bad.OperationID = "repair-cel-" + tc.name
+		bad.ExpectedConfigID = tc.revision
+		patch(map[string]any{"repair": map[string]any{"plan": bad, "state": "Preparing", "completion": nil, "addCompletion": nil, "preparedHandoff": nil}}, predecessorRule)
+	}
 	next := plan
 	next.OperationID = "repair-cel-next"
 	next.ExpectedConfigID = completion.ConfigID
-	nextClosed, obs, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next)
+	nextPrepared, obs, err := PrepareV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next)
+	if err != nil || obs != V1Alpha2CASApplied || nextPrepared.SQLReservationsClosed() {
+		t.Fatalf("prepare after terminal predecessor: %s %v", obs, err)
+	}
+	if record, ok := nextPrepared.Repair(); !ok || record.State != "Preparing" || record.Plan.OperationID != next.OperationID {
+		t.Fatalf("API server rejected or changed the successor preparing operation: %+v", record)
+	}
+	if _, _, err := PrepareV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+		t.Fatalf("stale successor Prepare must conflict: %v", err)
+	}
+	nextClosed, obs, err := CloseV1Alpha2RepairReservations(ctx, store, nextPrepared, nextPrepared.Authority(), next)
 	if err != nil || obs != V1Alpha2CASApplied || !nextClosed.SQLReservationsClosed() {
 		t.Fatalf("close while preserving historical pending: %s %v", obs, err)
-	}
-	if _, _, err := BeginV1Alpha2Repair(ctx, store, loaded, loaded.Authority(), next); !errors.Is(err, ErrV1Alpha2StatusConflict) {
-		t.Fatalf("stale Begin must conflict: %v", err)
 	}
 	abort := V1Alpha2RepairCompletion{OperationID: next.OperationID, PlanDigest: next.Digest(), ExpectedConfigID: next.ExpectedConfigID, ExpectedAbortSlot: next.ExpectedAbortSlot, Kind: "Abort", ConfigID: next.ExpectedConfigID, Slot: 2, Hash: strings.Repeat("d", 64)}
 	aborted, obs, err := FinishV1Alpha2Repair(ctx, store, nextClosed, nextClosed.Authority(), abort)

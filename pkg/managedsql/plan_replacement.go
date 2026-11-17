@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -39,7 +38,7 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 			return nil, fmt.Errorf("retired voter identity cannot be enrolled or replaced")
 		}
 	}
-	if r, ok := a.Repair(); ok && r.State == "Closed" {
+	if r, ok := a.Repair(); ok && (r.State == "Closed" || r.State == "Preparing") {
 		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, r.Plan); err != nil {
 			return nil, fmt.Errorf("closed repair candidate unavailable; retargeting forbidden: %w", err)
 		}
@@ -47,6 +46,9 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	}
 	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 	if err != nil {
+		return nil, err
+	}
+	if err := requireStableReplacementMembership(snapshot); err != nil {
 		return nil, err
 	}
 	target, err := a.TargetVoterCount()
@@ -110,7 +112,7 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 	if err != nil {
 		return nil, err
 	}
-	if !reflect.DeepEqual(current.Current, snapshot.Current) || current.AbortSlot != snapshot.AbortSlot {
+	if !sameReplicaSnapshot(current, snapshot) {
 		return nil, fmt.Errorf("membership changed during replacement planning")
 	}
 	return &p, nil
@@ -126,6 +128,9 @@ func memberPresent(cluster quepaxa.Cluster, id quepaxa.NodeID) bool {
 }
 
 func (h *Host) planVoterEnrollment(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, snapshot node.ManagedRepairSnapshot, target int, replacement operator.V1Alpha2RepairPodRequest) (*operator.V1Alpha2RepairPlan, error) {
+	if err := requireStableReplacementMembership(snapshot); err != nil {
+		return nil, err
+	}
 	if target <= len(snapshot.Current.Members) || len(snapshot.Current.Members) < 3 || len(snapshot.Current.Members) >= 64 || target > 64 {
 		return nil, fmt.Errorf("enrollment requires a higher bounded target voter count")
 	}
@@ -163,10 +168,20 @@ func (h *Host) planVoterEnrollment(ctx context.Context, a operator.V1Alpha2Admis
 	if err != nil {
 		return nil, err
 	}
-	if !reflect.DeepEqual(current.Current, snapshot.Current) || current.AbortSlot != snapshot.AbortSlot {
+	if !sameReplicaSnapshot(current, snapshot) {
 		return nil, fmt.Errorf("membership changed during enrollment planning")
 	}
 	return &p, nil
+}
+
+// A new repair may close SQL reservations only on settled membership. An
+// existing closed repair resumes through its own path and may legitimately
+// observe the pending transition it already owns.
+func requireStableReplacementMembership(snapshot node.ManagedRepairSnapshot) error {
+	if snapshot.PendingOK {
+		return fmt.Errorf("membership reconfiguration pending; new replacement is deferred")
+	}
+	return nil
 }
 
 func replacementSequenceForProtocol(protocol string) operator.V1Alpha2RepairSequence {

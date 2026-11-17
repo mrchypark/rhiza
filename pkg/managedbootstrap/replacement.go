@@ -43,6 +43,9 @@ func RunReplacementLoop(ctx context.Context, host *managedsql.Host, cfg manageds
 }
 
 func reconcileReplacement(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) (string, error) {
+	if stage, err := host.ReconcilePreparingRepairAbort(ctx); err != nil || stage != "idle" && stage != "resume" {
+		return stage, err
+	}
 	stage, err := host.ReconcileExternalReplicas(ctx)
 	if err != nil || stage != "disabled" && stage != "idle" && stage != "ordinary-repair" {
 		return stage, err
@@ -51,7 +54,7 @@ func reconcileReplacement(ctx context.Context, host *managedsql.Host, cfg manage
 	if err != nil {
 		return "authority", err
 	}
-	if r, ok := a.Repair(); ok && r.State == "Closed" {
+	if r, ok := a.Repair(); ok && (r.State == "Closed" || r.State == "Preparing") {
 		plan, err := host.PlanVoterReplacement(ctx, operator.V1Alpha2RepairPodRequest{}, nil)
 		if err != nil {
 			return "closed-candidate-blocked", err

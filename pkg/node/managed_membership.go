@@ -201,7 +201,7 @@ func (n *Node) VerifyManagedRepairAddition(ctx context.Context, request ManagedM
 		return ManagedRepairCompletion{}, fmt.Errorf("read managed ADD journal: %w", err)
 	}
 	var operation membershipOperation
-	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Add == nil || *operation.Request.Add != *request.Addition {
+	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || hydrateMembershipReservation(&operation, change, managedMembershipIntentHash(request)) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Add == nil || *operation.Request.Add != *request.Addition {
 		return ManagedRepairCompletion{}, network.ErrRequestConflict
 	}
 	if operation.Target.ConfigID != request.ExpectedConfigID+1 {

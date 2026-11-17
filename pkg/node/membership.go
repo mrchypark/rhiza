@@ -20,6 +20,46 @@ type membershipOperation struct {
 	Request             network.MembershipChange `json:"request"`
 	Target              quepaxa.Cluster          `json:"target"`
 	ManagedExcludedRead bool                     `json:"managedExcludedRead,omitempty"`
+	Reservation         *membershipReservation   `json:"reservation,omitempty"`
+}
+
+type membershipReservation struct {
+	OperationID       string                  `json:"operationID"`
+	Action            ManagedMembershipAction `json:"action"`
+	ExpectedAbortSlot quepaxa.Slot            `json:"expectedAbortSlot"`
+	Source            quepaxa.Cluster         `json:"source"`
+	IntentHash        string                  `json:"intentHash"`
+}
+
+func managedMembershipIntentHash(r ManagedMembershipRequest) string {
+	member := quepaxa.Member{}
+	if r.Addition != nil {
+		member = *r.Addition
+	}
+	payload := fmt.Sprintf("%s\x00%s\x00%t\x00%d\x00%d\x00%s\x00%s\x00%s\x00%x\x00%s", r.RepairOperationID, r.Action, r.AddOnly, r.ExpectedConfigID, r.ExpectedAbortSlot, r.OldNodeID, r.OldWALIdentity, member.ID, member.PublicKey, member.PeerURL)
+	sum := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("%x", sum)
+}
+
+func hydrateMembershipReservation(operation *membershipOperation, request network.MembershipChange, intentHash string) error {
+	if operation == nil || operation.Reservation == nil {
+		return nil
+	}
+	r := operation.Reservation
+	if r.OperationID != request.OperationID || r.Action != ManagedMembershipAdd || r.Source.ConfigID != request.ExpectedConfigID || r.ExpectedAbortSlot != request.ExpectedAbortSlot || request.Add == nil || r.IntentHash == "" || r.IntentHash != intentHash {
+		return network.ErrRequestConflict
+	}
+	target := quepaxa.Cluster{ConfigID: r.Source.ConfigID + 1}
+	for _, member := range r.Source.Members {
+		if request.Add != nil && member.ID == request.Add.ID {
+			return network.ErrInvalidRequest
+		}
+		target.Members = append(target.Members, member)
+	}
+	target.Members = append(target.Members, *request.Add)
+	operation.Request = request
+	operation.Target = target
+	return nil
 }
 
 type managedMembershipStage string
@@ -77,17 +117,29 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 	}
 	operation := membershipOperation{Request: request}
 	current := n.core.CurrentCluster()
+	var reservation *membershipReservation
 	if stored != nil {
 		if err := json.Unmarshal(stored, &operation); err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(operation.Request, request) {
+		if operation.Reservation != nil {
+			reservation = operation.Reservation
+			intentHash := ""
+			if permit, ok := ctx.Value(managedMembershipPermitKey{}).(managedMembershipPermit); ok {
+				intentHash = managedMembershipIntentHash(permit.request)
+			}
+			if err := hydrateMembershipReservation(&operation, request, intentHash); err != nil || !reflect.DeepEqual(reservation.Source, current) {
+				return network.ErrRequestConflict
+			}
+			current = reservation.Source
+		} else if !reflect.DeepEqual(operation.Request, request) {
 			return network.ErrRequestConflict
 		}
 		if n.managedStartup != nil && request.Remove != "" && !operation.ManagedExcludedRead {
 			return network.ErrRequestConflict
 		}
-	} else {
+	}
+	if stored == nil || reservation != nil {
 		if current.ConfigID != request.ExpectedConfigID {
 			return network.ErrRequestConflict
 		}
@@ -171,11 +223,13 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 		if len(encoded) >= 64<<10 {
 			return network.ErrInvalidRequest
 		}
-		if err := matchVoterRegistration(ctx, n.bucket, key, encoded, nil); err != nil {
-			if errors.Is(err, ErrVoterStateLost) {
-				return network.ErrRequestConflict
+		if reservation == nil {
+			if err := matchVoterRegistration(ctx, n.bucket, key, encoded, nil); err != nil {
+				if errors.Is(err, ErrVoterStateLost) {
+					return network.ErrRequestConflict
+				}
+				return err
 			}
-			return err
 		}
 	}
 	stage = managedMembershipStageLiveGuard
@@ -243,47 +297,85 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 // Selects the retained terminal for a journal's exact target and abort round.
 // OperationID provenance is checked against the immutable journal by callers.
 func (n *Node) retainedMembershipTerminal(operation membershipOperation) (quepaxa.DecidedValue, error) {
+	terminal, found, err := n.findRetainedMembershipTerminal(operation)
+	if err != nil {
+		return quepaxa.DecidedValue{}, err
+	}
+	if !found {
+		return quepaxa.DecidedValue{}, fmt.Errorf("membership terminal unavailable")
+	}
+	return terminal, nil
+}
+
+func (n *Node) findRetainedMembershipTerminal(operation membershipOperation) (quepaxa.DecidedValue, bool, error) {
 	history, err := n.core.MembershipHistory()
 	if err != nil {
-		return quepaxa.DecidedValue{}, fmt.Errorf("membership completion history: %w", err)
+		return quepaxa.DecidedValue{}, false, fmt.Errorf("membership completion history: %w", err)
 	}
 	var terminal *quepaxa.DecidedValue
 	var previous quepaxa.Slot
 	for _, transition := range history.Transitions {
-		if n.core.ClusterForSlot(transition.Freeze.Slot).ConfigID != operation.Request.ExpectedConfigID || !reflect.DeepEqual(n.core.ClusterForSlot(transition.Terminal.Slot+1), operation.Target) {
+		actualTarget := n.core.ClusterForSlot(transition.Terminal.Slot + 1)
+		targetMatches := reflect.DeepEqual(actualTarget, operation.Target)
+		if operation.Reservation != nil {
+			targetMatches = reservationTerminalTargetMatches(operation.Reservation.Source, actualTarget, operation.Request.Add)
+		}
+		if n.core.ClusterForSlot(transition.Freeze.Slot).ConfigID != operation.Request.ExpectedConfigID || !targetMatches {
 			previous = transition.Terminal.Slot
 			continue
 		}
 		if terminal != nil {
-			return quepaxa.DecidedValue{}, fmt.Errorf("ambiguous membership terminal")
+			return quepaxa.DecidedValue{}, false, fmt.Errorf("ambiguous membership terminal")
 		}
 		if previous < n.core.CompactionFloor() {
-			return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history compacted")
+			return quepaxa.DecidedValue{}, false, fmt.Errorf("membership revision history compacted")
 		}
 		var revision quepaxa.Slot
 		for slot := previous + 1; slot < transition.Freeze.Slot; slot++ {
 			value, ok := n.core.CertifiedValue(slot)
 			if !ok {
-				return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history unavailable")
+				return quepaxa.DecidedValue{}, false, fmt.Errorf("membership revision history unavailable")
 			}
 			control, err := quepaxa.DecodeReconfiguration(value.Value)
 			if err != nil {
-				return quepaxa.DecidedValue{}, fmt.Errorf("invalid membership revision history: %w", err)
+				return quepaxa.DecidedValue{}, false, fmt.Errorf("invalid membership revision history: %w", err)
 			}
 			if control {
 				revision = slot
 			}
 		}
 		if revision != operation.Request.ExpectedAbortSlot {
-			return quepaxa.DecidedValue{}, network.ErrRequestConflict
+			return quepaxa.DecidedValue{}, false, network.ErrRequestConflict
 		}
 		decision := transition.Terminal
 		terminal = &decision
 	}
 	if terminal == nil {
-		return quepaxa.DecidedValue{}, fmt.Errorf("membership terminal unavailable")
+		return quepaxa.DecidedValue{}, false, nil
 	}
-	return *terminal, nil
+	return *terminal, true, nil
+}
+
+func reservationTerminalTargetMatches(source, actual quepaxa.Cluster, addition *quepaxa.Member) bool {
+	// Consensus certificates do not contain the journal OperationID. This match
+	// is deliberately target-based: any matching target blocks no-effect abort.
+	// That false-positive direction is safe; history ambiguity/compaction errors
+	// also block. It is not proof that this operation ID produced the terminal.
+	if addition == nil || actual.ConfigID != source.ConfigID+1 || len(actual.Members) != len(source.Members)+1 {
+		return false
+	}
+	actualByID := make(map[quepaxa.NodeID]quepaxa.Member, len(actual.Members))
+	for _, member := range actual.Members {
+		actualByID[member.ID] = member
+	}
+	for _, member := range source.Members {
+		got, ok := actualByID[member.ID]
+		if !ok || !reflect.DeepEqual(got, member) {
+			return false
+		}
+	}
+	got, ok := actualByID[addition.ID]
+	return ok && got.PublicKey == addition.PublicKey && got.PeerURL == addition.PeerURL && got.WALIdentity != ""
 }
 
 func (n *Node) membershipOperationKey(request network.MembershipChange) string {
@@ -292,6 +384,63 @@ func (n *Node) membershipOperationKey(request network.MembershipChange) string {
 		name = fmt.Sprintf("%d-abort-%d.json", request.ExpectedConfigID, request.ExpectedAbortSlot)
 	}
 	return path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "membership", name)
+}
+
+// ReserveManagedRepairAdd durably claims the single membership journal slot
+// for this config/abort revision without beginning consensus reconfiguration.
+// Learner registration and handoff are validated by changeMembership later.
+func (n *Node) ReserveManagedRepairAdd(ctx context.Context, r ManagedMembershipRequest) error {
+	if n == nil || r.Action != ManagedMembershipAdd || r.Addition == nil || r.Addition.ID == "" || r.Addition.PublicKey == (quepaxa.PublicKey{}) || r.Addition.PeerURL == "" || r.HandoffHeadHash != "" {
+		return network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	n.membershipMu.Lock()
+	defer n.membershipMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if n.config == nil || n.core == nil || n.bucket == nil || !n.opened.Load() || !n.config.EnableReconfiguration || !n.core.IsVoter() {
+		return network.ErrNotReady
+	}
+	current := n.core.CurrentCluster()
+	current.Members = append([]quepaxa.Member(nil), current.Members...)
+	if _, pending := n.core.PendingReconfiguration(); pending || current.ConfigID != r.ExpectedConfigID {
+		return fmt.Errorf("membership reservation source changed: %w", network.ErrRequestConflict)
+	}
+	if revision, _, _ := n.core.LastReconfigurationAbort(); revision != r.ExpectedAbortSlot {
+		return fmt.Errorf("membership reservation abort revision changed: %w", network.ErrRequestConflict)
+	}
+	change := r.change(string(n.config.ClusterID))
+	key := n.membershipOperationKey(change)
+	stored, err := readVoterRegistration(ctx, n.bucket, key)
+	if err != nil {
+		return err
+	}
+	if stored != nil {
+		var operation membershipOperation
+		if json.Unmarshal(stored, &operation) != nil {
+			return network.ErrRequestConflict
+		}
+		if operation.Reservation != nil {
+			if operation.Reservation.OperationID == change.OperationID && operation.Reservation.Action == ManagedMembershipAdd && reflect.DeepEqual(operation.Reservation.Source, current) && operation.Reservation.ExpectedAbortSlot == r.ExpectedAbortSlot && operation.Reservation.IntentHash == managedMembershipIntentHash(r) {
+				return nil
+			}
+		}
+		return network.ErrRequestConflict
+	}
+	reservation := membershipOperation{Reservation: &membershipReservation{OperationID: change.OperationID, Action: ManagedMembershipAdd, ExpectedAbortSlot: r.ExpectedAbortSlot, Source: current, IntentHash: managedMembershipIntentHash(r)}}
+	encoded, err := json.Marshal(reservation)
+	if err != nil || len(encoded) >= 64<<10 {
+		return fmt.Errorf("membership reservation exceeds bounded budget")
+	}
+	if err := matchVoterRegistration(ctx, n.bucket, key, encoded, nil); err != nil {
+		if errors.Is(err, ErrVoterStateLost) {
+			return network.ErrRequestConflict
+		}
+		return err
+	}
+	return nil
 }
 
 func (n *Node) abortMembership(ctx context.Context, request network.MembershipChange) error {

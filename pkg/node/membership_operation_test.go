@@ -106,6 +106,72 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 	assertNoMembershipOperation(t, ctx, n, bucket, 2)
 }
 
+func TestManagedRepairAddReservationFencesCompetingOperation(t *testing.T) {
+	for _, addOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("addOnly=%t", addOnly), func(t *testing.T) {
+			ctx := context.Background()
+			n, identities, bucket, transport := newMembershipOperationNode(t)
+			n.managedStartup = &ManagedStartupConfig{Checker: preparedRepairCaptureChecker{}}
+			n.opened.Store(true)
+			learner := registerMembershipLearner(t, bucket, "fresh")
+			request := ManagedMembershipRequest{
+				RepairOperationID: "reserved-add", Action: ManagedMembershipAdd, AddOnly: addOnly, ExpectedConfigID: 1,
+				OldNodeID: "c", OldWALIdentity: identities["c"], Addition: &learner,
+			}
+			if err := n.ReserveManagedRepairAdd(ctx, request); err != nil {
+				t.Fatalf("reserve ADD journal: %v", err)
+			}
+			if pending, ok := transport.cores["a"].PendingReconfiguration(); ok {
+				t.Fatalf("reservation began consensus reconfiguration: %+v", pending)
+			}
+			key := n.membershipOperationKey(request.change("cluster"))
+			data, err := readVoterRegistration(ctx, bucket, key)
+			if err != nil || len(data) == 0 {
+				t.Fatalf("reserved ADD journal unavailable: %v", err)
+			}
+
+			competing := request
+			competing.RepairOperationID = "competing-add"
+			if err := n.ReserveManagedRepairAdd(ctx, competing); !errors.Is(err, network.ErrRequestConflict) {
+				t.Fatalf("competing operation bypassed reservation: %v", err)
+			}
+			if err := n.ReserveManagedRepairAdd(ctx, request); err != nil {
+				t.Fatalf("exact reservation retry was not idempotent: %v", err)
+			}
+			for _, changed := range []ManagedMembershipRequest{
+				func() ManagedMembershipRequest { r := request; r.AddOnly = !r.AddOnly; return r }(),
+				func() ManagedMembershipRequest {
+					r := request
+					r.OldNodeID = "b"
+					r.OldWALIdentity = identities["b"]
+					return r
+				}(),
+				func() ManagedMembershipRequest {
+					r := request
+					r.Addition = &quepaxa.Member{ID: learner.ID, PublicKey: learner.PublicKey, PeerURL: "https://different"}
+					return r
+				}(),
+			} {
+				if err := n.ReserveManagedRepairAdd(ctx, changed); !errors.Is(err, network.ErrRequestConflict) {
+					t.Fatalf("same operation ID with changed intent was accepted: %+v", changed)
+				}
+			}
+			if got := n.core.CurrentCluster(); got.ConfigID != 1 || len(got.Members) != 3 {
+				t.Fatalf("reservation changed membership: %+v", got)
+			}
+			restarted := &Node{config: n.config, core: n.core, bucket: n.bucket, archive: n.archive, managedStartup: n.managedStartup}
+			restarted.opened.Store(true)
+			if err := restarted.ReserveManagedRepairAdd(ctx, request); err != nil {
+				t.Fatalf("exact reservation did not survive restart: %v", err)
+			}
+			after, err := readVoterRegistration(ctx, bucket, key)
+			if err != nil || !bytes.Equal(data, after) {
+				t.Fatalf("exact reservation was not immutable across restart: %v", err)
+			}
+		})
+	}
+}
+
 func TestMembershipOperationRejectsDifferentPendingTargetBeforeJournal(t *testing.T) {
 	ctx := context.Background()
 	n, identities, bucket, transport := newMembershipOperationNode(t)
@@ -434,4 +500,20 @@ func (t *membershipOperationTransport) disable(ids ...quepaxa.NodeID) {
 	for _, id := range ids {
 		t.disabled[id] = true
 	}
+}
+
+func (t *membershipOperationTransport) retain(members []quepaxa.Member) {
+	keep := make(map[quepaxa.NodeID]bool, len(members))
+	for _, member := range members {
+		keep[member.ID] = true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ids := t.ids[:0]
+	for _, id := range t.ids {
+		if keep[id] {
+			ids = append(ids, id)
+		}
+	}
+	t.ids = ids
 }

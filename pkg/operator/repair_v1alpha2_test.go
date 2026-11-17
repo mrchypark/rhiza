@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -168,6 +169,27 @@ func TestRepairV1Alpha2GateAndABA(t *testing.T) {
 		t.Fatalf("stale repair CAS bypassed ABA: %v", err)
 	}
 
+}
+
+func TestPrepareRepairRetainsFullIntentBeforeClosingReservations(t *testing.T) {
+	f, old := repairTestSetup(t)
+	ctx := context.Background()
+	prepared, observation, err := PrepareV1Alpha2Repair(ctx, f.store, old, old.Authority(), f.plan)
+	if err != nil || observation != V1Alpha2CASApplied || prepared.SQLReservationsClosed() {
+		t.Fatalf("prepare: %s %v closed=%t", observation, err, prepared.SQLReservationsClosed())
+	}
+	record, ok := prepared.Repair()
+	if !ok || record.State != "Preparing" || !reflect.DeepEqual(record.Plan, f.plan) || record.PreparedHandoff != nil || record.Completion != nil {
+		t.Fatalf("preparing intent lost full plan: %+v", record)
+	}
+	again, observation, err := PrepareV1Alpha2Repair(ctx, f.store, prepared, prepared.Authority(), f.plan)
+	if err != nil || observation != V1Alpha2CASApplied || again.ResourceVersion() != prepared.ResourceVersion() {
+		t.Fatalf("exact preparation retry was not idempotent: %s %v", observation, err)
+	}
+	closed, observation, err := CloseV1Alpha2RepairReservations(ctx, f.store, prepared, prepared.Authority(), f.plan)
+	if err != nil || observation != V1Alpha2CASApplied || !closed.SQLReservationsClosed() {
+		t.Fatalf("close prepared intent: %s %v", observation, err)
+	}
 }
 
 func TestRepairV1Alpha2HistoricalPendingPreserved(t *testing.T) {
@@ -383,7 +405,7 @@ func TestRepairV1Alpha2SchemaIsBoundedIntentNotHandoff(t *testing.T) {
 		t.Fatal("unexpected ledger or prepared handoff")
 	}
 	rules := string(b)
-	for _, message := range []string{"voterCount may decrease by at most one per update", "repair record cannot be removed", "repair intent is immutable per operation", "terminal repair is immutable per operation", "replacement repair requires a terminal predecessor and advanced position", "closed repair forbids new application reservations", "REMOVE alone is not final repair completion", "closed repair must match authority and cannot overlap a transition"} {
+	for _, message := range []string{"voterCount may decrease by at most one per update", "repair record cannot be removed", "repair intent is immutable per operation", "terminal repair is immutable per operation", "replacement repair requires a terminal predecessor and advanced position", "closed repair forbids new application reservations", "REMOVE alone is not final repair completion", "active repair must match authority and cannot overlap a transition"} {
 		if !strings.Contains(rules, message) {
 			t.Fatalf("missing CEL invariant %s", message)
 		}

@@ -49,7 +49,7 @@ func (h *Host) ReconcileExternalReplicas(ctx context.Context) (string, error) {
 		return "frozen", err
 	}
 
-	if record, ok := a.Repair(); ok && record.State == "Closed" {
+	if record, ok := a.Repair(); ok && (record.State == "Closed" || record.State == "Preparing" && record.Plan.Sequence == operator.V1Alpha2RepairAdd) {
 		if record.Plan.Sequence == operator.V1Alpha2RepairAdd || record.Plan.Sequence == operator.V1Alpha2RepairLeave {
 			return h.resumeExternalReplicaRepair(ctx, record)
 		}
@@ -796,7 +796,7 @@ func replicaDecisionBlockedWith(a operator.V1Alpha2AdmissionSnapshot, allowedClo
 		return true
 	}
 	record, ok := a.Repair()
-	if !ok || record.State != "Closed" {
+	if !ok || record.State != "Closed" && record.State != "Preparing" {
 		return false
 	}
 	return allowedClosed == nil || !reflect.DeepEqual(record.Plan, *allowedClosed)

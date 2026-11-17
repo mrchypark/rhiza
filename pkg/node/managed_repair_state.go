@@ -99,7 +99,7 @@ func (n *Node) VerifyManagedRepairCompletion(ctx context.Context, request Manage
 		return ManagedRepairCompletion{}, fmt.Errorf("managed ADD journal unavailable")
 	}
 	var operation membershipOperation
-	if json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Add == nil || *operation.Request.Add != *request.Addition {
+	if json.Unmarshal(data, &operation) != nil || hydrateMembershipReservation(&operation, change, managedMembershipIntentHash(request)) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Add == nil || *operation.Request.Add != *request.Addition {
 		return ManagedRepairCompletion{}, network.ErrRequestConflict
 	}
 	current := n.core.CurrentCluster()

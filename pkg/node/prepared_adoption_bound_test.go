@@ -62,6 +62,7 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 	var lastWritten []byte
 	identity := recovery.PreparedStartupIdentity{ClusterUID: "cluster", Generation: 0, DeploymentUID: "deployment", PodUID: "pod", NodeID: "a", SourceBinding: strings.Repeat("1", 64), ConfigDigest: strings.Repeat("2", 64)}
 	for cycle := 1; cycle <= 8; cycle++ {
+		cycleStarted := time.Now()
 		member := registerMembershipLearner(t, bucket, quepaxa.NodeID(fmt.Sprintf("rhiza-n-%064d", cycle)))
 		wal, err := qlog.Open(t.TempDir())
 		if err != nil {
@@ -92,6 +93,7 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		}
 		transport.cores[member.ID] = learner
 		transport.ids = append(transport.ids, member.ID)
+		t.Logf("cycle=%d add-start slots=%d listeners=%d", cycle, n.core.Tip(), len(transport.ids))
 		current := n.core.CurrentCluster()
 		add := quepaxa.Cluster{ConfigID: current.ConfigID + 1, Members: append(append([]quepaxa.Member(nil), current.Members...), member)}
 		if _, err := n.core.BeginReconfiguration(ctx, add); err != nil {
@@ -100,6 +102,7 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		if err := n.core.FinishReconfiguration(ctx); err != nil {
 			t.Fatal("actual ADD terminal", err)
 		}
+		addDone := time.Now()
 		remove := quepaxa.Cluster{ConfigID: add.ConfigID + 1, Members: []quepaxa.Member{bootstrap.Members[0], bootstrap.Members[1], member}}
 		if _, err := n.core.BeginReconfiguration(ctx, remove); err != nil {
 			t.Fatal("actual REMOVE freeze", err)
@@ -107,6 +110,8 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		if err := n.core.FinishReconfiguration(ctx); err != nil {
 			t.Fatal("actual REMOVE terminal", err)
 		}
+		transport.retain(n.core.CurrentCluster().Members)
+		t.Logf("cycle=%d add=%s remove=%s total=%s config=%d listeners=%d", cycle, addDone.Sub(cycleStarted), time.Since(addDone), time.Since(cycleStarted), n.core.ConfigID(), len(transport.ids))
 		if err := archive.SyncThrough(ctx, n.core, n.core.Tip()); err != nil {
 			t.Fatal(err)
 		}

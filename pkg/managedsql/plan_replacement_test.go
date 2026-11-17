@@ -14,6 +14,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.T) {
@@ -151,5 +152,50 @@ func TestReplacementPlanSequenceMatchesSupportedProfiles(t *testing.T) {
 				t.Fatalf("replacement sequence for %q = %q, want %q", tc.protocol, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReplacementPlanningRequiresSettledMembership(t *testing.T) {
+	current := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{
+		replicaTestMember("a"), replicaTestMember("b"), replicaTestMember("c"),
+	}}
+	settled := node.ManagedRepairSnapshot{Current: current}
+	if err := requireStableReplacementMembership(settled); err != nil {
+		t.Fatalf("settled membership rejected: %v", err)
+	}
+
+	pending := settled
+	pending.Pending = quepaxa.Cluster{ConfigID: 2, Members: current.Members[:2]}
+	pending.PendingOK = true
+	// Current config and abort slot remain equal while the transition is pending;
+	// accepting this snapshot would let BeginV1Alpha2Repair close reservations.
+	if err := requireStableReplacementMembership(pending); err == nil {
+		t.Fatal("new replacement accepted while membership reconfiguration is pending")
+	}
+	if sameReplicaSnapshot(pending, settled) {
+		t.Fatal("pending membership transition was treated as a stable planning snapshot")
+	}
+}
+
+func TestPreparingRepairResumeRequiresExactSettledRevision(t *testing.T) {
+	plan := operator.V1Alpha2RepairPlan{ExpectedConfigID: 3, ExpectedAbortSlot: 7}
+	exact := node.ManagedRepairSnapshot{Current: quepaxa.Cluster{ConfigID: 3}, AbortSlot: 7}
+	if !preparingRepairMatches(exact, plan) {
+		t.Fatal("exact settled preparation did not qualify for resume")
+	}
+	pending := exact
+	pending.PendingOK = true
+	if preparingRepairMatches(pending, plan) {
+		t.Fatal("pending preparation qualified for automatic resume")
+	}
+	changedConfig := exact
+	changedConfig.Current.ConfigID = 4
+	if preparingRepairMatches(changedConfig, plan) {
+		t.Fatal("changed membership qualified for automatic resume")
+	}
+	changedAbort := exact
+	changedAbort.AbortSlot = 8
+	if preparingRepairMatches(changedAbort, plan) {
+		t.Fatal("changed abort revision qualified for automatic resume")
 	}
 }

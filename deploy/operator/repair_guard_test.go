@@ -9,7 +9,7 @@ import (
 
 // Static contract only: actual malformed-leaf rejection is qualified by the
 // API-server fixture, not by substituting a local CEL implementation.
-func TestRepairClosedAuthorityLeafGuards(t *testing.T) {
+func TestRepairActiveAuthorityLeafGuards(t *testing.T) {
 	data, err := os.ReadFile("cluster-crd.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -31,8 +31,8 @@ func TestRepairClosedAuthorityLeafGuards(t *testing.T) {
 	if err := yaml.Unmarshal(data, &crd); err != nil {
 		t.Fatal(err)
 	}
-	const message = "closed repair must match authority and cannot overlap a transition"
-	const expected = `!has(self.repair) || self.repair.state != "Closed" || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.binding.storageID) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)`
+	const message = "active repair must match authority and cannot overlap a transition"
+	const expected = `!has(self.repair) || (self.repair.state != "Preparing" && self.repair.state != "Closed") || (has(self.authority.owner) && has(self.authority.owner.uid) && has(self.authority.binding) && has(self.authority.binding.deploymentUID) && has(self.authority.binding.storageID) && has(self.authority.generation) && !has(self.authority.transition) && self.repair.plan.clusterUID == self.authority.owner.uid && self.repair.plan.generation == self.authority.generation && self.repair.plan.deploymentUID == self.authority.binding.deploymentUID && self.repair.plan.storageID == self.authority.binding.storageID)`
 	count := 0
 	for _, version := range crd.Spec.Versions {
 		if version.Name == "v1alpha2" {
@@ -40,13 +40,13 @@ func TestRepairClosedAuthorityLeafGuards(t *testing.T) {
 				if validation.Message == message {
 					count++
 					if validation.Rule != expected {
-						t.Fatal("closed repair rule must guard optional leaves before access and retain all binding/transition checks")
+						t.Fatal("active repair rule must guard optional leaves before access and retain all binding/transition checks")
 					}
 				}
 			}
 		}
 	}
 	if count != 1 {
-		t.Fatalf("expected one closed repair binding rule, found %d", count)
+		t.Fatalf("expected one active repair binding rule, found %d", count)
 	}
 }

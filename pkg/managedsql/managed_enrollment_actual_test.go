@@ -142,7 +142,20 @@ func TestManagedScaleEnrollsLearnersSerially3To4To5(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		closed, observation, err := operator.BeginV1Alpha2Repair(ctx, writerStore, admission, admission.Authority(), *plan)
+		prepared, observation, err := operator.PrepareV1Alpha2Repair(ctx, writerStore, admission, admission.Authority(), *plan)
+		if err != nil || observation != operator.V1Alpha2CASApplied || prepared.SQLReservationsClosed() {
+			t.Fatalf("prepare enrollment %d: observation=%s err=%v", ordinal, observation, err)
+		}
+		if err := writer.reserveReplacementAdd(ctx, *plan); err != nil {
+			t.Fatalf("reserve enrollment %d: %v", ordinal, err)
+		}
+		snapshot, err := writer.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		closed, observation, err := closeReplacementAfterValidation(ctx, writerStore, prepared, prepared.Authority(), *plan, snapshot, func(ctx context.Context) (node.ManagedRepairSnapshot, error) {
+			return writer.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		})
 		if err != nil || observation != operator.V1Alpha2CASApplied {
 			t.Fatalf("close enrollment %d: observation=%s err=%v", ordinal, observation, err)
 		}

@@ -409,7 +409,12 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 	if r.Plan.Generation > s.authority.Generation {
 		return nil, fmt.Errorf("repair belongs to a future authority")
 	}
-	if r.State == "Closed" {
+	if r.State == "Preparing" {
+		auth, _ := jsonObject(status["authority"])
+		if r.Completion != nil || r.PreparedHandoff != nil || r.AddCompletion != nil || !repairMatchesAuthority(r.Plan, s.authority) || hasV1Alpha2Transition(auth["transition"]) {
+			return nil, fmt.Errorf("invalid preparing repair")
+		}
+	} else if r.State == "Closed" {
 		auth, _ := jsonObject(status["authority"])
 		if r.Completion != nil || !repairMatchesAuthority(r.Plan, s.authority) || hasV1Alpha2Transition(auth["transition"]) {
 			return nil, fmt.Errorf("repair overlaps changed authority or transition")
@@ -423,11 +428,32 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 	return &r, nil
 }
 
-// BeginV1Alpha2Repair closes new reservations before a runtime may freeze its
-// membership. Existing pending/evidence is untouched. No membership is executed.
-// The trusted caller must verify current consensus configuration and the old
-// registered WAL identity; these cannot be proved by Kubernetes status.
+// PrepareV1Alpha2Repair records the complete intent without closing SQL
+// reservations. The host reserves runtime membership ownership before closing.
+func PrepareV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, plan V1Alpha2RepairPlan) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	return beginV1Alpha2Repair(ctx, store, old, expected, plan, "Preparing")
+}
+
+// CloseV1Alpha2RepairReservations closes new reservations only after the exact
+// Preparing intent and its runtime membership reservation are durable.
+func CloseV1Alpha2RepairReservations(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, plan V1Alpha2RepairPlan) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	r, ok := old.Repair()
+	if old.status.store != store || old.Authority() != expected || !ok || r.State != "Preparing" || !reflect.DeepEqual(r.Plan, plan) || !repairMatchesAuthority(r.Plan, expected) || r.Completion != nil || r.PreparedHandoff != nil || r.AddCompletion != nil || hasV1Alpha2Transition(old.transition) {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair close requires exact preparing intent")
+	}
+	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) {
+		r.State = "Closed"
+		status["repair"], _ = json.Marshal(r)
+	})
+}
+
+// BeginV1Alpha2Repair preserves the single-step preparation+close API used by
+// non-replacement membership operations. Existing pending/evidence is untouched.
 func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, plan V1Alpha2RepairPlan) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	return beginV1Alpha2Repair(ctx, store, old, expected, plan, "Closed")
+}
+
+func beginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, plan V1Alpha2RepairPlan, state string) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
 	if err := validateV1Alpha2RepairExecutionProfile(old); err != nil {
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
@@ -444,6 +470,15 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	if previous, ok := old.Repair(); ok {
+		if previous.State == "Preparing" {
+			if state == "Preparing" && reflect.DeepEqual(previous.Plan, plan) {
+				return old, V1Alpha2CASApplied, nil
+			}
+			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair preparation is already active")
+		}
+		if previous.Completion == nil {
+			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("previous repair has no terminal")
+		}
 		p := previous.Plan
 		if p.OperationID == plan.OperationID || !(plan.Generation > p.Generation || plan.Generation == p.Generation && (plan.ExpectedConfigID > p.ExpectedConfigID || plan.ExpectedConfigID == p.ExpectedConfigID && plan.ExpectedAbortSlot > p.ExpectedAbortSlot)) {
 			return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair operation position did not advance")
@@ -458,7 +493,7 @@ func BeginV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V1
 		}
 	}
 	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, auth map[string]json.RawMessage) {
-		status["repair"], _ = json.Marshal(V1Alpha2RepairRecord{Plan: plan, State: "Closed"})
+		status["repair"], _ = json.Marshal(V1Alpha2RepairRecord{Plan: plan, State: state})
 	})
 }
 

@@ -105,20 +105,34 @@ func validateRepairSequenceProfile(sequence operator.V1Alpha2RepairSequence, app
 
 func (h *Host) replaceVoterAddFirst(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, plan operator.V1Alpha2RepairPlan) error {
 	existing, exists := a.Repair()
-	if exists && !reflect.DeepEqual(existing.Plan, plan) && existing.State == "Closed" {
+	if exists && !reflect.DeepEqual(existing.Plan, plan) && (existing.State == "Closed" || existing.State == "Preparing") {
 		return fmt.Errorf("another exact repair is already closed")
 	}
 	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State == "Completed" {
 		return h.verifyCompletedAddFirstRepair(ctx, existing)
 	}
-	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State != "Closed" {
+	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State != "Closed" && existing.State != "Preparing" {
 		return fmt.Errorf("ADD-first repair is not resumable")
 	}
 	if !a.SQLReservationsClosed() {
-		if err := h.validateRepairStartState(ctx, plan); err != nil {
+		snapshot, err := h.validateRepairStartState(ctx, plan)
+		if err != nil {
 			return err
 		}
-		closed, observation, err := operator.BeginV1Alpha2Repair(ctx, h.cfg.Store, a, a.Authority(), plan)
+		prepared, observation, err := operator.PrepareV1Alpha2Repair(ctx, h.cfg.Store, a, a.Authority(), plan)
+		if err != nil {
+			return err
+		}
+		if observation != operator.V1Alpha2CASApplied {
+			return fmt.Errorf("repair prepare CAS outcome %s; refusing to reserve membership", observation)
+		}
+		a = prepared
+		if err := h.reserveReplacementAdd(ctx, plan); err != nil {
+			return err
+		}
+		closed, observation, err := closeReplacementAfterValidation(ctx, h.cfg.Store, a, a.Authority(), plan, snapshot, func(ctx context.Context) (node.ManagedRepairSnapshot, error) {
+			return h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		})
 		if err != nil {
 			return err
 		}
@@ -263,20 +277,34 @@ func (h *Host) replaceVoterAddFirst(ctx context.Context, a operator.V1Alpha2Admi
 // terminal and target configuration as well.
 func (h *Host) enrollVoter(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, plan operator.V1Alpha2RepairPlan) error {
 	existing, exists := a.Repair()
-	if exists && !reflect.DeepEqual(existing.Plan, plan) && existing.State == "Closed" {
+	if exists && !reflect.DeepEqual(existing.Plan, plan) && (existing.State == "Closed" || existing.State == "Preparing") {
 		return fmt.Errorf("another exact membership operation is already closed")
 	}
 	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State == "Completed" {
 		return h.verifyCompletedEnrollment(ctx, existing)
 	}
-	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State != "Closed" {
+	if exists && reflect.DeepEqual(existing.Plan, plan) && existing.State != "Closed" && existing.State != "Preparing" {
 		return fmt.Errorf("add-only enrollment is not resumable")
 	}
 	if !a.SQLReservationsClosed() {
-		if err := h.validateRepairStartState(ctx, plan); err != nil {
+		snapshot, err := h.validateRepairStartState(ctx, plan)
+		if err != nil {
 			return err
 		}
-		closed, observation, err := operator.BeginV1Alpha2Repair(ctx, h.cfg.Store, a, a.Authority(), plan)
+		prepared, observation, err := operator.PrepareV1Alpha2Repair(ctx, h.cfg.Store, a, a.Authority(), plan)
+		if err != nil {
+			return err
+		}
+		if observation != operator.V1Alpha2CASApplied {
+			return fmt.Errorf("enrollment prepare CAS outcome %s; refusing to reserve membership", observation)
+		}
+		a = prepared
+		if err := h.reserveReplacementAdd(ctx, plan); err != nil {
+			return err
+		}
+		closed, observation, err := closeReplacementAfterValidation(ctx, h.cfg.Store, a, a.Authority(), plan, snapshot, func(ctx context.Context) (node.ManagedRepairSnapshot, error) {
+			return h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+		})
 		if err != nil {
 			return err
 		}
@@ -440,13 +468,16 @@ func (h *Host) validateRepairPlanRuntime(ctx context.Context, plan operator.V1Al
 	return nil
 }
 
-func (h *Host) validateRepairStartState(ctx context.Context, plan operator.V1Alpha2RepairPlan) error {
+func (h *Host) validateRepairStartState(ctx context.Context, plan operator.V1Alpha2RepairPlan) (node.ManagedRepairSnapshot, error) {
 	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
 	if err != nil {
-		return err
+		return node.ManagedRepairSnapshot{}, err
+	}
+	if err := requireStableReplacementMembership(snapshot); err != nil {
+		return node.ManagedRepairSnapshot{}, err
 	}
 	if uint64(snapshot.Current.ConfigID) != plan.ExpectedConfigID || uint64(snapshot.AbortSlot) != plan.ExpectedAbortSlot {
-		return fmt.Errorf("repair plan no longer matches current membership revision")
+		return node.ManagedRepairSnapshot{}, fmt.Errorf("repair plan no longer matches current membership revision")
 	}
 	oldFound := false
 	var oldMember quepaxa.Member
@@ -462,18 +493,100 @@ func (h *Host) validateRepairStartState(ctx context.Context, plan operator.V1Alp
 		ids = append(ids, types.NodeID(member.ID))
 	}
 	if !oldFound || plan.OldWALIdentity == "" {
-		return fmt.Errorf("old voter or its expected WAL identity is missing from repair intent")
+		return node.ManagedRepairSnapshot{}, fmt.Errorf("old voter or its expected WAL identity is missing from repair intent")
 	}
 	registered, err := h.node.ManagedVoterWALIdentity(ctx, snapshot.Current.ConfigID, snapshot.AbortSlot, oldMember)
 	if err != nil || registered != plan.OldWALIdentity {
-		return errors.Join(fmt.Errorf("repair intent does not bind the exact current old-voter WAL identity"), err)
+		return node.ManagedRepairSnapshot{}, errors.Join(fmt.Errorf("repair intent does not bind the exact current old-voter WAL identity"), err)
 	}
 	ids = append(ids, plan.Replacement.NodeID)
 	slices.Sort(ids)
 	if !slices.Equal(ids, plan.FinalVoterIDs) {
-		return fmt.Errorf("repair target differs from actual current membership")
+		return node.ManagedRepairSnapshot{}, fmt.Errorf("repair target differs from actual current membership")
 	}
-	return nil
+	return snapshot, nil
+}
+
+// Fresh checks bound the unavoidable gap between runtime membership and status.
+// A transition that wins after the CAS keeps the exact closed repair; reservations
+// are never reopened here because the repair owns the handoff and may resume.
+func closeReplacementAfterValidation(ctx context.Context, store *operator.V1Alpha2StatusStore, old operator.V1Alpha2AdmissionSnapshot, expected operator.V1Alpha2AuthorityView, plan operator.V1Alpha2RepairPlan, validated node.ManagedRepairSnapshot, load func(context.Context) (node.ManagedRepairSnapshot, error)) (operator.V1Alpha2AdmissionSnapshot, operator.V1Alpha2CASObservation, error) {
+	if err := requireStableReplacementMembership(validated); err != nil {
+		return operator.V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	before, err := load(ctx)
+	if err != nil {
+		return operator.V1Alpha2AdmissionSnapshot{}, "", err
+	}
+	if !sameReplicaSnapshot(before, validated) {
+		return operator.V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("membership changed before repair reservation close")
+	}
+	closed, observation, err := operator.CloseV1Alpha2RepairReservations(ctx, store, old, expected, plan)
+	if err != nil || observation != operator.V1Alpha2CASApplied {
+		return closed, observation, err
+	}
+	after, err := load(ctx)
+	if err != nil {
+		return closed, observation, fmt.Errorf("membership unavailable after repair reservation close; exact repair retained: %w", err)
+	}
+	if !sameReplicaSnapshot(after, validated) {
+		return closed, observation, fmt.Errorf("membership changed after repair reservation close; exact repair retained")
+	}
+	return closed, observation, nil
+}
+
+func (h *Host) reserveReplacementAdd(ctx context.Context, plan operator.V1Alpha2RepairPlan) error {
+	request := replacementAddRequest(plan)
+	return h.node.ReserveManagedRepairAdd(ctx, request)
+}
+
+func replacementAddRequest(plan operator.V1Alpha2RepairPlan) node.ManagedMembershipRequest {
+	member := quepaxa.Member{ID: plan.Replacement.NodeID, PublicKey: plan.Replacement.PublicKey, PeerURL: plan.Replacement.PeerURL}
+	return node.ManagedMembershipRequest{
+		RepairOperationID: plan.OperationID, Action: node.ManagedMembershipAdd, AddOnly: plan.Sequence == operator.V1Alpha2RepairAdd,
+		ExpectedConfigID: uint(plan.ExpectedConfigID), ExpectedAbortSlot: quepaxa.Slot(plan.ExpectedAbortSlot),
+		OldNodeID: plan.OldNodeID, OldWALIdentity: plan.OldWALIdentity, Addition: &member,
+	}
+}
+
+// ReconcilePreparingRepairAbort resumes only an exact unchanged preparation or
+// an exact Closed repair whose handoff has not yet been captured. Any identity,
+// journal, candidate, or membership mismatch stops for manual recovery.
+func (h *Host) ReconcilePreparingRepairAbort(ctx context.Context) (string, error) {
+	h.replicaMu.Lock()
+	defer h.replicaMu.Unlock()
+	a, err := h.live(ctx)
+	if err != nil {
+		return "authority", err
+	}
+	record, ok := a.Repair()
+	if !ok || record.State != "Preparing" && !(record.State == "Closed" && record.PreparedHandoff == nil) {
+		return "idle", nil
+	}
+	if record.Plan.Sequence != operator.V1Alpha2RepairAddThenRemove && record.Plan.Sequence != operator.V1Alpha2RepairAdd {
+		return "idle", nil
+	}
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil {
+		return "membership", err
+	}
+	if !preparingRepairMatches(snapshot, record.Plan) {
+		return "manual-recovery-required", fmt.Errorf("managed repair for operation %q no longer matches current membership", record.Plan.OperationID)
+	}
+	if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, record.Plan); err != nil {
+		return "manual-recovery-required", errors.Join(fmt.Errorf("managed repair candidate mismatch for operation %q", record.Plan.OperationID), err)
+	}
+	if err := h.reserveReplacementAdd(ctx, record.Plan); err != nil {
+		return "manual-recovery-required", errors.Join(fmt.Errorf("managed repair journal mismatch for operation %q", record.Plan.OperationID), err)
+	}
+	if _, err := h.node.ManagedRepairSnapshot(ctx, record.Plan.Replacement.NodeID, record.Plan.Replacement.PublicKey); err != nil {
+		return "manual-recovery-required", errors.Join(fmt.Errorf("managed repair learner mismatch for operation %q", record.Plan.OperationID), err)
+	}
+	return "resume", nil
+}
+
+func preparingRepairMatches(snapshot node.ManagedRepairSnapshot, plan operator.V1Alpha2RepairPlan) bool {
+	return !snapshot.PendingOK && uint64(snapshot.Current.ConfigID) == plan.ExpectedConfigID && uint64(snapshot.AbortSlot) == plan.ExpectedAbortSlot
 }
 
 func (h *Host) waitRegisteredRepairLearner(ctx context.Context, learnerID quepaxa.NodeID, key quepaxa.PublicKey) (string, error) {
