@@ -1,5 +1,32 @@
 #!/bin/sh
 # Shared actual managed bootstrap/replacement checks. Drivers own API, image and cleanup.
+managed_status_gate_objects() {
+  jq -n --arg ns "$namespace" --arg user "system:serviceaccount:${namespace}:rhiza-operator" --arg name 'rhiza-test-bootstrap-gate' '
+    {apiVersion:"v1",kind:"List",items:[
+      {apiVersion:"admissionregistration.k8s.io/v1",kind:"ValidatingAdmissionPolicy",metadata:{name:$name},spec:{failurePolicy:"Fail",matchConstraints:{resourceRules:[{apiGroups:["rhiza.mrchypark.dev"],apiVersions:["v1alpha2"],operations:["UPDATE"],resources:["rhizaclusters/status"]}]},matchConditions:[{name:"test-target",expression:("request.namespace == " + ($ns|@json) + " && request.name == \"sql\" && request.userInfo.username == " + ($user|@json))}],validations:[{expression:"false",message:"test bootstrap observation gate"}]}},
+      {apiVersion:"admissionregistration.k8s.io/v1",kind:"ValidatingAdmissionPolicyBinding",metadata:{name:$name},spec:{policyName:$name,validationActions:["Deny"]}}
+    ]}'
+}
+managed_wait_status_gate() {
+  gate_expected=$1 gate_try=0
+  while [ "$gate_try" -lt 30 ]; do
+    gate_try=$((gate_try+1))
+    k -n "$namespace" get rhizacluster sql -o json > "$private/status-gate-object.json" || return $?
+    jq -e --arg uid "$uid" '.metadata.uid==$uid' "$private/status-gate-object.json" >/dev/null || return 1
+    gate_result=0
+    k --as "system:serviceaccount:${namespace}:rhiza-operator" replace --raw "/apis/rhiza.mrchypark.dev/v1alpha2/namespaces/$namespace/rhizaclusters/sql/status?dryRun=All" -f "$private/status-gate-object.json" > "$logs/status-gate-$gate_expected-$gate_try.log" 2>&1 || gate_result=$?
+    printf '%s\n' "$gate_result" > "$logs/status-gate-$gate_expected-$gate_try.exit"
+    if [ "$gate_result" -eq 0 ]; then
+      [ "$gate_expected" != open ] || return 0
+    elif grep -F 'test bootstrap observation gate' "$logs/status-gate-$gate_expected-$gate_try.log" >/dev/null; then
+      [ "$gate_expected" != blocked ] || return 0
+    else
+      return "$gate_result"
+    fi
+    sleep 1
+  done
+  return 1
+}
 managed_bootstrap_check() {
   if jq -e "$4" "$3" >/dev/null 2>&1; then return 0; fi
   printf 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=%s check=%s artifact=%s\n' "$1" "$2" "${3##*/}" >&2
@@ -535,13 +562,15 @@ if [ "${managed_manual_proof-}" = direct-host ]; then
 fi
 jq -e '[.items[]|select(.kind=="Deployment")]|length==1 and .[0].metadata.name=="rhiza-operator"' "$logs/managed-install.json" >/dev/null
 jq -e '[.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select((.resources|index("rhizaclusters/status"))!=null and (.verbs|index("update"))!=null)]|length==1' "$logs/managed-install.json" >/dev/null
-# Withhold ONLY operator status-update until actual kubelet gate observations.
-jq '(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status"))|.verbs) -= ["update"]' "$logs/managed-install.json" > "$logs/managed-install-gated.json"
-jq -e 'all(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status")); (.verbs|index("update"))==null)' "$logs/managed-install-gated.json" >/dev/null
 if [ "${managed_manual_proof-}" = direct-host ]; then
+  jq '(.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")|.rules[]|select(.resources|index("rhizaclusters/status"))|.verbs) -= ["update"]' "$logs/managed-install.json" > "$logs/managed-install-gated.json"
   create_direct_overlay "$logs/managed-install-gated.json"
 else
-  k -n "$namespace" apply --validate=strict -f "$logs/managed-install-gated.json"
+  # The isolated Kind cluster blocks only this operator's status writes; RBAC remains intact.
+  managed_status_gate_objects > "$logs/test-bootstrap-status-gate.json"
+  k create --validate=strict -f "$logs/test-bootstrap-status-gate.json"
+  jq '.items |= map(select(.kind!="Deployment" or .metadata.name!="rhiza-operator"))' "$logs/managed-install.json" > "$logs/managed-install-pre-gate.json"
+  k -n "$namespace" apply --validate=strict -f "$logs/managed-install-pre-gate.json"
 fi
 k -n "$namespace" get deployments -o json > "$logs/before-cr-deployments.json"
 jq -e 'all(.items[]; .metadata.name!="" and .metadata.name!="sql" and (.metadata.labels["rhiza.mrchypark.dev/cluster-uid"] // "")=="")' "$logs/before-cr-deployments.json" >/dev/null
@@ -552,6 +581,8 @@ if [ "${managed_manual_proof-}" = direct-host ]; then
 else
   k -n "$namespace" apply --validate=strict -f "$logs/requested-cluster.json"
   uid=$(k -n "$namespace" get rhizacluster sql -o jsonpath='{.metadata.uid}')
+  managed_wait_status_gate blocked
+  k -n "$namespace" apply --validate=strict -f "$logs/managed-install.json"
 fi
 selector="rhiza.mrchypark.dev/cluster-uid=$uid"
 attempt=0
@@ -561,7 +592,9 @@ done
 if [ "${managed_manual_proof-}" = direct-host ]; then
   restore_direct_overlay_status "$logs/managed-install.json"
 else
-  jq '.items[]|select(.kind=="Role" and .metadata.name=="rhiza-operator")' "$logs/managed-install.json" | k -n "$namespace" apply --validate=strict -f -
+  k delete validatingadmissionpolicybinding rhiza-test-bootstrap-gate --wait=true
+  k delete validatingadmissionpolicy rhiza-test-bootstrap-gate --wait=true
+  managed_wait_status_gate open
 fi
 k -n "$namespace" get serviceaccounts,roles,rolebindings -o jsonpath='{range .items[*]}{.kind}{" "}{.metadata.name}{"\n"}{end}' > "$logs/public-rbac-names.txt"
 k -n "$namespace" wait --for=condition=Ready pod -l "$selector" --timeout=180s

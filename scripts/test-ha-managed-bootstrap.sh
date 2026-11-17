@@ -39,6 +39,7 @@ if [ "${1-}" = --install-mode-self-test ]; then
 fi
 cleanup_managed_private() {
   rm -f "$private/runtime.json" "$private/kubeconfig" "$private/curl.conf" "$private/request.body" "$private/admin.token" "$private/runtime-before.json" "$private/runtime-after.json" "$private/chaos-chart.yaml" "$private/chaos-render.jsonl" "$private/chaos-failure.json" "$private/gcs-emulator.json" "$private/managed-install.jsonl" "$private/functional-load.sh" "$private/functional-load-job.json" "$private/functional-stage" "$private/functional-probe.body" "$private/functional-readback.body" "$private/restart-capture.raw" "$private/restart-capture-pod.json" || return 1
+  rm -f "$private/status-gate-object.json" || return 1
   rmdir "$private"
 }
 managed_private_cleanup_self_test() (
