@@ -666,7 +666,7 @@ func managedCallError(operation string, err error) *ffiError {
 	}
 	code := result.Code
 	switch code {
-	case "internal", "commit_unknown", "kv_recovery_required", "kv_not_submitted", "sql_recovery_required", "sql_not_submitted", "timeout", "canceled", "invalid_request", "not_ready", "quorum_unavailable", "request_conflict", "durability_unavailable", "overloaded":
+	case "internal", "commit_unknown", "kv_recovery_required", "kv_not_submitted", "sql_recovery_required", "sql_not_submitted", "timeout", "canceled", "invalid_request", "not_ready", "quorum_unavailable", "request_conflict", "durability_unavailable", "overloaded", "graph_resource_limit", "read_version_mismatch":
 	default:
 		code = "unclassified"
 	}
@@ -725,6 +725,10 @@ func errorCode(err error) string {
 		return "canceled"
 	case errors.Is(err, rhiza.ErrInvalidRequest):
 		return "invalid_request"
+	case errors.Is(err, rhiza.ErrGraphResourceLimit):
+		return "graph_resource_limit"
+	case errors.Is(err, rhiza.ErrReadVersionMismatch):
+		return "read_version_mismatch"
 	case errors.Is(err, rhiza.ErrNotReady):
 		return "not_ready"
 	case errors.Is(err, rhiza.ErrQuorumUnavailable):

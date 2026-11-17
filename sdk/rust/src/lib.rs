@@ -522,13 +522,32 @@ impl Db {
         )
     }
     pub fn graph_query(&self, cypher: &str, args: Value) -> Result<QueryResult> {
+        self.call("graph_query", graph_query_wire(cypher, args, "local", None))
+    }
+    /// Requires the exact local graph slot used by this read snapshot.
+    pub fn graph_query_at(
+        &self,
+        cypher: &str,
+        args: Value,
+        require_applied_slot: u64,
+    ) -> Result<QueryResult> {
         self.call(
             "graph_query",
-            json!({"cypher":cypher,"args":args,"consistency":"local"}),
+            graph_query_wire(cypher, args, "local", Some(require_applied_slot)),
         )
     }
     pub fn graph_reachable(&self, request: GraphReachableRequest) -> Result<Value> {
         self.call("graph_reachable", serde_json::to_value(request).unwrap())
+    }
+    pub fn graph_reachable_directed(
+        &self,
+        request: GraphReachableRequest,
+        direction: GraphReachableDirection,
+    ) -> Result<Value> {
+        self.call(
+            "graph_reachable",
+            graph_reachable_request_value(request, direction)?,
+        )
     }
     pub fn request_status(&self, kind: &str, request_id: &str) -> Result<RequestStatus> {
         self.call(
@@ -614,7 +633,21 @@ impl ManagedDb {
     pub fn graph_query(&self, cypher: &str, args: Value, consistency: &str) -> Result<QueryResult> {
         self.call(
             "graph_query",
-            json!({"cypher":cypher,"args":args,"consistency":consistency}),
+            graph_query_wire(cypher, args, consistency, None),
+        )
+    }
+
+    /// Requires the exact local graph slot used by this read snapshot.
+    pub fn graph_query_at(
+        &self,
+        cypher: &str,
+        args: Value,
+        consistency: &str,
+        require_applied_slot: u64,
+    ) -> Result<QueryResult> {
+        self.call(
+            "graph_query",
+            graph_query_wire(cypher, args, consistency, Some(require_applied_slot)),
         )
     }
 
@@ -622,6 +655,17 @@ impl ManagedDb {
         self.call(
             "graph_reachable",
             serde_json::to_value(request).map_err(internal)?,
+        )
+    }
+
+    pub fn graph_reachable_directed(
+        &self,
+        request: GraphReachableRequest,
+        direction: GraphReachableDirection,
+    ) -> Result<Value> {
+        self.call(
+            "graph_reachable",
+            graph_reachable_request_value(request, direction)?,
         )
     }
 
@@ -1138,6 +1182,32 @@ pub struct GraphReachableRequest {
     pub require_applied_slot: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphReachableDirection {
+    #[default]
+    Outgoing,
+    Incoming,
+}
+
+fn graph_reachable_request_value(
+    request: GraphReachableRequest,
+    direction: GraphReachableDirection,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(request).map_err(internal)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| Error {
+            code: "internal".into(),
+            message: "Graph reachable request did not serialize as an object".into(),
+        })?
+        .insert(
+            "direction".into(),
+            serde_json::to_value(direction).map_err(internal)?,
+        );
+    Ok(value)
+}
+
 struct BufferGuard(RhizaBuffer);
 impl BufferGuard {
     unsafe fn bytes(&self) -> &[u8] {
@@ -1220,6 +1290,19 @@ fn managed_request_selector(kind: MutationKind, request_id: &[u8]) -> Value {
     json!({"kind":kind.wire(),"request_id_b64":STANDARD.encode(request_id)})
 }
 
+fn graph_query_wire(
+    cypher: &str,
+    args: Value,
+    consistency: &str,
+    require_applied_slot: Option<u64>,
+) -> Value {
+    let mut request = json!({"cypher":cypher,"args":args,"consistency":consistency});
+    if let Some(slot) = require_applied_slot {
+        request["require_applied_slot"] = json!(slot);
+    }
+    request
+}
+
 #[cfg(test)]
 mod managed_kv_wire_tests {
     use super::*;
@@ -1244,6 +1327,21 @@ mod managed_kv_wire_tests {
             &[u8],
         ) -> std::result::Result<ManagedRecoveryResult, ManagedMutationError> =
             ManagedDb::recover_request;
+    }
+
+    #[test]
+    fn graph_query_at_is_additive_and_pins_the_wire_slot() {
+        assert_eq!(
+            graph_query_wire("RETURN 1", json!({}), "local", None),
+            json!({"cypher":"RETURN 1","args":{},"consistency":"local"})
+        );
+        assert_eq!(
+            graph_query_wire("RETURN 1", json!({}), "linearizable", Some(7)),
+            json!({"cypher":"RETURN 1","args":{},"consistency":"linearizable","require_applied_slot":7})
+        );
+        let _: fn(&Db, &str, Value, u64) -> Result<QueryResult> = Db::graph_query_at;
+        let _: fn(&ManagedDb, &str, Value, &str, u64) -> Result<QueryResult> =
+            ManagedDb::graph_query_at;
     }
 
     #[test]
@@ -1484,6 +1582,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graph_reachable_direction_is_additive_and_typed() {
+        assert_eq!(
+            GraphReachableDirection::default(),
+            GraphReachableDirection::Outgoing
+        );
+        assert_eq!(
+            serde_json::to_value(GraphReachableDirection::Outgoing).unwrap(),
+            json!("outgoing")
+        );
+        assert_eq!(
+            serde_json::to_value(GraphReachableDirection::Incoming).unwrap(),
+            json!("incoming")
+        );
+
+        let request = GraphReachableRequest {
+            start_label: "Concept".into(),
+            start_property: "key".into(),
+            start_value: json!("child"),
+            edge_type: "REL".into(),
+            node_label: Some("Concept".into()),
+            node_filters: None,
+            result_property: "key".into(),
+            max_depth: 1,
+            max_results: 10,
+            max_scanned_edges: 10,
+            max_bytes: 1024,
+            require_applied_slot: None,
+        };
+        let legacy = serde_json::to_value(request.clone()).unwrap();
+        assert!(legacy.get("direction").is_none());
+
+        let directed =
+            graph_reachable_request_value(request, GraphReachableDirection::Incoming).unwrap();
+        assert_eq!(directed["direction"], "incoming");
+        let mut without_direction = directed;
+        without_direction
+            .as_object_mut()
+            .unwrap()
+            .remove("direction");
+        assert_eq!(without_direction, legacy);
+
+        let _: fn(
+            &Db,
+            GraphReachableRequest,
+            GraphReachableDirection,
+        ) -> std::result::Result<Value, Error> = Db::graph_reachable_directed;
+        let _: fn(
+            &ManagedDb,
+            GraphReachableRequest,
+            GraphReachableDirection,
+        ) -> std::result::Result<Value, Error> = ManagedDb::graph_reachable_directed;
+    }
+
+    #[test]
     fn managed_requests_match_managed_ffi_wire() {
         assert_eq!(ManagedOpenConfig::default().into_json(), json!({}));
         assert_eq!(
@@ -1648,6 +1800,23 @@ mod tests {
                 .rows
                 .len(),
             1
+        );
+        let exact = db
+            .graph_query("MATCH (n:Item) RETURN n.name", json!({}))
+            .unwrap()
+            .applied_slot
+            .unwrap();
+        assert_eq!(
+            db.graph_query_at("MATCH (n:Item) RETURN n.name", json!({}), exact)
+                .unwrap()
+                .applied_slot,
+            Some(exact)
+        );
+        assert_eq!(
+            db.graph_query_at("MATCH (n:Item) RETURN n.name", json!({}), exact - 1)
+                .unwrap_err()
+                .code,
+            "read_version_mismatch"
         );
         assert!(db
             .graph_query("MATCH (n:Item {name: 'missing'}) RETURN n.name", json!({}))

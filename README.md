@@ -256,25 +256,39 @@ Use `GraphQuery` or `POST /graph/query` for read-only `MATCH ... RETURN` and
 replicated mutations. Mutation statements are applied atomically with their
 request receipt and optional stream events.
 
+`GraphQueryRequest` accepts optional `RequireAppliedSlot`. The exact local
+applied slot is checked inside the query's read transaction before Cypher runs;
+a mismatch returns `ErrReadVersionMismatch`. Graph work, row, or byte limits
+return `ErrGraphResourceLimit` without a partial result.
+
 Graph reads and replicated mutations share a per-query execution-work ceiling
 of `MaxGraphQueryWork` (10,000,000), in addition to row and logical-byte limits.
 It does not bound parser CPU or wall-clock time. A mutation exceeding the budget
 rolls back and returns an error, not a rejected receipt; its committed slot
 cannot be skipped, and exact replay can fail again after reopen.
 
-The embedded `GraphReachable` API performs a bounded outgoing traversal on one
-immutable local graph snapshot. Callers must provide depth, result, scanned-edge,
-and encoded-byte limits. It reports `StartFound`, `AppliedSlot`, and
-`ConsensusTip`, supports an optional `RequireAppliedSlot` precondition, and
-orders results by distance then internal node ID. A limit failure returns
+The embedded `GraphReachable` API performs a bounded traversal on one immutable
+local graph snapshot. `Direction` selects `outgoing` or `incoming`; an empty
+value preserves outgoing traversal. Callers must provide depth, result,
+scanned-edge, and encoded-byte limits. It reports `StartFound`, `AppliedSlot`,
+and `ConsensusTip`, supports an optional `RequireAppliedSlot` precondition,
+and orders results by distance then internal node ID. A limit failure returns
 `ErrGraphResourceLimit` without partial nodes.
 
-The exported `MaxGraphReachable*` and `MaxGraphQueryWork` constants expose the
-library ceilings.
+`POST /graph/reachable` exposes the same request. `GET /graph/reachable` accepts
+the same JSON request body for transports that require GET; clients behind an
+intermediary that discards GET bodies should use POST.
 
-Declare lookup indexes with `Config.LocalGraphNodePropertyIndexes`. These
-indexes are node-local derived state: they are not replicated, and Rhiza
-reconciles them when the node opens or installs a checkpoint.
+The exported `GraphReachableDirectionOutgoing`,
+`GraphReachableDirectionIncoming`, `MaxGraphReachable*`, and
+`MaxGraphQueryWork` constants expose the public direction values and library
+ceilings.
+
+Declare lookup indexes with `Config.LocalGraphNodePropertyIndexes` on voters and
+`ReplicaConfig.LocalGraphNodePropertyIndexes` on read replicas and learners.
+These indexes are node-local derived state: they are not replicated, and Rhiza
+reconciles them when the node or replica opens or installs a checkpoint. Index
+labels and properties must be non-empty valid UTF-8.
 
 The dependency owns the complete language contract. See the version-pinned
 [`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.13.0/docs/engine_conformance.md#supported-cypher-subset)

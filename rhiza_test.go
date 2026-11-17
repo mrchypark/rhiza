@@ -97,6 +97,7 @@ func TestPeerLearnerUsesVoterWithoutJoiningQuorum(t *testing.T) {
 	ctx := context.Background()
 	peerAddr := freeUDPAddr(t)
 	storeDir := t.TempDir()
+	graphIndex := rhiza.GraphNodePropertyIndex{Label: "Concept", Property: "key"}
 	members := []rhiza.Member{{ID: "n1", PeerURL: "quic://" + peerAddr, PublicKey: rhiza.PeerPublicKey("learner", "n1", "voter-token")}}
 	voter, err := rhiza.Open(ctx, rhiza.Config{
 		ClusterID: "learner", NodeID: "n1", DataDir: t.TempDir(), PeerAddr: peerAddr,
@@ -111,9 +112,42 @@ func TestPeerLearnerUsesVoterWithoutJoiningQuorum(t *testing.T) {
 	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY)"}); err != nil {
 		t.Fatal(err)
 	}
+	for i, cypher := range []string{
+		"CREATE (:Concept {key: 'a', workspace: 'w'})",
+		"CREATE (:Concept {key: 'b', workspace: 'w'})",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+	} {
+		if _, err := voter.GraphExecute(ctx, rhiza.GraphCommand{RequestID: fmt.Sprintf("graph-%d", i), Cypher: cypher}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// GraphReachable is the index oracle: Cypher queries may scan without an index.
+	reachableRequest := rhiza.GraphReachableRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+		NodeLabel: "Concept", NodeFilters: map[string]any{"workspace": "w"}, ResultProperty: "key",
+		MaxDepth: 1, MaxResults: 1, MaxScannedEdges: 1, MaxBytes: 128, Consistency: rhiza.ConsistencyLocal,
+	}
+	// The voter has no index, so only the learner configuration can supply it.
+	unconfigured, err := rhiza.OpenLearner(ctx, rhiza.ReplicaConfig{
+		ClusterID: "learner", ReplicaID: "learner-unindexed", DataDir: t.TempDir(), AdminToken: "learner-token",
+		Members: replicaMembers(t, "learner", members), ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, SyncInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unconfigured.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unconfigured.GraphReachable(ctx, reachableRequest); !errors.Is(err, rhiza.ErrInvalidRequest) || !strings.Contains(err.Error(), "node property index does not exist") {
+		t.Fatalf("unconfigured learner error=%v, want missing graph index", err)
+	}
+	if err := unconfigured.Close(); err != nil {
+		t.Fatal(err)
+	}
 	learner, err := rhiza.OpenLearner(ctx, rhiza.ReplicaConfig{
 		ClusterID: "learner", ReplicaID: "learner-1", DataDir: t.TempDir(), AdminToken: "learner-token",
 		Members: replicaMembers(t, "learner", members), ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, SyncInterval: time.Hour,
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{graphIndex},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +166,10 @@ func TestPeerLearnerUsesVoterWithoutJoiningQuorum(t *testing.T) {
 	rows, err := learner.Query(ctx, rhiza.QueryRequest{SQL: "SELECT id FROM items"})
 	if err != nil || len(rows.Rows) != 1 {
 		t.Fatalf("learner rows=%#v err=%v", rows.Rows, err)
+	}
+	reachable, err := learner.GraphReachable(ctx, reachableRequest)
+	if err != nil || !reachable.StartFound || len(reachable.Nodes) != 1 || reachable.Nodes[0].Value != "b" {
+		t.Fatalf("learner reachable=%#v err=%v", reachable, err)
 	}
 	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "insert-fallback", SQL: "INSERT INTO items VALUES (2)"}); err != nil {
 		t.Fatal(err)
@@ -236,6 +274,7 @@ func TestS3ReadReplicaE2E(t *testing.T) {
 func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	storeDir := t.TempDir()
+	graphIndex := rhiza.GraphNodePropertyIndex{Label: "Concept", Property: "key"}
 	voter, err := rhiza.Open(ctx, rhiza.Config{
 		ClusterID: "checkpoint-replica", NodeID: "n1", DataDir: t.TempDir(),
 		ObjStoreProvider: "filesystem", ObjStoreDir: storeDir,
@@ -250,6 +289,15 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1, 'checkpoint')"}); err != nil {
 		t.Fatal(err)
 	}
+	for i, cypher := range []string{
+		"CREATE (:Concept {key: 'a', workspace: 'w'})",
+		"CREATE (:Concept {key: 'b', workspace: 'w'})",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+	} {
+		if _, err := voter.GraphExecute(ctx, rhiza.GraphCommand{RequestID: fmt.Sprintf("graph-%d", i), Cypher: cypher}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := voter.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +305,7 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	replicaConfig := rhiza.ReplicaConfig{
 		ClusterID: "checkpoint-replica", ReplicaID: "read-1", DataDir: replicaDir,
 		Members: []rhiza.ReplicaMember{{ID: "n1"}}, ObjStoreProvider: "filesystem", ObjStoreDir: storeDir,
-		SyncInterval: time.Hour,
+		SyncInterval: time.Hour, LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{graphIndex},
 	}
 	replica, err := rhiza.OpenReadReplica(ctx, replicaConfig)
 	if err != nil {
@@ -267,6 +315,24 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "checkpoint" {
 		t.Fatalf("checkpoint replica rows=%#v err=%v status=%+v", rows.Rows, err, replica.Status())
 	}
+	assertIndexedGraph := func(prefix string, replica *rhiza.ReadReplica) {
+		t.Helper()
+		result, err := replica.GraphQuery(ctx, rhiza.GraphQueryRequest{
+			Cypher: "MATCH (n:Concept {key: 'a'}) RETURN n.workspace", Consistency: rhiza.ConsistencyLocal,
+		})
+		if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "w" {
+			t.Fatalf("%s graph rows=%#v err=%v", prefix, result.Rows, err)
+		}
+		reachable, err := replica.GraphReachable(ctx, rhiza.GraphReachableRequest{
+			StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+			NodeLabel: "Concept", ResultProperty: "key", MaxDepth: 1, MaxResults: 1,
+			MaxScannedEdges: 1, MaxBytes: 128, Consistency: rhiza.ConsistencyLocal,
+		})
+		if err != nil || !reachable.StartFound || len(reachable.Nodes) != 1 || reachable.Nodes[0].Value != "b" {
+			t.Fatalf("%s reachable=%#v err=%v", prefix, reachable, err)
+		}
+	}
+	assertIndexedGraph("checkpoint", replica)
 	if err := replica.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -283,6 +349,23 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(replicaDir, "latticedb")); err != nil {
 		t.Fatal(err)
 	}
+	// Removing only the replica policy must make the restored checkpoint fail.
+	unconfiguredConfig := replicaConfig
+	unconfiguredConfig.LocalGraphNodePropertyIndexes = nil
+	unconfigured, err := rhiza.OpenReadReplica(ctx, unconfiguredConfig)
+	if err != nil {
+		t.Fatalf("restore checkpoint without graph indexes: %v", err)
+	}
+	if _, err := unconfigured.GraphReachable(ctx, rhiza.GraphReachableRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+		NodeLabel: "Concept", ResultProperty: "key", MaxDepth: 1, MaxResults: 1,
+		MaxScannedEdges: 1, MaxBytes: 128, Consistency: rhiza.ConsistencyLocal,
+	}); !errors.Is(err, rhiza.ErrInvalidRequest) || !strings.Contains(err.Error(), "node property index does not exist") {
+		t.Fatalf("restored unconfigured replica error=%v, want missing graph index", err)
+	}
+	if err := unconfigured.Close(); err != nil {
+		t.Fatal(err)
+	}
 	replica, err = rhiza.OpenReadReplica(ctx, replicaConfig)
 	if err != nil {
 		t.Fatalf("restore materializer behind observer WAL: %v", err)
@@ -292,6 +375,7 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "checkpoint" {
 		t.Fatalf("re-restored checkpoint rows=%#v err=%v status=%+v", rows.Rows, err, replica.Status())
 	}
+	assertIndexedGraph("re-restored", replica)
 }
 
 func TestReadReplicaRejectsExistingStateWithoutIdentity(t *testing.T) {
@@ -328,6 +412,58 @@ func TestReadReplicaRejectsUnsupportedProviderOptionsBeforeCreatingState(t *test
 	entries, err := os.ReadDir(dataDir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("invalid provider config created replica state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestReadReplicaRejectsInvalidGraphIndexesBeforeCreatingState(t *testing.T) {
+	dataDir := t.TempDir()
+	replica, err := rhiza.OpenReadReplica(context.Background(), rhiza.ReplicaConfig{
+		ClusterID: "cluster", ReplicaID: "read-1", DataDir: dataDir,
+		Members:                       []rhiza.ReplicaMember{{ID: "n1"}},
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{{Property: "key"}},
+	})
+	if replica != nil || err == nil || !strings.Contains(err.Error(), "graph index label and property are required") {
+		t.Fatalf("replica=%v error=%v", replica, err)
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("invalid graph indexes created replica state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestReadReplicaRejectsInvalidUTF8GraphIndexesBeforeCreatingState(t *testing.T) {
+	dataDir := t.TempDir()
+	replica, openErr := rhiza.OpenReadReplica(context.Background(), rhiza.ReplicaConfig{
+		ClusterID: "cluster", ReplicaID: "read-1", DataDir: dataDir,
+		Members:          []rhiza.ReplicaMember{{ID: "n1"}},
+		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(),
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{{
+			Label: string([]byte{0xff}), Property: "key",
+		}},
+	})
+	if replica != nil || openErr == nil || !strings.Contains(openErr.Error(), "valid UTF-8") {
+		t.Fatalf("replica=%v error=%v", replica, openErr)
+	}
+	entries, readErr := os.ReadDir(dataDir)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("invalid UTF-8 graph indexes created replica state: entries=%v readErr=%v openErr=%v", entries, readErr, openErr)
+	}
+}
+
+func TestVoterRejectsInvalidUTF8GraphIndexesBeforeCreatingState(t *testing.T) {
+	dataDir := t.TempDir()
+	db, openErr := rhiza.Open(context.Background(), rhiza.Config{
+		NodeID: "n1", DataDir: dataDir,
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{{
+			Label: "Concept", Property: string([]byte{0xff}),
+		}},
+	})
+	if db != nil || openErr == nil || !strings.Contains(openErr.Error(), "valid UTF-8") {
+		t.Fatalf("db=%v error=%v", db, openErr)
+	}
+	entries, readErr := os.ReadDir(dataDir)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("invalid UTF-8 graph indexes created voter state: entries=%v readErr=%v openErr=%v", entries, readErr, openErr)
 	}
 }
 

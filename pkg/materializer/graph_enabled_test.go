@@ -1381,8 +1381,11 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	}
 	expression := strings.TrimSuffix(strings.Repeat("1 + ", 1200), " + ")
 	readQuery := `MATCH (n:WorkItem) WHERE n.value = ` + expression + ` RETURN n.id`
+	if _, err := m.GraphQuery(ctx, readQuery, nil); !errors.Is(err, ErrGraphResourceLimit) {
+		t.Fatalf("over-budget read error=%v, want Rhiza resource limit", err)
+	}
 	if _, err := m.GraphQuery(ctx, readQuery, nil); !errors.Is(err, latticedb.ErrResourceLimit) {
-		t.Fatalf("over-budget read error=%v, want resource limit", err)
+		t.Fatalf("over-budget read error=%v, want retained LatticeDB cause", err)
 	}
 	command := types.GraphCommand{
 		RequestID: "over-budget",
@@ -1416,8 +1419,11 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 		t.Fatalf("replay after reopen error=%v, want repeatable resource-limit failure", err)
 	}
 	const unchangedQuery = `MATCH (n:WorkItem {value: 0}) RETURN count(n) AS total`
+	if _, err := m.GraphQuery(ctx, unchangedQuery, nil); !errors.Is(err, ErrGraphResourceLimit) {
+		t.Fatalf("production-budget verification query error=%v, want Rhiza resource limit", err)
+	}
 	if _, err := m.GraphQuery(ctx, unchangedQuery, nil); !errors.Is(err, latticedb.ErrResourceLimit) {
-		t.Fatalf("production-budget verification query error=%v, want resource limit", err)
+		t.Fatalf("production-budget verification query error=%v, want retained LatticeDB cause", err)
 	}
 	boundedResult, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {id: 0}) RETURN n.value`, nil)
 	if err != nil || boundedResult.AppliedSlot != 1 || len(boundedResult.Rows) != 1 || boundedResult.Rows[0][0] != int64(0) {
@@ -1442,6 +1448,57 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	}
 	if records, _, err := m.GraphReadStream(ctx, "work-limit", 0, 10, 0); err != nil || len(records) != 0 {
 		t.Fatalf("stream after failed mutation records=%+v err=%v, want no publication", records, err)
+	}
+}
+
+func TestGraphQueryAtChecksExactSlotBeforeQuery(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "pinned-seed", Cypher: `CREATE (:Pinned {id: '1'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+
+	exact := uint64(1)
+	result, err := m.GraphQueryAt(ctx, `MATCH (n:Pinned) RETURN n.id`, nil, &exact)
+	if err != nil || result.AppliedSlot != exact || !reflect.DeepEqual(result.Rows, [][]any{{"1"}}) {
+		t.Fatalf("exact GraphQueryAt result=%+v error=%v", result, err)
+	}
+
+	stale := uint64(0)
+	result, err = m.GraphQueryAt(ctx, `THIS IS NOT VALID CYPHER`, nil, &stale)
+	if !errors.Is(err, ErrReadVersionMismatch) || result.AppliedSlot != exact {
+		t.Fatalf("stale GraphQueryAt result=%+v error=%v", result, err)
+	}
+}
+
+func TestGraphQueryEscapedResultLimitsAreResourceLimits(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	cell := strings.Repeat("\x01", MaxCellBytes)
+	if _, err := m.GraphQuery(ctx, `RETURN $value AS value`, map[string]any{"value": cell}); !errors.Is(err, ErrGraphResourceLimit) {
+		t.Fatalf("escaped cell error=%v, want ErrGraphResourceLimit", err)
+	} else if errors.Is(err, latticedb.ErrResourceLimit) {
+		t.Fatalf("escaped cell error=%v must not synthesize a LatticeDB cause", err)
+	}
+
+	aggregate := strings.Repeat("\x01", 100_000)
+	if _, err := m.GraphQuery(ctx, `UNWIND range(0, 35) AS i RETURN $value AS value`, map[string]any{"value": aggregate}); !errors.Is(err, ErrGraphResourceLimit) {
+		t.Fatalf("escaped aggregate error=%v, want ErrGraphResourceLimit", err)
+	} else if errors.Is(err, latticedb.ErrResourceLimit) {
+		t.Fatalf("escaped aggregate error=%v must not synthesize a LatticeDB cause", err)
 	}
 }
 
@@ -2138,5 +2195,30 @@ func TestGraphMethodsAfterCloseReturnError(t *testing.T) {
 	}
 	if _, err := m.graphRequestExists("closed"); err == nil {
 		t.Fatal("graphRequestExists succeeded after close")
+	}
+}
+
+func TestGraphReachableDirectionValidationPrecedesGraphAccess(t *testing.T) {
+	request := types.GraphReachableRequest{
+		StartLabel: "Item", StartProperty: "id", StartValue: "start", EdgeType: "REL", ResultProperty: "id",
+		MaxDepth: 1, MaxResults: 1, MaxScannedEdges: 1, MaxBytes: 128,
+	}
+	for _, direction := range []string{"", types.GraphReachableDirectionOutgoing, types.GraphReachableDirectionIncoming} {
+		request.Direction = direction
+		if err := ValidateGraphReachableRequest(request); err != nil {
+			t.Fatalf("direction %q: %v", direction, err)
+		}
+	}
+
+	m, err := Open(filepath.Join(t.TempDir(), "invalid-direction.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request.Direction = "INCOMING"
+	if _, err := m.GraphReachable(context.Background(), request); err == nil || !strings.Contains(err.Error(), "invalid graph reachability direction") {
+		t.Fatalf("invalid direction error=%v, want validation before graph access", err)
 	}
 }

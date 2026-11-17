@@ -70,6 +70,9 @@ type ReplicaConfig struct {
 	ObjStoreAzureStorageAccountKey string
 	ObjStoreAzureConnectionString  string
 	ObjStoreAzureUserAssignedID    string
+	// LocalGraphNodePropertyIndexes are node-local derived indexes. Rhiza
+	// reconciles them when the replica opens and after checkpoint restore.
+	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex
 }
 
 // ReplicaHistoryVerificationConfig opts a replica observer into verification
@@ -229,6 +232,9 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 	if config.DataDir == "" || config.ReplicaID == "" {
 		return nil, fmt.Errorf("replica ID and data directory are required")
 	}
+	if _, err := materializer.ValidateLocalGraphNodePropertyIndexes(config.LocalGraphNodePropertyIndexes); err != nil {
+		return nil, err
+	}
 	if err := sqlpolicy.CheckExisting(ctx, path.Join(config.DataDir, "sqlite.db")); err != nil {
 		return nil, err
 	}
@@ -332,6 +338,9 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 	r.material, err = materializer.Open(path.Join(config.DataDir, "sqlite.db"), 4)
 	if err != nil {
 		return nil, fmt.Errorf("open replica materializer: %w", err)
+	}
+	if err := r.material.ConfigureLocalGraphNodePropertyIndexes(config.LocalGraphNodePropertyIndexes); err != nil {
+		return nil, fmt.Errorf("configure replica graph indexes: %w", err)
 	}
 	r.bucket, err = objstore.NewBucket(bucketConfig)
 	if err != nil {

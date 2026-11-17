@@ -103,6 +103,11 @@ operations use `call`: `graph_stream_read`, `graph_stream_offset`,
 `set_graph_stream_offset`, and `trim_graph_stream`, with the corresponding
 [Go request fields](../../rhiza.go).
 
+`graph_reachable` keeps its existing request struct and method signature for
+source compatibility. Call `graph_reachable_directed(request,
+GraphReachableDirection::Incoming)` on either `Db` or `ManagedDb` to send the
+typed `direction:"incoming"` field.
+
 ## Recovery operator for embedded hosts
 
 An embedded host that runs the Rhiza recovery operator opens its generation

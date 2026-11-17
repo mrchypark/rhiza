@@ -15,6 +15,8 @@ fn existing_error_literals_and_exhaustive_destructuring_compile() {
     let _: fn(&ManagedDb, &ManagedExecuteRequest) -> Result<ExecuteReturningResult, Error> =
         ManagedDb::execute;
     let _: fn(&ManagedDb, &ManagedQueryRequest) -> Result<QueryResult, Error> = ManagedDb::query;
+    let _: fn(&ManagedDb, &str, serde_json::Value, &str, u64) -> Result<QueryResult, Error> =
+        ManagedDb::graph_query_at;
     let _: fn(&ManagedDb) -> Result<(), Error> = ManagedDb::recover_pending;
     let _: fn(&ManagedDb) -> Result<bool, Error> = ManagedDb::ready;
 }

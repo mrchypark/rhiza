@@ -16,7 +16,8 @@
 | SQL execute 계열 | `request_id` 필수; optional `sql`, `args`, `want_rows`, `require_one`, `statements`; statement=`sql`, optional `args`,`want_rows`,`expected_rows_affected`,`expected_returned_rows`,`output_refs`; ref=`arg_index`,`statement_index`, optional `column_name`,`column_index`. `statements`는 top-level SQL/args와 배타적이지 않음 | receipt + optional `statements`; result=`rows_affected`,`last_insert_id`,`columns`,`rows`. returning 계열은 **nonempty** statements만 거절; one은 incoming `require_one`도 false로 바꾸지 않음 |
 | SQL query | `sql` 필수, optional `args`,`consistency` | `columns`,`rows`,`applied_slot`,`consensus_tip` |
 | Graph execute | `request_id:string`, optional `cypher:string`,`args:map[string]any`,`events:[]GraphStreamEvent`,`stream_offset:*GraphStreamOffsetMutation`,`stream_trim:*GraphStreamTrimMutation`; 아래 Graph admission 규칙을 모두 만족 | receipt |
-| Graph query | `cypher` 필수, optional `args`,`consistency` | optional `columns`,`rows`,`error`,`applied_slot`,`consensus_tip` |
+| Graph query | `cypher` 필수, optional `args`,`consistency`,`require_applied_slot` | optional `columns`,`rows`,`error`,`applied_slot`,`consensus_tip` |
+| Graph reachable | POST 또는 GET JSON body: `start_label`,`start_property`,`start_value`,`edge_type`,`result_property`,`max_depth`,`max_results`,`max_scanned_edges`,`max_bytes`; optional `direction` (`outgoing` 기본 또는 `incoming`),`node_label`,`node_filters`,`consistency`,`require_applied_slot` | `nodes`,`start_found`,`scanned_edges`,`applied_slot`,`consensus_tip` |
 | Graph changes/read | optional `stream`,`after_sequence`,`limit`,`wait_ms`,`consistency`; changes는 stream을 `__lattice_changes`로 덮음. limit 0=100, max 1,000; wait max 30,000ms | `records` (`sequence`,`kind`,`payload`)[], `applied_slot`,`consensus_tip` |
 | Graph offset | `request_id` optional, `stream`,`consumer`, optional `sequence`,`consistency`; PUT은 mutation이므로 valid request_id 필요 | POST JSON=`sequence`,`found`,`applied_slot`,`consensus_tip`; PUT 204 |
 | Graph trim | `request_id`,`stream`,`through_sequence` | 204 |
@@ -54,6 +55,8 @@ SSE subscribe는 `http.Flusher`가 아니면 500 `streaming_unsupported`; write 
 |---|---:|---|
 | JSON/HTTP validation, unsupported consistency | 400 | `invalid_request` |
 | 동일 ID의 다른 intent | 409 | `request_conflict` |
+| exact applied slot 불일치 | 409 | `read_version_mismatch` |
+| graph row/work/byte budget 초과 | 400 | `graph_resource_limit` |
 | writable/readiness/local lifecycle/handler shutdown | 503 | `not_ready` |
 | mutation/read/queue capacity | 503 | `overloaded` |
 | unwrapped durability barrier | 503 | `durability_unavailable` |

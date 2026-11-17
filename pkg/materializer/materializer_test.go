@@ -53,6 +53,23 @@ func TestNormalizeSQLArgsAcceptsGoIntegers(t *testing.T) {
 	}
 }
 
+func TestValidateLocalGraphNodePropertyIndexesRejectsInvalidUTF8(t *testing.T) {
+	invalid := string([]byte{0xff})
+	for _, test := range []struct {
+		name  string
+		index types.GraphNodePropertyIndex
+	}{
+		{name: "label", index: types.GraphNodePropertyIndex{Label: invalid, Property: "key"}},
+		{name: "property", index: types.GraphNodePropertyIndex{Label: "Concept", Property: invalid}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ValidateLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{test.index}); err == nil || !strings.Contains(err.Error(), "valid UTF-8") {
+				t.Fatalf("error=%v, want invalid UTF-8 rejection", err)
+			}
+		})
+	}
+}
+
 func TestMaterializerCreatesKVExpiryIndex(t *testing.T) {
 	m, err := Open(t.TempDir()+"/index.db", 1)
 	if err != nil {

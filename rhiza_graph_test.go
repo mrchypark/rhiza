@@ -89,6 +89,113 @@ func TestEmbeddedGraphReachableContract(t *testing.T) {
 	}
 }
 
+func TestEmbeddedGraphReachableDirectionContract(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{
+		NodeID: "n1", DataDir: t.TempDir(),
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{{Label: "Concept", Property: "key"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i, cypher := range []string{
+		"CREATE (:Concept {key: 'a', workspace: 'w'})",
+		"CREATE (:Concept {key: 'b', workspace: 'w'})",
+		"CREATE (:Concept {key: 'c', workspace: 'w'})",
+		"CREATE (:Concept {key: 'blocked', workspace: 'blocked'})",
+		"CREATE (:Concept {key: 'hidden', workspace: 'w'})",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+		"MATCH (b:Concept {key: 'b'}), (c:Concept {key: 'c'}) CREATE (b)-[:REL]->(c)",
+		"MATCH (b:Concept {key: 'blocked'}), (a:Concept {key: 'a'}) CREATE (b)-[:REL]->(a)",
+		"MATCH (h:Concept {key: 'hidden'}), (b:Concept {key: 'blocked'}) CREATE (h)-[:REL]->(b)",
+	} {
+		if _, err := db.GraphExecute(ctx, rhiza.GraphCommand{RequestID: fmt.Sprintf("direction-%d", i), Cypher: cypher}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	outgoing := rhiza.GraphReachableRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+		NodeLabel: "Concept", NodeFilters: map[string]any{"workspace": "w"}, ResultProperty: "key",
+		MaxDepth: 4, MaxResults: 10, MaxScannedEdges: 10, MaxBytes: 1024, Consistency: rhiza.ConsistencyLocal,
+	}
+	wantOutgoing := []rhiza.GraphReachableNode{{Value: "b", Distance: 1}, {Value: "c", Distance: 2}}
+	defaultResult, err := db.GraphReachable(ctx, outgoing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(defaultResult.Nodes, wantOutgoing) || defaultResult.ScannedEdges != 3 {
+		t.Fatalf("default outgoing result=%#v", defaultResult)
+	}
+	outgoing.Direction = rhiza.GraphReachableDirectionOutgoing
+	explicitResult, err := db.GraphReachable(ctx, outgoing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(explicitResult, defaultResult) {
+		t.Fatalf("explicit outgoing result=%#v, default=%#v", explicitResult, defaultResult)
+	}
+
+	incoming := outgoing
+	incoming.Direction = rhiza.GraphReachableDirectionIncoming
+	incoming.StartValue = "c"
+	requirement := defaultResult.AppliedSlot
+	incoming.RequireAppliedSlot = &requirement
+	incomingResult, err := db.GraphReachable(ctx, incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIncoming := []rhiza.GraphReachableNode{{Value: "b", Distance: 1}, {Value: "a", Distance: 2}}
+	if !reflect.DeepEqual(incomingResult.Nodes, wantIncoming) || incomingResult.ScannedEdges != 4 {
+		t.Fatalf("incoming result=%#v", incomingResult)
+	}
+	t.Run("incoming max depth 1", func(t *testing.T) {
+		shallow := incoming
+		shallow.MaxDepth = 1
+		shallow.RequireAppliedSlot = nil
+		shallowResult, err := db.GraphReachable(ctx, shallow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantShallow := []rhiza.GraphReachableNode{{Value: "b", Distance: 1}}
+		if !reflect.DeepEqual(shallowResult.Nodes, wantShallow) || shallowResult.ScannedEdges != 1 {
+			t.Fatalf("incoming max depth 1 result=%#v", shallowResult)
+		}
+	})
+
+	staleRequirement := uint64(0)
+	incoming.RequireAppliedSlot = &staleRequirement
+	if _, err := db.GraphReachable(ctx, incoming); !errors.Is(err, rhiza.ErrReadVersionMismatch) {
+		t.Fatalf("incoming stale-slot error=%v, want ErrReadVersionMismatch", err)
+	}
+	incoming.RequireAppliedSlot = nil
+	invalid := incoming
+	invalid.Direction = "sideways"
+	if _, err := db.GraphReachable(ctx, invalid); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("invalid direction error=%v, want ErrInvalidRequest", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func(*rhiza.GraphReachableRequest)
+	}{
+		{name: "results", change: func(request *rhiza.GraphReachableRequest) { request.MaxResults = 1 }},
+		{name: "scanned edges", change: func(request *rhiza.GraphReachableRequest) { request.MaxScannedEdges = 1 }},
+		{name: "bytes", change: func(request *rhiza.GraphReachableRequest) { request.MaxBytes = 2 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limited := incoming
+			test.change(&limited)
+			result, err := db.GraphReachable(ctx, limited)
+			if !errors.Is(err, rhiza.ErrGraphResourceLimit) || len(result.Nodes) != 0 {
+				t.Fatalf("limit result=%#v error=%v", result, err)
+			}
+		})
+	}
+}
+
 func TestEmbeddedGraphGoAPI(t *testing.T) {
 	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
 	if err != nil {
