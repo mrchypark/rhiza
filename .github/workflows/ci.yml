@@ -53,7 +53,6 @@ jobs:
       - name: Reject unsupported legacy recovery before side effects
         run: |
           go test ./cmd/rhiza-operator -run '^TestPhase9InitializerRejectsLegacyAutomaticRecoveryBeforeKubernetes$' -count=1 -timeout=60s
-          go test ./pkg/operator -run '^TestPhase1ControllerRunUnavailable(BeforeSideEffects|WithNilConfiguration)$' -count=1 -timeout=60s
 
   membership-e2e:
     runs-on: ubuntu-24.04

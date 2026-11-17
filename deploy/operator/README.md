@@ -224,11 +224,11 @@ no new lease, epoch or live permissions. Preserve pending application state,
 UNKNOWN outcomes and live anchor/Transition validation. The current runtime
 does not yet implement or qualify this automatic-attempt policy.
 
-The legacy `Controller.Run` recovery engine remains unavailable. The old alpha1
-success-recovery CI and qualification-image publication paths are retired,
-not passed or carried forward as alpha2 evidence. Their Go protocol regressions
-and explicit no-side-effect rejection tests remain in CI. The current managed
-contract, provider and kubelet workflows run on pull requests and main.
+The legacy `Controller.Run` entry point has been removed, so the old alpha1
+success-recovery loop is not executable. The alpha1 success-recovery CI and
+qualification-image publication paths are retired, not passed or carried
+forward as alpha2 evidence. The current managed contract, provider and kubelet
+workflows run on pull requests and main.
 These examples are not a claim of complete disaster recovery qualification:
 Chaos Mesh, isolated-process physical fencing and live-cloud parity require
 separate evidence. Existing private HA code does not provide legacy API support.
@@ -279,5 +279,5 @@ exists for an exact UID and resourceVersion, but no running recovery controller
 invokes it. Safe claim release and trusted retention are not implemented in
 this path. Two-resource observations
 are not atomic, and a claim is bookkeeping, not permission to perform recovery.
-`Controller.Run` remains unavailable. CI seeds authority only as a test fixture;
-that seed is not a production genesis or recovery procedure.
+The legacy recovery loop is not exposed by `Controller`. CI seeds authority only
+as a test fixture; that seed is not a production genesis or recovery procedure.

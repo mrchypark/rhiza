@@ -12,7 +12,7 @@ Baseline: `ffd566387995f9d60a33402cdecb62fd293ddaee`. The discrepancies below we
 
 ## docs/operator-go-contracts-2026-10-30.md
 
-- Baseline line 1 called the appendix current, although it describes a [commit-scoped implementation](docs/operator-go-reverse-spec-2026-10-30.md#L3) and [current `Controller.Run`](pkg/operator/controller.go#L73) rejects legacy recovery. Labeled it as a historical snapshot, linked the current installation guide, and preserved the snapshot body.
+- Baseline line 1 called the appendix current, although it describes a [commit-scoped implementation](docs/operator-go-reverse-spec-2026-10-30.md#L3) and [the baseline `Controller.Run`](https://github.com/mrchypark/rhiza/blob/ffd566387995f9d60a33402cdecb62fd293ddaee/pkg/operator/controller.go#L73) rejected legacy recovery. The public method was later removed. Labeled the appendix as a historical snapshot, linked the current installation guide, and preserved its body.
 
 # Managed HA, operator and published-restore follow-up
 

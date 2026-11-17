@@ -23,7 +23,7 @@ type sessionAuthority struct {
 func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *testing.T) {
 	var unavailable atomic.Bool
 	id := testIdentity()
-	socket := filepath.Join(t.TempDir(), "session.sock")
+	socket := shortTestUnixSocketPath(t, "session.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestSessionInterruptedSuccessfulBodyIsTransient(t *testing.T) {
 }
 
 func TestSupervisorSocketRestartKeepsLiveListenerAndOtherFiles(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := shortTestUnixSocketPath(t, "control.sock")
 	live, err := listenSupervisor(path)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()
 	authority := &sessionAuthority{id: id}
 	s := &Supervisor{Authority: authority, Identity: id, bound: id, ticket: "private-ticket"}
-	socket := filepath.Join(t.TempDir(), "control.sock")
+	socket := shortTestUnixSocketPath(t, "control.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -171,4 +171,22 @@ func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	if receipt == nil || receipt.Request != request {
 		t.Fatal("matching drain not delivered")
 	}
+}
+
+func shortTestUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "rhiza-fencing-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove Unix socket directory: %v", err)
+		}
+	})
+	path := filepath.Join(dir, name)
+	if len(path) >= 104 {
+		t.Fatalf("Unix socket path is too long for Darwin: %d bytes", len(path))
+	}
+	return path
 }
