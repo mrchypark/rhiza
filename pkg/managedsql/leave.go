@@ -181,8 +181,9 @@ func (h *Host) resumeLeave(ctx context.Context, r operator.V1Alpha2RepairRecord)
 		if err != nil {
 			return err
 		}
-		r, _ = latest.Repair()
-		if r.PreparedHandoff == nil {
+		var ok bool
+		r, ok = latest.Repair()
+		if !ok || r.PreparedHandoff == nil {
 			return fmt.Errorf("leave handoff was not retained")
 		}
 	}
