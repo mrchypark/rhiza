@@ -757,6 +757,14 @@ impl ManagedDb {
     pub fn execute(&self, request: &ManagedExecuteRequest) -> Result<ExecuteReturningResult> {
         self.call("execute", serde_json::to_value(request).map_err(internal)?)
     }
+    /// Executes a managed SQL request while preserving `mutation_context` on
+    /// `commit_unknown` failures.
+    pub fn execute_detailed(
+        &self,
+        request: &ManagedExecuteRequest,
+    ) -> std::result::Result<ExecuteReturningResult, ManagedMutationError> {
+        self.call_detailed("execute", serde_json::to_value(request).map_err(internal)?)
+    }
     pub fn query(&self, request: &ManagedQueryRequest) -> Result<QueryResult> {
         self.call("query", serde_json::to_value(request).map_err(internal)?)
     }

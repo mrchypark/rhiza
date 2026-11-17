@@ -106,8 +106,9 @@ No migration or deployment is performed automatically by this change.
 
 ## Graph engine upgrade
 
-The new-cluster requirement also covers the upgrade from latticedb-go v0.7.0
-to v0.9.0. Export actual application nodes, relationships, and properties with
+The new-cluster requirement also covers major graph-engine upgrades (such as
+early `latticedb-go v0.7.0` to `v0.9.0+`, up through the current `v0.13.0`
+release). Export actual application nodes, relationships, and properties with
 the old compatible binary, then import them with new graph request IDs into
 the fresh cluster. Do not copy graph files, checkpoints, receipts, or replay
 old graph decision history, and do not mix graph engine versions among peers.

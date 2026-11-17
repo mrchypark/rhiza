@@ -2253,16 +2253,16 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusInternalServerError, "streaming_unsupported", "streaming unsupported")
 		return
 	}
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
 	ch, cancel, err := s.NotifySubscribe(topic)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
 	defer cancel()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 	keepalive := time.NewTicker(15 * time.Second)
