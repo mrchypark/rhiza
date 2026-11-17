@@ -187,12 +187,14 @@ const (
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
-	MaxHTTPBodyBytes              = network.MaxRequestBodyBytes
-	MaxGraphReachableDepth        = materializer.MaxGraphReachableDepth
-	MaxGraphReachableResults      = materializer.MaxReturningRows
-	MaxGraphReachableScannedEdges = materializer.MaxGraphReachableEdges
-	MaxGraphReachableBytes        = materializer.MaxResultBytes
-	MaxLocalGraphPropertyIndexes  = materializer.MaxGraphPropertyIndexes
+	MaxHTTPBodyBytes                = network.MaxRequestBodyBytes
+	MaxGraphReachableDepth          = materializer.MaxGraphReachableDepth
+	MaxGraphReachableResults        = materializer.MaxReturningRows
+	MaxGraphReachableScannedEdges   = materializer.MaxGraphReachableEdges
+	MaxGraphReachableBytes          = materializer.MaxResultBytes
+	MaxLocalGraphPropertyIndexes    = materializer.MaxGraphPropertyIndexes
+	GraphReachableDirectionOutgoing = types.GraphReachableDirectionOutgoing
+	GraphReachableDirectionIncoming = types.GraphReachableDirectionIncoming
 )
 
 var (
@@ -561,8 +563,9 @@ func (db *DB) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResul
 	return db.api.GraphQuery(ctx, req)
 }
 
-// GraphReachable performs a bounded, deterministic outgoing traversal on one
-// immutable local graph snapshot. Results are ordered by distance, then node ID.
+// GraphReachable performs a bounded, deterministic incoming or outgoing
+// traversal on one immutable local graph snapshot. Results are ordered by
+// distance, then node ID.
 func (db *DB) GraphReachable(ctx context.Context, req GraphReachableRequest) (GraphReachableResult, error) {
 	return db.api.GraphReachable(ctx, req)
 }

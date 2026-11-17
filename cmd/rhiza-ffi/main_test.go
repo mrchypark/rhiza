@@ -154,6 +154,18 @@ func TestGoEntryBasicPublicAPI(t *testing.T) {
 	if !bytes.Contains(graph, []byte("graph")) {
 		t.Fatalf("graph response: %s", graph)
 	}
+	staleQuery := []byte(`{"operation":"graph_query","request":{"cypher":"MATCH (n:Item) RETURN n.name","require_applied_slot":0}}`)
+	if code := responseErrorCode(t, goCall(h, staleQuery, 0)); code != "read_version_mismatch" {
+		t.Fatalf("stale graph query code=%q", code)
+	}
+	limitedQuery := []byte(`{"operation":"graph_query","request":{"cypher":"UNWIND range(0, 10000) AS n RETURN n"}}`)
+	if code := responseErrorCode(t, goCall(h, limitedQuery, 0)); code != "graph_resource_limit" {
+		t.Fatalf("limited graph query code=%q", code)
+	}
+	staleReachable := []byte(`{"operation":"graph_reachable","request":{"start_label":"Item","start_property":"name","start_value":"graph","edge_type":"REL","result_property":"name","max_depth":1,"max_results":1,"max_scanned_edges":1,"max_bytes":128,"require_applied_slot":0}}`)
+	if code := responseErrorCode(t, goCall(h, staleReachable, 0)); code != "read_version_mismatch" {
+		t.Fatalf("stale graph reachable code=%q", code)
+	}
 	ready := requireData(t, call(t, h, "ready", map[string]any{}))
 	if string(ready) != "true" {
 		t.Fatalf("ready: %s", ready)
@@ -610,6 +622,12 @@ func TestErrorJSONAndCommitUnknownPriority(t *testing.T) {
 	}
 	if code := errorCode(fmt.Errorf("%w while %w", rhiza.ErrCommitUnknown, context.Canceled)); code != "commit_unknown" {
 		t.Fatalf("commit unknown code=%q", code)
+	}
+	if code := errorCode(fmt.Errorf("graph: %w", rhiza.ErrGraphResourceLimit)); code != "graph_resource_limit" {
+		t.Fatalf("graph resource code=%q", code)
+	}
+	if code := errorCode(fmt.Errorf("graph: %w", rhiza.ErrReadVersionMismatch)); code != "read_version_mismatch" {
+		t.Fatalf("read version code=%q", code)
 	}
 }
 

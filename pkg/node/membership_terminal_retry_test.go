@@ -20,6 +20,15 @@ type terminalLossTransport struct {
 	attempts atomic.Int64
 }
 
+func (t *membershipOperationTransport) retainMembers(members []quepaxa.Member) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ids = t.ids[:0]
+	for _, member := range members {
+		t.ids = append(t.ids, member.ID)
+	}
+}
+
 func (t *terminalLossTransport) SendDecision(ctx context.Context, d quepaxa.Decision) error {
 	if t.cores["a"].CurrentCluster().ConfigID == 2 {
 		t.attempts.Add(1)
@@ -32,7 +41,11 @@ func (t *terminalLossTransport) SendDecision(ctx context.Context, d quepaxa.Deci
 
 func terminalRetryFixture(t *testing.T, admission func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error, configure ...func(*quepaxa.Config)) (*Node, *objectstore.MeteredBucket, *terminalLossTransport, map[quepaxa.NodeID]string) {
 	t.Helper()
-	ctx := context.Background()
+	return terminalRetryFixtureContext(t, context.Background(), admission, configure...)
+}
+
+func terminalRetryFixtureContext(t *testing.T, ctx context.Context, admission func(context.Context, quepaxa.Cluster, quepaxa.Slot, [32]byte) error, configure ...func(*quepaxa.Config)) (*Node, *objectstore.MeteredBucket, *terminalLossTransport, map[quepaxa.NodeID]string) {
+	t.Helper()
 	bucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)

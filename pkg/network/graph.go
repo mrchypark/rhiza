@@ -20,9 +20,10 @@ type GraphExecuteResponse struct {
 }
 
 type GraphQueryRequest struct {
-	Cypher      string         `json:"cypher"`
-	Args        map[string]any `json:"args,omitempty"`
-	Consistency string         `json:"consistency,omitempty"`
+	Cypher             string         `json:"cypher"`
+	Args               map[string]any `json:"args,omitempty"`
+	Consistency        string         `json:"consistency,omitempty"`
+	RequireAppliedSlot *uint64        `json:"require_applied_slot,omitempty"`
 }
 
 type GraphReachableRequest = types.GraphReachableRequest
@@ -281,12 +282,44 @@ func (s *Server) graphQuery(ctx context.Context, request GraphQueryRequest) (typ
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
 		return types.GraphCommandResult{}, fmt.Errorf("Graph query certified read barrier: %w", err)
 	}
-	result, err := s.material.GraphQuery(ctx, request.Cypher, request.Args)
-	if err != nil {
-		return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
+	result, err := s.material.GraphQueryAt(ctx, request.Cypher, request.Args, request.RequireAppliedSlot)
 	result.ConsensusTip = uint64(s.core.Tip())
+	if err != nil {
+		switch {
+		case errors.Is(err, materializer.ErrReadVersionMismatch):
+			return result, fmt.Errorf("%w: %w", ErrReadVersionMismatch, err)
+		case errors.Is(err, materializer.ErrGraphResourceLimit):
+			return result, fmt.Errorf("%w: %w", ErrGraphResourceLimit, err)
+		default:
+			return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	}
 	return result, nil
+}
+
+func (s *Server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodPost, http.MethodGet)
+		return
+	}
+	var request GraphReachableRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	release, err := s.acquireRead(r.Context(), false)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	result, err := s.graphReachable(r.Context(), request)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 func (s *Server) GraphReachable(ctx context.Context, request GraphReachableRequest) (GraphReachableResult, error) {
@@ -313,9 +346,9 @@ func (s *Server) graphReachable(ctx context.Context, request GraphReachableReque
 		}
 		switch {
 		case errors.Is(err, materializer.ErrGraphResourceLimit):
-			return GraphReachableResult{}, ErrGraphResourceLimit
+			return GraphReachableResult{}, fmt.Errorf("%w: %w", ErrGraphResourceLimit, err)
 		case errors.Is(err, materializer.ErrReadVersionMismatch):
-			return result, fmt.Errorf("%w: %v", ErrReadVersionMismatch, err)
+			return result, fmt.Errorf("%w: %w", ErrReadVersionMismatch, err)
 		default:
 			return GraphReachableResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}

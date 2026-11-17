@@ -567,6 +567,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/sql/query", s.handleQuery)
 	s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
 	s.mux.HandleFunc("/graph/query", s.handleGraphQuery)
+	s.mux.HandleFunc("/graph/reachable", s.handleGraphReachable)
 	s.mux.HandleFunc("/graph/changes", s.handleGraphChanges)
 	s.mux.HandleFunc("/graph/streams/read", s.handleGraphStreamRead)
 	s.mux.HandleFunc("/graph/streams/offset", s.handleGraphStreamOffset)
@@ -1736,6 +1737,12 @@ func writeAPIError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, errConsistency):
 		status = http.StatusBadRequest
 		code = "invalid_request"
+	case errors.Is(err, ErrGraphResourceLimit):
+		status = http.StatusBadRequest
+		code = "graph_resource_limit"
+	case errors.Is(err, ErrReadVersionMismatch):
+		status = http.StatusConflict
+		code = "read_version_mismatch"
 	case errors.Is(err, ErrRequestConflict):
 		status = http.StatusConflict
 		code = "request_conflict"

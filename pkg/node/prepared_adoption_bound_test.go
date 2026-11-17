@@ -23,8 +23,8 @@ import (
 // Reuse the real registered-membership fixture and actual learner admission.
 // No certificate, membership transition, or captured archive is manufactured.
 func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancelSetup()
 	var learner *quepaxa.Core
 	verifyLearner := func(ctx context.Context, target quepaxa.Cluster, through quepaxa.Slot, prefix [32]byte) error {
 		if learner == nil {
@@ -47,21 +47,27 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		}
 		return errors.New("target lacks exact registered learner")
 	}
-	n, bucket, transport, _ := terminalRetryFixture(t, verifyLearner)
+	n, bucket, transport, _ := terminalRetryFixtureContext(t, setupCtx, verifyLearner)
 	bootstrap := n.core.CurrentCluster()
 	archive, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, "adoption-bound", 1, types.ValidateManagedKVExecutionPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(archive.Close)
-	if err := archive.Load(ctx); err != nil {
+	if err := archive.Load(setupCtx); err != nil {
 		t.Fatal(err)
 	}
+	if err := setupCtx.Err(); err != nil {
+		t.Fatalf("fixture and archive setup exceeded its finite context: %v", err)
+	}
+	cancelSetup()
 	var lastView *recovery.ReadOnlyView
 	var lastMembership quepaxa.MembershipRecord
 	var lastWritten []byte
 	identity := recovery.PreparedStartupIdentity{ClusterUID: "cluster", Generation: 0, DeploymentUID: "deployment", PodUID: "pod", NodeID: "a", SourceBinding: strings.Repeat("1", 64), ConfigDigest: strings.Repeat("2", 64)}
 	for cycle := 1; cycle <= 8; cycle++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
 		member := registerMembershipLearner(t, bucket, quepaxa.NodeID(fmt.Sprintf("rhiza-n-%064d", cycle)))
 		wal, err := qlog.Open(t.TempDir())
 		if err != nil {
@@ -107,6 +113,8 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		if err := n.core.FinishReconfiguration(ctx); err != nil {
 			t.Fatal("actual REMOVE terminal", err)
 		}
+		// Removed learners must not absorb later decisions after their terminal.
+		transport.retainMembers(n.core.CurrentCluster().Members)
 		if err := archive.SyncThrough(ctx, n.core, n.core.Tip()); err != nil {
 			t.Fatal(err)
 		}
@@ -153,8 +161,14 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 				t.Fatal("reader changed adoption bytes", err)
 			}
 		})
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("cycle %d exceeded its finite context: %v", cycle, err)
+		}
+		cancel()
 	}
 	t.Run("reader-boundary-preserves-certified-record", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
 		if len(lastWritten) == 0 || len(lastWritten) > managedPreparedAdoptionMaxBytes {
 			t.Fatal("actual certified fixture does not fit shared metadata budget")
 		}
@@ -179,8 +193,13 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 		if after, err := os.ReadFile(name); err != nil || !bytes.Equal(after, oversize) {
 			t.Fatal("reader changed rejected record", err)
 		}
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("reader boundary exceeded its finite context: %v", err)
+		}
 	})
 	t.Run("oversize-rejected-before-publication", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
 		// Keep the actual certificates intact; only the untrusted identity
 		// envelope is oversized. This is not claimed to be valid startup identity.
 		oversize := identity
@@ -193,6 +212,9 @@ func TestPreparedAdoptionCertifiedMembershipRoundTripBound(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(dir, file)); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("oversize writer created %s: %v", file, err)
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("oversize publication validation exceeded its finite context: %v", err)
 		}
 	})
 }

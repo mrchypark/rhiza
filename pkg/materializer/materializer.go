@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -245,6 +246,9 @@ func ValidateLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyInde
 	for _, index := range indexes {
 		if index.Label == "" || index.Property == "" {
 			return nil, fmt.Errorf("graph index label and property are required")
+		}
+		if !utf8.ValidString(index.Label) || !utf8.ValidString(index.Property) {
+			return nil, fmt.Errorf("graph index label and property must be valid UTF-8")
 		}
 		if _, ok := seen[index]; ok {
 			continue

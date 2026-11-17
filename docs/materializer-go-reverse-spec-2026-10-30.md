@@ -155,6 +155,14 @@ Graph query returns deterministic `Columns`, ordered `Rows`, `AppliedSlot`, and
 rejection, but infrastructure/unknown errors remain retryable without receipt.
 Graph read snapshots wait for a writer or context cancellation and are bounded
 by the 10,000-row, 16 MiB result, and 10,000,000-work limits.
+An optional exact `RequireAppliedSlot` is checked against the same immutable
+read snapshot before Cypher execution. A mismatch returns
+`ErrReadVersionMismatch`; row, byte, or work exhaustion returns
+`ErrGraphResourceLimit`. Limits reported by the LatticeDB query engine retain
+their `ErrResourceLimit` cause in the error chain. Rhiza's own post-query
+encoded-cell and aggregate-byte checks return `ErrGraphResourceLimit` without a
+LatticeDB cause because the engine did not report that failure. Neither failure
+returns query rows.
 
 Events append per-stream monotonically increasing sequence records atomically
 with their Cypher mutation. `GraphReadStream(ctx, stream, after, limit, wait)`
@@ -168,12 +176,13 @@ existence, and applied slot. Trim atomically removes records through its
 inclusive sequence. Reserved `__lattice_` streams are forbidden for events but
 allowed for offset/trim. Stream and consumer names are valid UTF-8, 1..255 bytes.
 
-`GraphReachable` performs bounded outgoing traversal: it finds the one start
-node by label/property/value, never returns the start, returns matching nodes
-and expands them, and counts every fetched outgoing edge (including duplicates
-and rejected targets). The caller must provide nonzero bounded depth/results/
-scanned-edges/bytes not exceeding 64/10,000/1,000,000/16 MiB. Optional exact
-`RequireAppliedSlot` must equal local graph/SQL state; otherwise it fails.
+`GraphReachable` performs bounded incoming or outgoing traversal according to
+its optional direction (empty defaults to outgoing): it finds the one start node
+by label/property/value, never returns the start, returns matching nodes and
+expands them, and counts every fetched edge in that direction (including
+duplicates and rejected targets). The caller must provide nonzero bounded depth/
+results/scanned-edges/bytes not exceeding 64/10,000/1,000,000/16 MiB. Optional
+exact `RequireAppliedSlot` must equal local graph/SQL state; otherwise it fails.
 
 ## Notification and receipt lifecycle
 

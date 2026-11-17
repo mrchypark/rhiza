@@ -984,6 +984,12 @@ func knownNonGraphValue(value []byte) (bool, error) {
 }
 
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {
+	return m.GraphQueryAt(ctx, cypher, args, nil)
+}
+
+// GraphQueryAt executes a graph query against one read snapshot and optionally
+// requires that snapshot to match an exact applied slot before querying.
+func (m *Materializer) GraphQueryAt(ctx context.Context, cypher string, args map[string]any, requireAppliedSlot *uint64) (types.GraphCommandResult, error) {
 	m.mu.RLock()
 	if len(cypher) == 0 || len(cypher) > MaxSQLBytes || len(args) > MaxSQLArgs {
 		m.mu.RUnlock()
@@ -1013,9 +1019,19 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	g.queryWG.Add(1)
 	m.mu.RUnlock()
 	defer g.queryWG.Done()
+	if requireAppliedSlot != nil && *requireAppliedSlot != appliedSlot {
+		mismatch := fmt.Errorf("%w: required %d, got %d", ErrReadVersionMismatch, *requireAppliedSlot, appliedSlot)
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			return types.GraphCommandResult{AppliedSlot: appliedSlot}, errors.Join(mismatch, rollbackErr)
+		}
+		return types.GraphCommandResult{AppliedSlot: appliedSlot}, mismatch
+	}
 	result, err := tx.QueryContext(ctx, cypher, converted, graphQueryOptions())
 	rollbackErr := tx.Rollback()
 	if err != nil {
+		if errors.Is(err, latticedb.ErrResourceLimit) {
+			return types.GraphCommandResult{AppliedSlot: appliedSlot}, fmt.Errorf("%w: %w", ErrGraphResourceLimit, err)
+		}
 		return types.GraphCommandResult{}, err
 	}
 	if rollbackErr != nil {
@@ -1031,6 +1047,11 @@ func graphQueryOptions() latticedb.QueryOptions {
 }
 
 func ValidateGraphReachableRequest(request types.GraphReachableRequest) error {
+	switch request.Direction {
+	case "", types.GraphReachableDirectionOutgoing, types.GraphReachableDirectionIncoming:
+	default:
+		return fmt.Errorf("invalid graph reachability direction %q", request.Direction)
+	}
 	if request.StartLabel == "" || request.StartProperty == "" || request.EdgeType == "" || request.ResultProperty == "" ||
 		request.MaxDepth == 0 || request.MaxDepth > MaxGraphReachableDepth || request.MaxResults == 0 || request.MaxResults > MaxReturningRows ||
 		request.MaxScannedEdges == 0 || request.MaxScannedEdges > MaxGraphReachableEdges || request.MaxBytes == 0 || request.MaxBytes > MaxResultBytes {
@@ -1093,6 +1114,7 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 	}
 	current := []uint64{starts[0]}
 	visited := map[uint64]struct{}{starts[0]: {}}
+	incoming := request.Direction == types.GraphReachableDirectionIncoming
 	encodedBytes := 2 // JSON array brackets.
 	for depth := uint32(1); depth <= request.MaxDepth && len(current) != 0; depth++ {
 		nextSet := make(map[uint64]struct{})
@@ -1101,7 +1123,12 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 				return types.GraphReachableResult{}, err
 			}
 			remaining := request.MaxScannedEdges - result.ScannedEdges
-			edges, err := tx.GetOutgoingEdgesByType(source, request.EdgeType, remaining+1)
+			var edges []latticedb.Edge
+			if incoming {
+				edges, err = tx.GetIncomingEdgesByType(source, request.EdgeType, remaining+1)
+			} else {
+				edges, err = tx.GetOutgoingEdgesByType(source, request.EdgeType, remaining+1)
+			}
 			if err != nil {
 				return types.GraphReachableResult{}, err
 			}
@@ -1115,11 +1142,15 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 						return types.GraphReachableResult{}, err
 					}
 				}
-				if _, ok := visited[edge.TargetID]; ok {
+				nextID := edge.TargetID
+				if incoming {
+					nextID = edge.SourceID
+				}
+				if _, ok := visited[nextID]; ok {
 					continue
 				}
-				visited[edge.TargetID] = struct{}{}
-				nextSet[edge.TargetID] = struct{}{}
+				visited[nextID] = struct{}{}
+				nextSet[nextID] = struct{}{}
 			}
 		}
 		next := make([]uint64, 0, len(nextSet))
@@ -1265,7 +1296,7 @@ func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult,
 	}
 	for _, source := range result.Rows {
 		if len(response.Rows) == MaxReturningRows {
-			return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d rows", MaxReturningRows)
+			return types.GraphCommandResult{}, fmt.Errorf("%w: graph result exceeds %d rows", ErrGraphResourceLimit, MaxReturningRows)
 		}
 		row := make([]any, len(result.Columns))
 		for i, column := range result.Columns {
@@ -1275,11 +1306,11 @@ func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult,
 				return types.GraphCommandResult{}, err
 			}
 			if encodedBytes > MaxCellBytes {
-				return types.GraphCommandResult{}, fmt.Errorf("graph result cell exceeds %d bytes", MaxCellBytes)
+				return types.GraphCommandResult{}, fmt.Errorf("%w: graph result cell exceeds %d bytes", ErrGraphResourceLimit, MaxCellBytes)
 			}
 			remaining -= encodedBytes
 			if remaining < 0 {
-				return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d bytes", MaxResultBytes)
+				return types.GraphCommandResult{}, fmt.Errorf("%w: graph result exceeds %d bytes", ErrGraphResourceLimit, MaxResultBytes)
 			}
 			row[i] = value
 		}

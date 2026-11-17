@@ -340,10 +340,8 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 	if err := validateReadAdmissionConfig(n.config); err != nil {
 		return err
 	}
-	if n.config.Local {
-		if _, err := materializer.ValidateLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
-			return err
-		}
+	if _, err := materializer.ValidateLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
+		return err
 	}
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")

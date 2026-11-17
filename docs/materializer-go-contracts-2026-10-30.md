@@ -69,8 +69,9 @@ GraphCommandResult {columns?:[]string, rows?:[][]any, error?:string,
 ```
 
 `GraphReachableRequest` is `{start_label,start_property,start_value,edge_type,
-node_label?,node_filters?,result_property,max_depth,max_results,
-max_scanned_edges,max_bytes,consistency?,require_applied_slot?}`. Its response
+direction?,node_label?,node_filters?,result_property,max_depth,max_results,
+max_scanned_edges,max_bytes,consistency?,require_applied_slot?}`. An empty
+`direction` means `outgoing`; `incoming` traverses edge sources. Its response
 is `{nodes:[{value,distance}],start_found,scanned_edges,applied_slot,
 consensus_tip}`. A `GraphNodePropertyIndex` is a label/property pair; at most
 64 are configured, and duplicates collapse while preserving first occurrence.
