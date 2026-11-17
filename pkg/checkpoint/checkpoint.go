@@ -1690,12 +1690,14 @@ func (m *Manager) garbageCollect(ctx context.Context, claim *PublisherClaim, ret
 	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
 }
 
+const maintenanceDeleteMargin = 5 * time.Second
+
 func (m *Manager) validateMaintenanceClaim(ctx context.Context, claim *PublisherClaim) error {
 	current, err := m.readPublisherClaim(ctx)
 	if err != nil {
 		return err
 	}
-	if claim == nil || current.Purpose != "maintenance" || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() {
+	if claim == nil || current.Purpose != "maintenance" || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().Add(maintenanceDeleteMargin).UnixMilli() {
 		return ErrPublisherFenced
 	}
 	return nil
