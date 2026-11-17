@@ -896,19 +896,29 @@ func (h *Host) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse
 	}
 }
 
-func (h *Host) executeAttempt(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error, bool) {
+func (h *Host) openNodeForWrite() (*node.Node, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if h.closed || h.node == nil {
+		return nil, false
+	}
+	return h.node, true
+}
+
+func (h *Host) executeAttempt(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error, bool) {
+	n, ok := h.openNodeForWrite()
+	if !ok {
 		return ExecuteResponse{}, &SQLNotSubmittedError{Stage: SQLStageAuthority, Cause: fmt.Errorf("SQL host closed")}, true
 	}
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {
 		return ExecuteResponse{}, err, false
 	}
-	response, err := h.node.ExecuteManagedSQL(ctx, req)
+	response, err := n.ExecuteManagedSQL(ctx, req)
 	p := applicationOriginal{kind: "sql", sql: req}
 	err = internalRequestOutcome(p, response.MutationReceipt, err)
+	h.mu.Lock()
 	h.rememberRequestOutcome(p, err, response.MutationReceipt)
+	h.mu.Unlock()
 	return response, err, true
 }
 
