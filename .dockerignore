@@ -1,5 +1,7 @@
 .git
 /rhiza
 *.db
+*.test
 
 /sdk/rust/target
+/sdk/rust/native
