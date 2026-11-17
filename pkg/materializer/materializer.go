@@ -2684,7 +2684,12 @@ func (m *Materializer) reader() (*sql.DB, error) {
 
 func (m *Materializer) queryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	m.mu.RLock()
-	reader := m.readers[0]
+	var reader *sql.DB
+	if len(m.readers) > 0 && m.readers[0] != nil {
+		reader = m.readers[0]
+	} else {
+		reader = m.db
+	}
 	m.mu.RUnlock()
 
 	return reader.QueryRowContext(ctx, query, args...)

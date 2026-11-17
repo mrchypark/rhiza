@@ -537,7 +537,10 @@ impl Db {
         )
     }
     pub fn graph_reachable(&self, request: GraphReachableRequest) -> Result<Value> {
-        self.call("graph_reachable", serde_json::to_value(request).unwrap())
+        self.call(
+            "graph_reachable",
+            serde_json::to_value(request).map_err(internal)?,
+        )
     }
     pub fn graph_reachable_directed(
         &self,
