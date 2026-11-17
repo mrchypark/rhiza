@@ -43,6 +43,10 @@ managed_initial_ack_oracle() {
   fi
 }
 
+managed_greenfield_access_oracle() {
+  jq -e --arg sa "$2" --arg namespace "$3" 'any(.items[]; .kind=="ServiceAccount" and .metadata.name==$sa and .metadata.ownerReferences==null) and any(.items[]; .kind=="Role" and .metadata.name==$sa and any(.rules[]; .resources==["rhizaclusters/status"] and .resourceNames==["sql"] and (.verbs|index("update"))!=null)) and any(.items[]; .kind=="RoleBinding" and .metadata.name==($sa+"-binding") and .roleRef.name==$sa and .subjects==[{"kind":"ServiceAccount","name":$sa,"namespace":$namespace}]) and all(.items[]; .metadata.name!="rhiza-managed-host")' "$1" >/dev/null
+}
+
 # Keep only fixed-shape restart evidence after checking the exact Pod UID.
 managed_capture_restart_failure() {
   capture_pod=$1 capture_uid=$2
@@ -94,7 +98,7 @@ managed_wait_restart_ready() {
 managed_initial_oracle_self_test() (
   set -eu
   oracle_dir=$(mktemp -d)
-  trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/error" "$oracle_dir/restart-capture.raw" "$oracle_dir/restart-capture-pod.json" "$oracle_dir/restart-contract-diagnostic.txt" "$oracle_dir/restarted-pod.json"; rmdir "$oracle_dir"' EXIT HUP INT TERM
+  trap 'rm -f "$oracle_dir/ack.json" "$oracle_dir/query.json" "$oracle_dir/pods.json" "$oracle_dir/access.json" "$oracle_dir/error" "$oracle_dir/restart-capture.raw" "$oracle_dir/restart-capture-pod.json" "$oracle_dir/restart-contract-diagnostic.txt" "$oracle_dir/restarted-pod.json"; rmdir "$oracle_dir"' EXIT HUP INT TERM
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"rows_affected":1}' > "$oracle_dir/ack.json"
   managed_initial_ack_oracle "$oracle_dir/ack.json" insert_ack || exit 1
   printf '%s\n' '{"status":"committed","slot":7,"retry_through_slot":99,"applied":false}' > "$oracle_dir/ack.json"
@@ -114,6 +118,10 @@ managed_initial_oracle_self_test() (
   printf '%s\n' '{"items":[{"status":{"containerStatuses":[{"restartCount":1}]}}]}' > "$oracle_dir/pods.json"
   if managed_bootstrap_check initial restart_zero "$oracle_dir/pods.json" 'all(.items[]; all(.status.containerStatuses[]; .restartCount==0))' 2> "$oracle_dir/error"; then exit 1; fi
   grep -Fx 'MANAGED_BOOTSTRAP_ORACLE_FAILURE phase=initial check=restart_zero artifact=pods.json' "$oracle_dir/error" || exit 1
+  printf '%s\n' '{"items":[{"kind":"ServiceAccount","metadata":{"name":"sa"}},{"kind":"Role","metadata":{"name":"sa"},"rules":[{"resources":["rhizaclusters/status"],"resourceNames":["sql"],"verbs":["get","update"]}]},{"kind":"RoleBinding","metadata":{"name":"sa-binding"},"roleRef":{"name":"sa"},"subjects":[{"kind":"ServiceAccount","name":"sa","namespace":"ns"}]}]}' > "$oracle_dir/access.json"
+  managed_greenfield_access_oracle "$oracle_dir/access.json" sa ns || exit 1
+  if managed_greenfield_access_oracle "$oracle_dir/access.json" sa wrong; then exit 1; fi
+  if managed_greenfield_access_oracle "$oracle_dir/access.json" wrong ns; then exit 1; fi
   private=$oracle_dir logs=$oracle_dir namespace=ns uid=cluster
   capture_mode=ok
   k() {
@@ -606,7 +614,7 @@ jq -e --arg sa "$expected_sa" '.items[0].spec.template.spec.serviceAccountName==
 k -n "$namespace" get pods -l "$selector" -o json > "$logs/greenfield-pods.json"
 jq -e --arg sa "$expected_sa" '.items|length==3 and all(.[]; .spec.serviceAccountName==$sa and any(.status.conditions[]?; .type=="Ready" and .status=="True"))' "$logs/greenfield-pods.json" >/dev/null
 k -n "$namespace" get serviceaccount,role,rolebinding -o json > "$logs/greenfield-access.json"
-jq -e --arg sa "$expected_sa" 'any(.items[]; .kind=="ServiceAccount" and .metadata.name==$sa and .metadata.ownerReferences==null) and any(.items[]; .kind=="Role" and .metadata.name==$sa and any(.rules[]; .resources==["rhizaclusters/status"] and .resourceNames==["sql"] and (.verbs|index("update"))!=null)) and any(.items[]; .kind=="RoleBinding" and .metadata.name==($sa+"-binding") and .roleRef.name==$sa and .subjects==[{"kind":"ServiceAccount","name":$sa,"namespace":$namespace}]) and all(.items[]; .metadata.name!="rhiza-managed-host")' "$logs/greenfield-access.json" >/dev/null
+managed_greenfield_access_oracle "$logs/greenfield-access.json" "$expected_sa" "$namespace"
 printf '%s\n' '{"serviceAccount":"'"$expected_sa"'","legacyServiceAccountAbsent":true,"pods":3}' > "$logs/greenfield-sa.json"
 jq -e '.status.bootstrapPlan.reconfiguration==true' "$logs/committed.json" >/dev/null
 jq -e --arg protocol "$fixture_protocol" --arg evidence "$fixture_evidence" '(.status.applicationInit.plan.applicationProtocol // "")==$protocol and .status.applicationInit.plan.evidenceFormat==$evidence and .status.bootstrapPlan.evidenceFormat==$evidence' "$logs/committed.json" >/dev/null
