@@ -1,8 +1,9 @@
 package materializer
 
 import (
-	"github.com/mrchypark/rhiza/internal/types"
 	"testing"
+
+	"github.com/mrchypark/rhiza/internal/types"
 )
 
 func TestReplicatedSQLRejectsTempAdmission(t *testing.T) {
@@ -47,6 +48,29 @@ func TestReplicatedSQLAllowsPersistentTempNames(t *testing.T) {
 	} {
 		if err := ValidateSQLCommand(types.SQLCommand{RequestID: "persistent", SQL: query}); err != nil {
 			t.Errorf("%s: %v", query, err)
+		}
+	}
+}
+
+func TestSingleSchemaMaintenanceSQL(t *testing.T) {
+	for _, tt := range []struct {
+		query string
+		want  bool
+	}{
+		{"INSERT INTO items VALUES ('DROP TABLE items')", false},
+		{"-- comment\nUPDATE items SET id = 1", false},
+		{"/* comment */ aLtEr TABLE items RENAME TO renamed", true},
+		{"-- comment\n\ufeffDROP TABLE items", true},
+		{"DROP TABLE \"semi;colon\"; /* trailing */", true},
+		{"DROP TABLE items; SELECT 1", false},
+		{"ALTER TABLE items ADD COLUMN id; DROP TABLE items", false},
+		{"DROP TABLE \"unterminated", false},
+		{"\"DROP\" TABLE items", false},
+		{"DROP INDEX items_idx", false},
+		{"", false},
+	} {
+		if got := singleSchemaMaintenanceSQL(tt.query); got != tt.want {
+			t.Errorf("singleSchemaMaintenanceSQL(%q) = %t, want %t", tt.query, got, tt.want)
 		}
 	}
 }

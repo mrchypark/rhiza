@@ -119,6 +119,12 @@ func validateReplicatedTempSQL(query string) error {
 }
 
 func singleSchemaMaintenanceSQL(query string) bool {
+	// Only ALTER and DROP need tokenization; an unknown prefix may hide a BOM.
+	switch firstSQLKeyword(query) {
+	case "", "ALTER", "DROP":
+	default:
+		return false
+	}
 	tokens, err := sqlPolicyTokens(query)
 	if err != nil || len(tokens) < 3 || !tokens[0].bare || !(strings.EqualFold(tokens[0].text, "ALTER") || strings.EqualFold(tokens[0].text, "DROP")) || !tokens[1].bare || !strings.EqualFold(tokens[1].text, "TABLE") {
 		return false
