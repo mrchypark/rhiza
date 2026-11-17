@@ -135,7 +135,9 @@ type Config struct {
 	ObjStoreDurability             ObjectStoreDurability
 	ObjStoreSyncInterval           time.Duration
 	ObjStoreBatchDelay             time.Duration
-	ObjStoreGCInterval             time.Duration
+	// ObjStoreGCInterval controls Local backup GC. Non-Local HA checkpoint and
+	// archive managers are append-only and perform no online GC.
+	ObjStoreGCInterval time.Duration
 	// ObjStoreGCGracePeriod delays collection of obsolete backup objects.
 	// In Local mode, zero selects 24 hours, including an explicit zero from
 	// RHIZA_OBJSTORE_GC_GRACE_PERIOD. Use a positive duration to shorten it.

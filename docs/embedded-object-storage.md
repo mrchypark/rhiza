@@ -127,9 +127,11 @@ to delete blocks shared with a protected root.
 creation. An inactive database with unchanged state skips creating a new
 periodic checkpoint. Bounded-WAL and `CheckpointTailBytes` triggers can create
 additional snapshots.
-`ObjStoreGCInterval` defaults to 1 hour and controls collection cadence, while
+`ObjStoreGCInterval` defaults to 1 hour and controls Local backup collection cadence, while
 `ObjStoreGCGracePeriod` supplies a minimum safety delay after reachability has
 been established. Age alone never proves an object is safe to delete.
+The non-Local shared checkpoint and archive managers are append-only and do not
+run online GC. Positive GC settings are accepted but do not reclaim HA objects.
 Zero `ObjStoreGCGracePeriod` selects 24 hours in Local mode, including an
 explicit environment value of zero. Environment configuration also defaults
 `RHIZA_OBJSTORE_GC_GRACE_PERIOD` to 24 hours. Tests request positive grace

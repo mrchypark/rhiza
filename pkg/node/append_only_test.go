@@ -29,10 +29,14 @@ func TestHAAppendOnlyNodeManagers(t *testing.T) {
 	if n.checkpoints == nil || n.archive == nil {
 		t.Fatal("HA managers missing")
 	}
+	deletes := n.bucket.Stats().Deletes
 	if err := n.checkpoints.GarbageCollectFrom(ctx, nil, 1, 1, 0); err == nil {
 		t.Fatal("node checkpoint manager allowed GC")
 	}
 	if err := n.archive.Cleanup(ctx, 0); err == nil {
 		t.Fatal("node archive allowed GC")
+	}
+	if got := n.bucket.Stats().Deletes; got != deletes {
+		t.Fatalf("append-only GC attempts deleted %d objects", got-deletes)
 	}
 }
