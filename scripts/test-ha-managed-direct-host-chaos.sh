@@ -120,19 +120,34 @@ report_unrecorded_cluster() {
   printf 'FAIL: %s live_uid=%s recorded_uid=%s; automatic CR/access deletion skipped\n' "$note" "$live_uid" "${recorded_uid:-missing}" > "$logs/residual-resources.txt"
   return 1
 }
+managed_cleanup_status_safe() {
+  jq -e '
+    (has("status") and (.status|type)=="object" and (.status|length)>0) and
+    (.status.authority|type)=="object" and
+    .status.authority.pendingWrite==false and
+    ((.status.authority.transition // null)==null) and
+    ((.status.authority.pendingRequest // null)==null) and
+    ((.status.replicaStep // null)==null) and
+    ((.status.replicaCheck // null)==null) and
+    (((.status.recoveryQueue // null)==null) or
+      ((.status.recoveryQueue|type)=="object" and (.status.recoveryQueue|length)==0)) and
+    ((.status.repair // null)==null or
+      ((.status.repair|type)=="object" and
+       (.status.repair.state=="Completed" or .status.repair.state=="Aborted") and
+       (.status.repair.completion|type)=="object")) and
+    ((.status|has("pendingWrite")|not) or .status.pendingWrite==false)
+  ' "$1" >/dev/null
+}
 force_release_test_owned_managed_finalizer() {
-  kind=$1 name=$2 created_uid=$3
+  kind=$1 name=$2 created_uid=$3 snapshot=$4
   [ "$kind" = RhizaCluster ] || return 0
-  [ -n "$created_uid" ] || return 1
-  if ! hn get rhizacluster "$name" -o json > "$private/test-owned-cluster.json" 2>"$private/test-owned-cluster.err"; then
-    grep -F NotFound "$private/test-owned-cluster.err" >/dev/null && return 0
-    return 1
-  fi
-  [ "$(jq -er '.metadata.uid' "$private/test-owned-cluster.json")" = "$created_uid" ] || return 1
-  [ "$(jq -er '.metadata.resourceVersion | select(type=="string" and length>0)' "$private/test-owned-cluster.json")" ] || return 1
-  [ "$(jq -er '.metadata.deletionTimestamp | select(type=="string" and length>0)' "$private/test-owned-cluster.json")" ] || return 1
-  jq -e --arg f rhiza.mrchypark.dev/managed-host-cleanup '((.metadata.finalizers // [])|index($f))!=null' "$private/test-owned-cluster.json" >/dev/null || return 1
-  finalizer_patch=$(jq -c --arg uid "$created_uid" --arg rv "$(jq -er .metadata.resourceVersion "$private/test-owned-cluster.json")" --arg f rhiza.mrchypark.dev/managed-host-cleanup '
+  [ -n "$created_uid" ] && [ -f "$snapshot" ] || return 1
+  [ "$(jq -er '.metadata.uid' "$snapshot")" = "$created_uid" ] || return 1
+  [ "$(jq -er '.metadata.resourceVersion | select(type=="string" and length>0)' "$snapshot")" ] || return 1
+  [ "$(jq -er '.metadata.deletionTimestamp | select(type=="string" and length>0)' "$snapshot")" ] || return 1
+  jq -e --arg f rhiza.mrchypark.dev/managed-host-cleanup '((.metadata.finalizers // [])|index($f))!=null' "$snapshot" >/dev/null || return 1
+  managed_cleanup_status_safe "$snapshot" || return 1
+  finalizer_patch=$(jq -c --arg uid "$created_uid" --arg rv "$(jq -er .metadata.resourceVersion "$snapshot")" --arg f rhiza.mrchypark.dev/managed-host-cleanup '
     (.metadata.deletionTimestamp | select(type=="string" and length>0)) as $deletion |
     (.metadata.finalizers | index($f)) as $i |
     if $i == null then error("cleanup finalizer absent") else
@@ -140,11 +155,12 @@ force_release_test_owned_managed_finalizer() {
       {op:"test",path:"/metadata/uid",value:$uid},
       {op:"test",path:"/metadata/resourceVersion",value:$rv},
       {op:"test",path:"/metadata/deletionTimestamp",value:$deletion},
+      {op:"test",path:"/status",value:.status},
       {op:"test",path:"/metadata/finalizers",value:.metadata.finalizers},
       {op:"test",path:"/metadata/finalizers/\($i)",value:$f},
       {op:"replace",path:"/metadata/finalizers",value:[.metadata.finalizers[]|select(.!=$f)]}
     ] end
-  ' "$private/test-owned-cluster.json") || return 1
+  ' "$snapshot") || return 1
   hn patch rhizacluster "$name" --type=json -p "$finalizer_patch"
 }
 delete_test_owned_managed_access() {
@@ -228,12 +244,17 @@ delete_direct_overlay() {
     if [ -z "$created_uid" ] || ! url=$(direct_overlay_path "$kind" "$name"); then delete_result=1; continue; fi
     jq -nc --arg uid "$created_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid},propagationPolicy:"Foreground"}' > "$private/overlay-delete.json" || return 1
     if [ "$kind" = RhizaCluster ]; then
+      if ! hn delete --raw "$url" -f "$private/overlay-delete.json"; then delete_result=1; continue; fi
+      if ! hn get rhizacluster "$name" -o json > "$private/test-owned-cluster.json"; then delete_result=1; continue; fi
+      [ "$(jq -er '.metadata.uid' "$private/test-owned-cluster.json")" = "$created_uid" ] || { delete_result=1; continue; }
+      managed_cleanup_status_safe "$private/test-owned-cluster.json" || { delete_result=1; continue; }
       if ! delete_test_owned_managed_access "$created_uid"; then delete_result=1; continue; fi
+      if ! hn get rhizacluster "$name" -o json > "$private/test-owned-cluster-after-access.json"; then delete_result=1; continue; fi
+      if [ "$(jq -S -c '{uid:.metadata.uid,rv:.metadata.resourceVersion,status:(.status // null)}' "$private/test-owned-cluster.json")" != "$(jq -S -c '{uid:.metadata.uid,rv:.metadata.resourceVersion,status:(.status // null)}' "$private/test-owned-cluster-after-access.json")" ]; then delete_result=1; continue; fi
+      if ! force_release_test_owned_managed_finalizer "$kind" "$name" "$created_uid" "$private/test-owned-cluster.json"; then delete_result=1; continue; fi
+    else
+      if ! hn delete --raw "$url" -f "$private/overlay-delete.json"; then delete_result=1; continue; fi
     fi
-    if ! hn delete --raw "$url" -f "$private/overlay-delete.json"; then delete_result=1; continue; fi
-    case "$kind" in
-      RhizaCluster) force_release_test_owned_managed_finalizer "$kind" "$name" "$created_uid" || { delete_result=1; continue; } ;;
-    esac
     case "$kind" in
       Deployment|RhizaCluster) hn wait --for=delete "$kind/$name" --timeout=45s || delete_result=1 ;;
     esac
@@ -294,7 +315,7 @@ cleanup() {
   if [ -n "$bucket_pid" ]; then kill "$bucket_pid" 2>/dev/null || :; wait "$bucket_pid" 2>/dev/null || :; kill -0 "$bucket_pid" 2>/dev/null && result=1 || :; fi
   rm -f "$private/runtime.json" "$private/admin.token" "$private/curl.conf" "$private/request.body" "$private/forward.log" "$private/port-forward.log" "$private/preflight-list.json" "$RUNNER_TEMP/ha-managed-direct-host-bucket-setup"
   rm -f "$private/managed-install.jsonl" "$private/managed-install-direct.json" "$private/direct-overlay.jsonl" "$private/residual-cluster.json" "$private/residual-cluster.err" "$private/overlay-create.json" "$private/direct-status-update.json" "$private/overlay-delete.json" || result=1
-  rm -f "$private/test-owned-cluster.json" "$private/test-owned-cluster.err" "$private/test-owned-sa.json" "$private/test-owned-role.json" "$private/test-owned-binding.json" "$private/test-owned-delete.json" "$private/test-owned-sa.err" "$private/test-owned-role.err" "$private/test-owned-binding.err" || result=1
+  rm -f "$private/test-owned-cluster.json" "$private/test-owned-cluster-after-access.json" "$private/test-owned-cluster.err" "$private/test-owned-sa.json" "$private/test-owned-role.json" "$private/test-owned-binding.json" "$private/test-owned-delete.json" "$private/test-owned-sa.err" "$private/test-owned-role.err" "$private/test-owned-binding.err" || result=1
   rmdir "$private" || result=1
   [ "$original_result" -eq 0 ] || result=$original_result
   printf '%s\n' "$result" > "$logs/driver.exit"

@@ -254,33 +254,135 @@ rules, roleRef, and subjects before each delete.
    order, after the independent runtime/work evidence is accepted.
 4. Remove only the cleanup finalizer. Preserve every other finalizer.
 
+Before deleting access or approving finalizer removal, require a non-empty
+status snapshot with no unresolved authority work. `status.repair` must be
+absent or a terminal `Completed`/`Aborted` record with its completion object;
+`Preparing`, `Closed`, unknown states, `pendingWrite`, a transition, a pending
+request, replica work, or a non-empty recovery queue are fail-closed.
+
+Run the following as one fail-fast shell transaction. The first GET is the only
+snapshot used to build the final patch, and its UID, resourceVersion,
+deletionTimestamp and raw status are all tested server-side:
+
+```sh
+set -eu
+: "${namespace:?}" "${cr:?}" "${uid:?}"
+kubectl get rhizacluster "$cr" -n "$namespace" -o json > /tmp/rhiza-cluster.json
+jq -e '
+  (has("status") and (.status|type)=="object" and (.status|length)>0) and
+  (.status.authority|type)=="object" and
+  .status.authority.pendingWrite==false and
+  ((.status.authority.transition // null)==null) and
+  ((.status.authority.pendingRequest // null)==null) and
+  ((.status.replicaStep // null)==null) and
+  ((.status.replicaCheck // null)==null) and
+  (((.status.recoveryQueue // null)==null) or
+    ((.status.recoveryQueue|type)=="object" and (.status.recoveryQueue|length)==0)) and
+  ((.status.repair // null)==null or
+    ((.status.repair|type)=="object" and
+     (.status.repair.state=="Completed" or .status.repair.state=="Aborted") and
+     (.status.repair.completion|type)=="object")) and
+  ((.status|has("pendingWrite")|not) or .status.pendingWrite==false)
+' /tmp/rhiza-cluster.json >/dev/null || { echo 'managed cleanup status is not safe; stop and require independent evidence' >&2; exit 1; }
+uid=$(jq -er '.metadata.uid' /tmp/rhiza-cluster.json)
+rv=$(jq -er '.metadata.resourceVersion' /tmp/rhiza-cluster.json)
+deletion=$(jq -er '.metadata.deletionTimestamp | select(type=="string" and length>0)' /tmp/rhiza-cluster.json)
+finalizers=$(jq -c '.metadata.finalizers' /tmp/rhiza-cluster.json)
+case "$finalizers" in *'"rhiza.mrchypark.dev/managed-host-cleanup"'*) ;; *) echo 'cleanup finalizer absent; stop' >&2; exit 1;; esac
+```
+
 Use the CR UID, not the current name alone, for the generated access names:
 
 ```sh
 sa="rhiza-managed-host-$(printf '%s\000%s\000%s' "$namespace" "$cr" "$uid" | sha256sum | cut -c1-16)"
 binding="$sa-binding"
-printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}' "$object_uid" \
-  | kubectl delete --raw "/apis/rbac.authorization.k8s.io/v1/namespaces/$namespace/rolebindings/$binding" -f -
+deployment="rhiza-$(printf '%s' "$uid" | sha256sum | cut -c1-20)-g0"
+cluster_name_label="$cr"
+if [ "${#cluster_name_label}" -gt 63 ]; then
+  cluster_name_label="sha256-$(printf '%s' "$cr" | sha256sum | cut -c1-16)"
+fi
+
+delete_owned_access() {
+  resource=$1 name=$2
+  case "$resource" in
+    rolebinding) kind=RoleBinding api_path="/apis/rbac.authorization.k8s.io/v1/namespaces/$namespace/rolebindings/$name" ;;
+    role) kind=Role api_path="/apis/rbac.authorization.k8s.io/v1/namespaces/$namespace/roles/$name" ;;
+    serviceaccount) kind=ServiceAccount api_path="/api/v1/namespaces/$namespace/serviceaccounts/$name" ;;
+    *) return 1 ;;
+  esac
+  if ! kubectl get "$resource/$name" -n "$namespace" -o json > /tmp/rhiza-access-object.json 2>/tmp/rhiza-access-get.err; then
+    if grep -F NotFound /tmp/rhiza-access-get.err >/dev/null; then
+      return 0
+    fi
+    cat /tmp/rhiza-access-get.err >&2
+    return 1
+  fi
+  object_uid=$(jq -er '.metadata.uid | select(type=="string" and length>0)' /tmp/rhiza-access-object.json)
+  jq -e --arg uid "$uid" --arg name "$name" --arg kind "$kind" --arg cluster_name "$cluster_name_label" \
+    --arg namespace "$namespace" --arg cr "$cr" --arg deployment "$deployment" --arg sa "$sa" '
+    .kind==$kind and .metadata.name==$name and .metadata.namespace==$namespace and
+    .metadata.labels["app.kubernetes.io/managed-by"]=="rhiza-operator" and
+    .metadata.labels["rhiza.mrchypark.dev/cluster-uid"]==$uid and
+    .metadata.labels["rhiza.mrchypark.dev/cluster-name"]==$cluster_name and
+    .metadata.labels["rhiza.mrchypark.dev/access-contract"]=="v1alpha2-host-v1" and
+    .metadata.labels["rhiza.mrchypark.dev/access-lifecycle"]=="retain-until-manual-cleanup" and
+    (.metadata.uid|type=="string" and length>0) and
+    if $kind=="Role" then
+      .rules==[
+        {apiGroups:["rhiza.mrchypark.dev"],resources:["rhizaclusters"],resourceNames:[$cr],verbs:["get"]},
+        {apiGroups:["rhiza.mrchypark.dev"],resources:["rhizaclusters/status"],resourceNames:[$cr],verbs:["get","update"]},
+        {apiGroups:[""],resources:["pods"],verbs:["get","list"]},
+        {apiGroups:["apps"],resources:["deployments"],resourceNames:[$deployment],verbs:["get"]},
+        {apiGroups:["apps"],resources:["replicasets"],verbs:["get"]}
+      ]
+    elif $kind=="RoleBinding" then
+      .roleRef=={apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$sa} and
+      .subjects==[{kind:"ServiceAccount",name:$sa,namespace:$namespace}]
+    else .kind=="ServiceAccount" end
+  ' /tmp/rhiza-access-object.json >/dev/null
+  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}' "$object_uid" \
+    | kubectl delete --raw "$api_path" -f -
+  if kubectl get "$resource/$name" -n "$namespace" -o json >/dev/null 2>/tmp/rhiza-access-after.err; then
+    echo "$kind $name is still present after UID-conditioned deletion" >&2
+    return 1
+  fi
+  if ! grep -F NotFound /tmp/rhiza-access-after.err >/dev/null; then
+    cat /tmp/rhiza-access-after.err >&2
+    return 1
+  fi
+}
+
+delete_owned_access rolebinding "$binding"
+delete_owned_access role "$sa"
+delete_owned_access serviceaccount "$sa"
 ```
 
-Repeat the raw conditional delete for the Role and ServiceAccount using their
-object UIDs. Finally, build a JSON Patch from one GET and submit it as one
-server-side operation. The `test` operations make UID, resourceVersion and the
-complete finalizer list preconditions of the same atomic patch:
+Do not substitute a name-only delete or a guessed `object_uid`: each function
+call obtains the object UID from the exact object GET. After access deletion,
+re-read the CR and require the exact same
+UID, resourceVersion and raw status as the initial snapshot. Any change stops
+the procedure before finalizer removal. The access objects remain revoked; do
+not restore or recreate them during this cleanup. Leave the CR/finalizer in
+place and report the changed snapshot for independent investigation.
 
 ```sh
-kubectl get rhizacluster "$cr" -n "$namespace" -o json \
-  | jq --arg uid "$uid" --arg f rhiza.mrchypark.dev/managed-host-cleanup \
+set -eu
+kubectl get rhizacluster "$cr" -n "$namespace" -o json > /tmp/rhiza-cluster-after-access.json
+jq -S -c '{uid:.metadata.uid,rv:.metadata.resourceVersion,status:(.status // null)}' /tmp/rhiza-cluster.json > /tmp/rhiza-identity-before
+jq -S -c '{uid:.metadata.uid,rv:.metadata.resourceVersion,status:(.status // null)}' /tmp/rhiza-cluster-after-access.json > /tmp/rhiza-identity-after
+cmp -s /tmp/rhiza-identity-before /tmp/rhiza-identity-after || { echo 'status/UID/RV changed after access deletion; retain finalizer' >&2; exit 1; }
+jq --arg uid "$uid" --arg rv "$rv" --arg deletion "$deletion" --arg f rhiza.mrchypark.dev/managed-host-cleanup \
       'if (.metadata.deletionTimestamp | type) != "string" then error("CR not deleting") else
       (.metadata.finalizers | index($f)) as $i |
       if $i == null then error("cleanup finalizer absent") else [
         {op:"test",path:"/metadata/uid",value:$uid},
-        {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
-        {op:"test",path:"/metadata/deletionTimestamp",value:.metadata.deletionTimestamp},
+        {op:"test",path:"/metadata/resourceVersion",value:$rv},
+        {op:"test",path:"/metadata/deletionTimestamp",value:$deletion},
+        {op:"test",path:"/status",value:.status},
         {op:"test",path:"/metadata/finalizers",value:.metadata.finalizers},
         {op:"test",path:"/metadata/finalizers/\($i)",value:$f},
         {op:"replace",path:"/metadata/finalizers",value:[.metadata.finalizers[]|select(.!=$f)]}
-      ] end end' > /tmp/rhiza-finalizer-patch.json
+      ] end end' /tmp/rhiza-cluster.json > /tmp/rhiza-finalizer-patch.json
 kubectl patch rhizacluster "$cr" -n "$namespace" \
   --type=json --patch-file /tmp/rhiza-finalizer-patch.json
 ```
@@ -288,8 +390,47 @@ kubectl patch rhizacluster "$cr" -n "$namespace" \
 The API server evaluates every `test` op before the replacement. A changed CR
 UID, resourceVersion, deletionTimestamp or finalizer list rejects the entire
 patch without changing the finalizer. An active CR cannot be approved by this
-command because the timestamp test fails. No client-side comparison is the
-approval boundary.
+command because the timestamp test fails. A status change after access deletion
+either fails the pre-patch comparison or the final server-side status/RV test.
+No client-side comparison alone is the approval boundary.
+
+If `status` is empty or not safe, the automatic procedure stops before access
+deletion. Do not treat empty status as safe. Only after independently verifying
+old process termination, recreation prevention and completion of outstanding
+work may an administrator record that evidence and perform a separate explicit
+manual completion using UID, resourceVersion, deletionTimestamp and finalizer
+tests. Because any status creation or mutation changes resourceVersion, that
+server-side RV precondition still prevents a status change between the reviewed
+snapshot and the manual patch.
+
+For that explicit empty/unsafe-status path, do not run the automatic access
+deletion sequence until the administrator has recorded the independent evidence.
+Then use the same `delete_owned_access` verification/deletion flow above and
+submit one CR GET patch with UID, resourceVersion,
+deletionTimestamp, finalizer-list and finalizer-value tests; omit a status test
+only because the field is absent. The RV test still rejects any status creation
+or other concurrent write. This is a metadata-only finalizer update; the CRD
+status CEL rules do not require creating a status field, so an absent status is
+not itself a reason for the API server to reject the explicit manual patch.
+
+```sh
+set -eu
+kubectl get rhizacluster "$cr" -n "$namespace" -o json > /tmp/rhiza-manual-cluster.json
+uid=$(jq -er '.metadata.uid' /tmp/rhiza-manual-cluster.json)
+rv=$(jq -er '.metadata.resourceVersion' /tmp/rhiza-manual-cluster.json)
+deletion=$(jq -er '.metadata.deletionTimestamp | select(type=="string" and length>0)' /tmp/rhiza-manual-cluster.json)
+jq --arg uid "$uid" --arg rv "$rv" --arg deletion "$deletion" --arg f rhiza.mrchypark.dev/managed-host-cleanup '
+  (.metadata.finalizers | index($f)) as $i |
+  if $i == null then error("cleanup finalizer absent") else [
+    {op:"test",path:"/metadata/uid",value:$uid},
+    {op:"test",path:"/metadata/resourceVersion",value:$rv},
+    {op:"test",path:"/metadata/deletionTimestamp",value:$deletion},
+    {op:"test",path:"/metadata/finalizers",value:.metadata.finalizers},
+    {op:"test",path:"/metadata/finalizers/\($i)",value:$f},
+    {op:"replace",path:"/metadata/finalizers",value:[.metadata.finalizers[]|select(.!=$f)]}
+  ] end' /tmp/rhiza-manual-cluster.json > /tmp/rhiza-manual-patch.json
+kubectl patch rhizacluster "$cr" -n "$namespace" --type=json --patch-file /tmp/rhiza-manual-patch.json
+```
 
 No annotation, ConfigMap, CR status field, or operator-generated token is an
 approval mechanism: those are forgeable or have confused-deputy semantics. The

@@ -373,7 +373,7 @@ export RHIZA_CONTRACT_LOG_DIR="$logs"
 export RHIZA_CONTRACT_COMPLETE_UID="$complete_uid" RHIZA_CONTRACT_RETAINED_UID="$retained_uid" RHIZA_CONTRACT_WAITING_UID="$waiting_uid"
 export RHIZA_CONTRACT_GENESIS_UID="$genesis_uid" RHIZA_CONTRACT_KUBECONFIG="$kubeconfig" RHIZA_CONTRACT_CONTEXT="$context"
 export RHIZA_CONTRACT_AUTHORITY_UID="$authority_uid"
-contract_pattern=${RHIZA_CONTRACT_TEST_PATTERN:-'^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair|ReplicaScale)APIServerContract$|^TestManagedHostAccessAPIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$'}
+contract_pattern=${RHIZA_CONTRACT_TEST_PATTERN:-'^TestV1Alpha2(Status|Authority|Lifecycle|Cancellation|Genesis|Initializer|Repair|ReplicaScale)APIServerContract$|^TestManagedHostAccessAPIServerContract$|^TestManagedHostFinalizerAPIServerContract$|^TestRepairIntegerBoundAPIServerContract$|^TestAuthorityV1Alpha2HistoricalUnknownRemainsReadOnly$|^TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile$|^TestGenesisRetiredProfilesRejectBeforeKubernetes$'}
 go test ./pkg/operator -run "$contract_pattern" -count=1 -timeout=60s
 reject genesis-receipt-remove 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":null}}'
 reject genesis-receipt-change 'genesis receipt cannot be removed or changed and requires authority' patch rhizacluster genesis-contract -n "$namespace" --subresource=status --type=merge -p '{"status":{"genesis":{"logicalID":"different"}}}'

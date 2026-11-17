@@ -4,13 +4,13 @@ set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 if [ "${1-}" = --overlay-self-test ]; then
   scratch=$(mktemp -d)
-  trap 'rm -f "$scratch"/overlay.json "$scratch"/direct-overlay-created.tsv "$scratch"/direct-cluster-create-attempted* "$scratch"/overlay-delete.json "$scratch"/source-cluster.json "$scratch"/source-*.json "$scratch"/test-owned-*.json "$scratch"/test-owned-*.err "$scratch"/residual-* "$scratch"/finalizer-patch.json "$scratch"/access-delete-order.txt; rmdir "$scratch"' EXIT HUP INT TERM
+  trap 'rm -f "$scratch"/overlay.json "$scratch"/direct-overlay-created.tsv "$scratch"/direct-cluster-create-attempted* "$scratch"/overlay-delete.json "$scratch"/source-cluster.json "$scratch"/source-*.json "$scratch"/status-*.json "$scratch"/test-owned-*.json "$scratch"/test-owned-*.err "$scratch"/residual-* "$scratch"/readme-deletes.txt "$scratch"/finalizer-patch.json "$scratch"/access-delete-order.txt; rmdir "$scratch"' EXIT HUP INT TERM
   private=$scratch logs=$scratch namespace=test-ns
   release=test-release
   attempt_id=current-attempt
   cluster_create_attempt="$scratch/direct-cluster-create-attempted.$attempt_id"
   direct=scripts/test-ha-managed-direct-host-chaos.sh
-  for helper in project_direct_overlay direct_overlay_path delete_direct_overlay create_direct_cluster report_unrecorded_cluster force_release_test_owned_managed_finalizer delete_test_owned_managed_access; do
+  for helper in project_direct_overlay direct_overlay_path delete_direct_overlay create_direct_cluster report_unrecorded_cluster managed_cleanup_status_safe force_release_test_owned_managed_finalizer delete_test_owned_managed_access; do
     definition=$(sed -n "/^$helper() {/,/^}/p" "$direct")
     [ -n "$definition" ]
     eval "$definition"
@@ -31,7 +31,26 @@ if [ "${1-}" = --overlay-self-test ]; then
   printf 'Role\tunowned\tother-uid\n' > "$scratch/direct-overlay-created.tsv"
   if delete_direct_overlay; then exit 1; fi
   [ "$calls" = 1 ]
-  jq -n '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql",namespace:"test-ns",uid:"owned",resourceVersion:"7",deletionTimestamp:"2026-11-17T00:00:00Z",finalizers:["example.invalid/keep","rhiza.mrchypark.dev/managed-host-cleanup"]}}' > "$scratch/source-cluster.json"
+  jq -n '{apiVersion:"rhiza.mrchypark.dev/v1alpha2",kind:"RhizaCluster",metadata:{name:"sql",namespace:"test-ns",uid:"owned-uid",resourceVersion:"7",deletionTimestamp:"2026-11-17T00:00:00Z",finalizers:["example.invalid/keep","rhiza.mrchypark.dev/managed-host-cleanup"]},status:{authority:{pendingWrite:false},repair:{state:"Completed",completion:{kind:"Terminal"}}}}' > "$scratch/source-cluster.json"
+  managed_cleanup_status_safe "$scratch/source-cluster.json"
+  jq '.status.repair={state:"Aborted",completion:{kind:"Abort"}}' "$scratch/source-cluster.json" > "$scratch/status-aborted.json"
+  managed_cleanup_status_safe "$scratch/status-aborted.json"
+  jq 'del(.status.repair)' "$scratch/source-cluster.json" > "$scratch/status-no-repair.json"
+  managed_cleanup_status_safe "$scratch/status-no-repair.json"
+  for expression in \
+    '.status={}' \
+    '.status.authority.pendingWrite=true' \
+    '.status.authority.transition={}' \
+    '.status.authority.pendingRequest={}' \
+    '.status.replicaStep={}' \
+    '.status.recoveryQueue={entries:[1]}' \
+    '.status.repair.state="Preparing"' \
+    '.status.repair.state="Closed"' \
+    '.status.repair.state="unknown"' \
+    '.status.repair.completion=null'; do
+    jq -c "$expression" "$scratch/source-cluster.json" > "$scratch/status-case.json"
+    if managed_cleanup_status_safe "$scratch/status-case.json"; then exit 1; fi
+  done
   patches=0
   hn() {
     case "$1 $2 $3" in
@@ -44,21 +63,24 @@ if [ "${1-}" = --overlay-self-test ]; then
       *) return 1 ;;
     esac
   }
-  force_release_test_owned_managed_finalizer RhizaCluster sql owned
+  force_release_test_owned_managed_finalizer RhizaCluster sql owned-uid "$scratch/source-cluster.json"
   [ "$patches" = 1 ]
   jq -e '
-    length==6 and
-    .[0]=={op:"test",path:"/metadata/uid",value:"owned"} and
+    length==7 and
+    .[0]=={op:"test",path:"/metadata/uid",value:"owned-uid"} and
     .[1]=={op:"test",path:"/metadata/resourceVersion",value:"7"} and
     .[2]=={op:"test",path:"/metadata/deletionTimestamp",value:"2026-11-17T00:00:00Z"} and
-    .[3].op=="test" and .[3].path=="/metadata/finalizers" and
-    .[4]=={op:"test",path:"/metadata/finalizers/1",value:"rhiza.mrchypark.dev/managed-host-cleanup"} and
-    .[5]=={op:"replace",path:"/metadata/finalizers",value:["example.invalid/keep"]}
+    .[3]=={op:"test",path:"/status",value:{authority:{pendingWrite:false},repair:{state:"Completed",completion:{kind:"Terminal"}}}} and
+    .[4].op=="test" and .[4].path=="/metadata/finalizers" and
+    .[5]=={op:"test",path:"/metadata/finalizers/1",value:"rhiza.mrchypark.dev/managed-host-cleanup"} and
+    .[6]=={op:"replace",path:"/metadata/finalizers",value:["example.invalid/keep"]}
   ' "$scratch/finalizer-patch.json" >/dev/null
   jq '.metadata.uid="other"' "$scratch/source-cluster.json" > "$scratch/source-cluster.json.tmp"
   mv "$scratch/source-cluster.json.tmp" "$scratch/source-cluster.json"
-  if force_release_test_owned_managed_finalizer RhizaCluster sql owned; then exit 1; fi
+  if force_release_test_owned_managed_finalizer RhizaCluster sql owned-uid "$scratch/source-cluster.json"; then exit 1; fi
   [ "$patches" = 1 ]
+  jq '.metadata.uid="owned-uid"' "$scratch/source-cluster.json" > "$scratch/source-cluster.json.tmp"
+  mv "$scratch/source-cluster.json.tmp" "$scratch/source-cluster.json"
   uid=owned-uid
   sa="rhiza-managed-host-$(printf '%s\000%s\000%s' test-ns sql "$uid" | sha256sum | cut -c1-16)"
   deployment="rhiza-$(printf '%s' "$uid" | sha256sum | cut -c1-20)-g0"
@@ -90,16 +112,19 @@ if [ "${1-}" = --overlay-self-test ]; then
   cp "$scratch/source-sa.json" "$scratch/source-sa-good.json"
   cp "$scratch/source-role.json" "$scratch/source-role-good.json"
   cp "$scratch/source-binding.json" "$scratch/source-binding-good.json"
-  for mutation in binding-role-kind binding-subject role-api-group sa-cluster-uid sa-managed-by sa-cluster-name sa-access-contract sa-access-lifecycle; do
+  for mutation in binding-role-kind binding-subject binding-empty-uid role-api-group role-empty-uid sa-cluster-uid sa-managed-by sa-cluster-name sa-access-contract sa-access-lifecycle sa-empty-uid; do
     case "$mutation" in
       binding-role-kind) jq '.roleRef.kind="ClusterRole"' "$scratch/source-binding-good.json" > "$scratch/source-binding.json" ;;
       binding-subject) jq '.subjects[0].name="other"' "$scratch/source-binding-good.json" > "$scratch/source-binding.json" ;;
+      binding-empty-uid) jq '.metadata.uid=""' "$scratch/source-binding-good.json" > "$scratch/source-binding.json" ;;
       role-api-group) jq '.rules[0].apiGroups=[""]' "$scratch/source-role-good.json" > "$scratch/source-role.json" ;;
+      role-empty-uid) jq '.metadata.uid=""' "$scratch/source-role-good.json" > "$scratch/source-role.json" ;;
       sa-cluster-uid) jq '.metadata.labels["rhiza.mrchypark.dev/cluster-uid"]="other"' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
       sa-managed-by) jq '.metadata.labels["app.kubernetes.io/managed-by"]="other"' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
       sa-cluster-name) jq '.metadata.labels["rhiza.mrchypark.dev/cluster-name"]="other"' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
       sa-access-contract) jq '.metadata.labels["rhiza.mrchypark.dev/access-contract"]="other"' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
       sa-access-lifecycle) jq '.metadata.labels["rhiza.mrchypark.dev/access-lifecycle"]="other"' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
+      sa-empty-uid) jq '.metadata.uid=""' "$scratch/source-sa-good.json" > "$scratch/source-sa.json" ;;
     esac
     : > "$scratch/access-delete-order.txt"
     if delete_test_owned_managed_access "$uid"; then exit 1; fi
@@ -139,6 +164,7 @@ if [ "${1-}" = --overlay-self-test ]; then
   force_release_test_owned_managed_finalizer() { order="$order finalizer"; }
   hn() {
     case "$1 $2" in
+      'get rhizacluster') cat "$scratch/source-cluster.json" ;;
       "delete --raw") order="$order delete" ;;
       'wait --for=delete') order="$order wait" ;;
       *) return 1 ;;
@@ -146,11 +172,82 @@ if [ "${1-}" = --overlay-self-test ]; then
   }
   printf 'RhizaCluster\tsql\t%s\n' "$uid" > "$scratch/direct-overlay-created.tsv"
   delete_direct_overlay
-  [ "$order" = ' access delete finalizer wait' ]
+  [ "$order" = ' delete access finalizer wait' ]
+  jq '.metadata.resourceVersion="8" | .status.authority.pendingWrite=true' "$scratch/source-cluster.json" > "$scratch/status-after-access.json"
+  : > "$scratch/direct-overlay-created.tsv"
+  printf 'RhizaCluster\tsql\t%s\n' "$uid" >> "$scratch/direct-overlay-created.tsv"
+  order=
+  gets=0
+  hn() {
+    case "$1 $2" in
+      'get rhizacluster')
+        gets=$((gets+1))
+        if [ "$gets" = 1 ]; then cat "$scratch/source-cluster.json"; else cat "$scratch/status-after-access.json"; fi
+        ;;
+      "delete --raw") order="$order delete" ;;
+      'wait --for=delete') order="$order wait" ;;
+      *) return 1 ;;
+    esac
+  }
+  if delete_direct_overlay; then exit 1; fi
+  [ "$order" = ' delete access' ]
+  jq '.status.repair.state="Preparing"' "$scratch/source-cluster.json" > "$scratch/status-preparing.json"
+  : > "$scratch/direct-overlay-created.tsv"
+  printf 'RhizaCluster\tsql\t%s\n' "$uid" >> "$scratch/direct-overlay-created.tsv"
+  order=
+  hn() {
+    case "$1 $2" in
+      'get rhizacluster') cat "$scratch/status-preparing.json" ;;
+      "delete --raw") order="$order delete" ;;
+      'wait --for=delete') order="$order wait" ;;
+      *) return 1 ;;
+    esac
+  }
+  if delete_direct_overlay; then exit 1; fi
+  [ "$order" = ' delete' ]
   order=
   delete_test_owned_managed_access() { return 1; }
   if delete_direct_overlay; then exit 1; fi
-  [ -z "$order" ]
+  [ "$order" = ' delete' ]
+  namespace=test-ns cr=sql uid=owned-uid
+  release=test-release
+  attempt_id=current-attempt
+  cluster_name_label=sql
+  sa="rhiza-managed-host-$(printf '%s\000%s\000%s' "$namespace" "$cr" "$uid" | sha256sum | cut -c1-16)"
+  binding="$sa-binding"
+  deployment="rhiza-$(printf '%s' "$uid" | sha256sum | cut -c1-20)-g0"
+  readme_function=$(sed -n '/^delete_owned_access() {/,/^}/p' deploy/operator/README.md)
+  [ -n "$readme_function" ]
+  eval "$readme_function"
+  kubectl() {
+    case "$readme_mode $1" in
+      'absent-before get') printf '%s\n' 'Error from server (NotFound)' >&2; return 1 ;;
+      'forbidden-before get') printf '%s\n' 'Error from server (Forbidden)' >&2; return 1 ;;
+      'positive get')
+        readme_gets=$((readme_gets+1))
+        if [ "$readme_gets" = 1 ]; then cat "$scratch/source-binding-good.json"; else printf '%s\n' 'Error from server (NotFound)' >&2; return 1; fi
+        ;;
+      'post-network get')
+        readme_gets=$((readme_gets+1))
+        if [ "$readme_gets" = 1 ]; then cat "$scratch/source-binding-good.json"; else printf '%s\n' 'connection refused' >&2; return 1; fi
+        ;;
+      positive\ delete|post-network\ delete) printf 'delete\n' >> "$scratch/readme-deletes.txt" ;;
+      *) return 1 ;;
+    esac
+  }
+  : > "$scratch/readme-deletes.txt"
+  readme_mode=absent-before readme_gets=0
+  delete_owned_access rolebinding "$binding"
+  [ ! -s "$scratch/readme-deletes.txt" ]
+  readme_mode=forbidden-before readme_gets=0
+  if delete_owned_access rolebinding "$binding"; then exit 1; fi
+  [ ! -s "$scratch/readme-deletes.txt" ]
+  readme_mode=positive readme_gets=0
+  delete_owned_access rolebinding "$binding"
+  [ "$readme_gets" = 2 ] && [ "$(wc -l < "$scratch/readme-deletes.txt" | tr -d ' ')" = 1 ]
+  readme_mode=post-network readme_gets=0
+  if delete_owned_access rolebinding "$binding"; then exit 1; fi
+  [ "$readme_gets" = 2 ] && [ "$(wc -l < "$scratch/readme-deletes.txt" | tr -d ' ')" = 2 ]
   printf '%s\n' 'PASS: exact overlay projection, UID-conditioned deletion, atomic finalizer release and owned access cleanup'
   exit 0
 fi
