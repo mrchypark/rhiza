@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -104,9 +105,7 @@ func (a *LocalArchive) GarbageCollect(ctx context.Context, keep int, grace time.
 				retired[snapshot.PortableRoot] = struct{}{}
 				continue
 			}
-			want, _ := json.Marshal(snapshot)
-			got, _ := json.Marshal(stored)
-			if !bytes.Equal(want, got) {
+			if !sameLocalSnapshot(snapshot, stored) {
 				return fmt.Errorf("Local retention metadata mismatch")
 			}
 			if i < keep || a.head.Snapshot != nil && snapshot.PortableRoot == a.head.Snapshot.PortableRoot {
@@ -225,12 +224,8 @@ func (a *LocalArchive) validateLocalCatalog() error {
 			return fmt.Errorf("duplicate Local catalog root")
 		}
 		seen[snapshot.PortableRoot] = true
-		if a.head.Snapshot != nil {
-			want, _ := json.Marshal(a.head.Snapshot)
-			got, _ := json.Marshal(snapshot)
-			if bytes.Equal(want, got) {
-				current = true
-			}
+		if a.head.Snapshot != nil && sameLocalSnapshot(*a.head.Snapshot, snapshot) {
+			current = true
 		}
 	}
 	if !current {
@@ -294,17 +289,13 @@ func (a *LocalArchive) pinLocalView(ctx context.Context, selected *LocalSnapshot
 		}
 		allowed := false
 		if snapshot != nil && a.head.Snapshot != nil {
-			want, _ := json.Marshal(snapshot)
-			got, _ := json.Marshal(a.head.Snapshot)
-			allowed = bytes.Equal(want, got)
+			allowed = sameLocalSnapshot(*snapshot, *a.head.Snapshot)
 		}
 		for _, old := range a.head.Catalog {
 			if snapshot == nil {
 				break
 			}
-			want, _ := json.Marshal(snapshot)
-			got, _ := json.Marshal(old)
-			if bytes.Equal(want, got) {
+			if sameLocalSnapshot(*snapshot, old) {
 				allowed = true
 			}
 		}
@@ -455,19 +446,25 @@ func (p *LocalRestorePin) Close(ctx context.Context) error {
 		return nil
 	}
 	return p.archive.localManager().WithLocalMaintenanceContext(ctx, func(ctx context.Context) error {
+		var closeErr error
 		for _, part := range p.parts {
-			if err := part.Close(ctx); err != nil {
-				return err
-			}
+			closeErr = errors.Join(closeErr, part.Close(ctx))
 		}
+		p.parts = nil
 		if p.key != "" {
 			if err := p.updateView(ctx, 0, true); err != nil {
-				return err
+				closeErr = errors.Join(closeErr, err)
 			}
 		}
-		p.closed = true
-		return nil
+		if closeErr == nil {
+			p.closed = true
+		}
+		return closeErr
 	})
+}
+
+func sameLocalSnapshot(a, b LocalSnapshot) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 type localViewRecord struct {
