@@ -714,7 +714,7 @@ func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.Checkpoi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	peer, closePeer, err := t.transportForSlotLease(seal.Index)
+	peer, closePeer, err := t.transportForSlotLease(seal.Index + 1)
 	if err != nil {
 		return err
 	}

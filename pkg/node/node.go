@@ -1523,7 +1523,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					return err
 				}
 				seal := quepaxa.CheckpointSeal{
-					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
+					ConfigID: core.ClusterForSlot(quepaxa.Slot(root.Index) + 1).ConfigID, Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
 					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following,
 					GenerationAnchorHash: core.GenerationAnchorHash(),
 				}
