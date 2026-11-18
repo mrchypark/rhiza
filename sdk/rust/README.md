@@ -2,7 +2,7 @@
 
 `rhizadb` is a synchronous embedded SDK. It builds Rhiza's local Go C archive
 from the native source bundled in the crate, so consumer builds need Rust, Go
-1.27+, a C compiler, and a macOS or Linux GNU host (ARM64 or x86-64). The Go
+1.27.4+, a C compiler, and a macOS or Linux GNU host (ARM64 or x86-64). The Go
 dependency closure is vendored inside the crate, so the build resolves every
 module from the crate and needs no network access; no precompiled native archive
 is downloaded. Each release also attaches a stripped archive per supported
@@ -44,7 +44,7 @@ its default `./rhiza-data`; the fix is in the same release.
 ## Migration from `rhizadb` 0.4
 
 Version 0.5 replaces the earlier Rust implementation with the Rhiza Go FFI
-bridge and therefore has no compatibility layer. It requires Go 1.27.3+ and a C
+bridge and therefore has no compatibility layer. It requires Go 1.27.4+ and a C
 toolchain at consumer build time. Update imports to `rhizadb`, create a
 `Config`, open `Db`, and use the request/response types in this crate.
 
@@ -119,7 +119,7 @@ let recovery_addr = db.start_operator("127.0.0.1:9091")?;
 ```
 
 `start_operator` serves `GET /recovery/status` plus authenticated
-`GET /recovery/probe`, `POST /recovery/archive`, `GET /membership/status`,
+`GET /recovery/probe`, `POST /recovery/archive`, `POST /recovery/drain`, `GET /membership/status`,
 `POST /membership/change`, and `POST /membership/abort`; application SQL, KV,
 graph, readiness, and metrics routes return 404. Keep the bound address private to the operator. It can be
 started once and stops with `Db::close` or `Drop`. The environment is read at

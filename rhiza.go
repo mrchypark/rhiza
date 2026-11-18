@@ -182,12 +182,16 @@ const (
 	HTTPErrorCodeDurabilityUnavailable  = "durability_unavailable"
 	HTTPErrorCodeCommitUnknown          = "commit_unknown"
 	HTTPErrorCodeQuorumUnavailable      = "quorum_unavailable"
+	HTTPErrorCodeGraphResourceLimit     = "graph_resource_limit"
+	HTTPErrorCodeReadVersionMismatch    = "read_version_mismatch"
+	HTTPErrorCodeInternalError          = "internal_error"
 	HTTPErrorCodeMethodNotAllowed       = "method_not_allowed"
 	HTTPErrorCodeNotFound               = "not_found"
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
 	MaxHTTPBodyBytes                = network.MaxRequestBodyBytes
+	MaxGraphQueryWork               = materializer.MaxGraphQueryWork
 	MaxGraphReachableDepth          = materializer.MaxGraphReachableDepth
 	MaxGraphReachableResults        = materializer.MaxReturningRows
 	MaxGraphReachableScannedEdges   = materializer.MaxGraphReachableEdges
@@ -201,6 +205,7 @@ var (
 	ErrVoterStateLost          = node.ErrVoterStateLost
 	ErrVoterEnrollmentRequired = node.ErrVoterEnrollmentRequired
 	ErrNotReady                = network.ErrNotReady
+	ErrOverloaded              = network.ErrOverloaded
 	ErrRequestConflict         = network.ErrRequestConflict
 	ErrInvalidRequest          = network.ErrInvalidRequest
 	ErrQuorumUnavailable       = quepaxa.ErrQuorumUnavailable
