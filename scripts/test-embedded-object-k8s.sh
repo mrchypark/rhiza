@@ -67,7 +67,7 @@ spec:
       enableServiceLinks: false
       containers:
       - name: floci
-        image: floci/floci:2.3.0
+        image: floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
         ports: [{containerPort: 4566}]
         readinessProbe:
           tcpSocket: {port: 4566}

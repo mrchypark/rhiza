@@ -5,8 +5,27 @@
 set -eu
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 driver="$repo/scripts/test-embedded-object-providers.sh"
+fixture="$repo/scripts/ha-managed-bootstrap-fixture.sh"
+bucket="$repo/scripts/ha-managed-bucket-setup"
+k8s="$repo/scripts/test-embedded-object-k8s.sh"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+check_floci_ref() {
+ if ! grep -F "$2" "$1" >/dev/null; then
+  echo "missing pinned Floci reference in $1: $2" >&2
+  exit 1
+ fi
+}
+s3_ref='floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9'
+gcs_ref='floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12'
+azure_ref='floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89'
+# Exact literal presence only; this does not exhaustively parse image references.
+for ref in "$s3_ref" "$gcs_ref" "$azure_ref"; do
+ check_floci_ref "$driver" "$ref"
+ check_floci_ref "$fixture" "$ref"
+ check_floci_ref "$bucket" "$ref"
+done
+check_floci_ref "$k8s" "$s3_ref"
 eval "$(sed -n '/^ffi_verify_log() {/,/^}/p' "$driver")"
 eval "$(sed -n '/^ffi_owned_endpoint() {/,/^}/p' "$driver")"
 eval "$(sed -n '/^ffi_wait() {/,/^}/p' "$driver")"
@@ -54,4 +73,4 @@ for child_code in 0 17; do
   grep -Fx "final_exit=$expected" "$case_dir/evidence/cleanup.txt" >/dev/null
  done
 done
-echo 'PASS: exact FFI evidence and owned Floci endpoint predicates'
+echo 'PASS: exact FFI evidence, owned Floci endpoint predicates, and expected Floci references present'
