@@ -176,12 +176,30 @@ QuePaxa uses `floor(voterCount/2)+1` responses for a decision. Thus 4 and 5
 voters both require 3 responses; 7 requires 4 and 10 requires 6. The leader fast
 path means one epoch leader submits first, not that one voter decides alone.
 
-The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses:
-the operator Role includes Pod and Secret creation/deletion, Service creation,
-and recovery-object permissions. The Host Role can read cluster resources
-and update their status across the namespace by default. These grants do not
-imply that a Service or DR controller runs. Use a trusted namespace and scope
-the Host's cluster and status rules to known CR names where practical.
+The shipped [RBAC](rbac.yaml) grants more than this reconciliation path uses.
+The operator Role can get, create and delete Secrets across its namespace;
+it can also get/update cluster and recovery status and has broader Pod, Service
+and recovery-object access than ordinary request serving. The Host Role can
+read cluster resources and get/update cluster status across the namespace by
+default. If the optional legacy fencer manifest is applied, its Role can also
+get every Secret and get/create/update every ConfigMap in the namespace. Secret
+and recovery names are dynamic, so they cannot all be expressed with static
+`resourceNames`. These grants do not imply that a Service, fencer or DR
+controller runs. Use a namespace containing only Rhiza-managed objects, and add
+`resourceNames` to both Host cluster rules when installed cluster names are
+known. Do not grant Host access to CR main-resource updates or unrelated Secret
+access.
+
+Each fenced `(StatefulSet UID, source cluster)` has one cooperative ledger
+ConfigMap containing its complete run and receipt history. A transition whose
+serialized ledger exceeds 700000 bytes fails closed before the ConfigMap write;
+the last persisted evidence remains unchanged and the fence stays pending until
+the evidence can be handled without discarding history. The current
+implementation has no ledger compaction. Monitor ledger ConfigMap size as an
+availability limit for long-lived or restart-heavy generations. Raising the
+limit toward Kubernetes' default 1 MiB object bound, deleting evidence, or
+replacing the single object is not a recovery action and requires a separately
+tested fencing contract.
 
 Normal images contain `rhiza-operator` and `rhiza-ha-init`. A separate fencer
 Deployment or external lease service is not required for normal quorum repair.

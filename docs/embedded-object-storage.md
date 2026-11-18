@@ -260,9 +260,12 @@ RHIZA_EMBEDDED_TEST_PATTERN='^TestEmbeddedObjectStorageGC' \
 The runner lists selected tests before provisioning emulators and rejects a
 custom `RHIZA_EMBEDDED_TEST_PATTERN` that matches no test names.
 
-The executable runner uses `floci/floci:2.3.0`,
-`floci/floci-gcp:0.11.0`, and `floci/floci-az:0.15.0`. Each emulator and the
-cross-compiled Go test binary run on an owned Docker network with no published
+The executable runner pins these multi-arch index digests:
+`floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9`,
+`floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12`, and
+`floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89`.
+Each emulator and the cross-compiled Go test binary run on an owned Docker
+network with no published
 host ports. It provisions disposable buckets or containers through actual Go
 clients, with explicit test credentials and no mounted host credentials or
 ambient host cloud environment. It records pulled image digests and checks every

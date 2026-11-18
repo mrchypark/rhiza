@@ -390,9 +390,9 @@ fixture_family=$(managed_fixture_profile_family "$fixture_case")
 floci_node_selector='{}'
 fixture_provider=${fixture_provider-s3}
 case "$fixture_provider" in
-  s3) floci_image=floci/floci:2.3.0; floci_port=4566 ;;
-  gcs) floci_image=floci/floci-gcp:0.11.0; floci_port=4588 ;;
-  azure) floci_image=floci/floci-az:0.15.0; floci_port=4577 ;;
+  s3) floci_image=floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9; floci_port=4566 ;;
+  gcs) floci_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12; floci_port=4588 ;;
+  azure) floci_image=floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89; floci_port=4577 ;;
   *) echo 'unsupported explicit emulator provider' >&2; return 1 ;;
 esac
 printf 'case=%s\nprovider=%s\nemulator=%s\nport=%s\nprotocol=%s\n' "$fixture_case" "$fixture_provider" "$floci_image" "$floci_port" "$fixture_protocol" > "$logs/fixture-provider.txt"

@@ -217,16 +217,23 @@ func TestManagedGraphAppendOnlyAdmissionCompletesPendingApplication(t *testing.T
 type managedGraphAppendOnlyAdmissionFixture struct {
 	node      *Node
 	transport *managedAppendOnlyAdmissionTransport
+	policy    sqlpolicy.MaterializationPolicy
+	protocol  string
+	validate  func([]byte) error
+	bucket    *managedAppendOnlySelectorBucket
 }
 
 func newManagedGraphAppendOnlyAdmissionFixture(t *testing.T) *managedGraphAppendOnlyAdmissionFixture {
+	return newManagedAppendOnlyAdmissionFixture(t, "managed-graph-append-only-admission", sqlpolicy.ManagedGraphRequestMaterializationPolicy, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, types.ValidateManagedGraphExecutionPolicy)
+}
+
+func newManagedAppendOnlyAdmissionFixture(t *testing.T, clusterName string, policy sqlpolicy.MaterializationPolicy, protocol string, validate func([]byte) error) *managedGraphAppendOnlyAdmissionFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	transport := newManagedAppendOnlyAdmissionTransport()
 	transport.addGate(9)
-	protocol := sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
-	clusterID := types.ClusterID("managed-graph-append-only-admission")
+	clusterID := types.ClusterID(clusterName)
 	cluster := quepaxa.Cluster{ConfigID: 1}
 	wals := make(map[quepaxa.NodeID]*qlog.WAL, 3)
 	for i, id := range []quepaxa.NodeID{"n1", "n2", "n3"} {
@@ -246,12 +253,17 @@ func newManagedGraphAppendOnlyAdmissionFixture(t *testing.T) *managedGraphAppend
 		member.WALIdentity = hex.EncodeToString(identity)
 		cluster.Members = append(cluster.Members, member)
 	}
-	bucket := thanosobjstore.NewInMemBucket()
+	bucket := &managedAppendOnlySelectorBucket{Bucket: thanosobjstore.NewInMemBucket()}
+	t.Cleanup(func() {
+		if err := bucket.Close(); err != nil {
+			t.Errorf("close admission fixture bucket: %v", err)
+		}
+	})
 	var node1 *Node
 	for _, member := range cluster.Members {
-		config := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStorePrefix: "managed-graph-append-only-admission", ObjStoreProvider: "memory", ObjStoreBucket: "test", ObjStoreRegion: "local"}
+		config := &types.ExecutionConfig{NodeID: member.ID, ClusterID: clusterID, Members: cluster.Members, DataDir: t.TempDir(), ObjStorePrefix: clusterName, ObjStoreProvider: "memory", ObjStoreBucket: "test", ObjStoreRegion: "local"}
 		n := New(config)
-		n.managedStartup = &ManagedStartupConfig{expectedPolicy: sqlpolicy.ManagedGraphRequestMaterializationPolicy, Identity: ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: protocol, Member: recovery.PreparedStartupIdentity{ClusterUID: string(clusterID), NodeID: string(member.ID)}}}
+		n.managedStartup = &ManagedStartupConfig{expectedPolicy: policy, Identity: ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: protocol, Member: recovery.PreparedStartupIdentity{ClusterUID: string(clusterID), NodeID: string(member.ID)}}}
 		source, memberDigest, err := n.preparedBindingDigestsForProtocol(protocol)
 		if err != nil {
 			t.Fatal(err)
@@ -264,11 +276,11 @@ func newManagedGraphAppendOnlyAdmissionFixture(t *testing.T) *managedGraphAppend
 		n.managedStartup.Identity.BootstrapPlanDigest = planDigest
 		n.managedStartup.Identity.Member.SourceBinding = source
 		n.managedStartup.Identity.Member.ConfigDigest = memberDigest
-		manager, err := checkpoint.NewAppendOnlyManagerForPolicy(bucket, string(clusterID), t.TempDir(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, 1)
+		manager, err := checkpoint.NewAppendOnlyManagerForPolicy(bucket, string(clusterID), t.TempDir(), policy, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		archive, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, string(clusterID), 1, types.ValidateManagedGraphExecutionPolicy)
+		archive, err := recovery.NewAppendOnlyManagerWithValueValidator(bucket, string(clusterID), 1, validate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +296,7 @@ func newManagedGraphAppendOnlyAdmissionFixture(t *testing.T) *managedGraphAppend
 		copy(identity[:], walIdentity)
 		core, err := quepaxa.New(quepaxa.Config{
 			NodeID: member.ID, Cluster: cluster, WAL: wals[member.ID], Transport: transport,
-			ValidateValue: types.ValidateManagedGraphExecutionPolicy,
+			ValidateValue: validate,
 			ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{
 				ApplicationProtocol: protocol, BootstrapPlanDigest: planDigest, MemberConfigDigest: memberDigest, Generation: 0, WALIdentity: identity,
 			}, Verify: n.verifyManagedAppendOnlyCandidate},
@@ -339,7 +351,7 @@ func newManagedGraphAppendOnlyAdmissionFixture(t *testing.T) *managedGraphAppend
 	if node1.core.Tip() != 8 || node1.core.RecorderTip() != 8 || mat.Tip() != 8 {
 		t.Fatalf("fixture did not establish aligned actual prefix: certified=%d recorded=%d applied=%d", node1.core.Tip(), node1.core.RecorderTip(), mat.Tip())
 	}
-	return &managedGraphAppendOnlyAdmissionFixture{node: node1, transport: transport}
+	return &managedGraphAppendOnlyAdmissionFixture{node: node1, transport: transport, policy: policy, protocol: protocol, validate: validate, bucket: bucket}
 }
 
 func (f *managedGraphAppendOnlyAdmissionFixture) startHeldControl(ctx context.Context) <-chan error {
