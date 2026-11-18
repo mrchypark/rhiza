@@ -410,6 +410,8 @@ jobs:
             }
             END { if (matched != 1) exit 1 }
           ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
+      - name: Dockerignore build context
+        run: sh scripts/test-dockerignore-build-context.sh
       - uses: docker/build-push-action@v6
         with:
           context: .
