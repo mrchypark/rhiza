@@ -59,9 +59,14 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 		}
 		handler, closeService = db.Handler(), db.Close
 	case "object-store", "learner":
-		replicaMembers, err := objectReplicaMembers(config.ClusterID, members, role == "object-store" && config.EnableReconfiguration)
+		var (
+			replicaMembers []rhiza.ReplicaMember
+			err            error
+		)
 		if role == "learner" {
 			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"))
+		} else {
+			replicaMembers, err = objectReplicaMembers(config.ClusterID, members, config.EnableReconfiguration)
 		}
 		if err != nil {
 			return fmt.Errorf("configure %s: %w", role, err)

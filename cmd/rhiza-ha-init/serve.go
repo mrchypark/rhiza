@@ -52,13 +52,17 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 	repairDone := make(chan struct{})
 	go func() { defer close(repairDone); runManagedReplacementLoop(serveCtx, host, cfg) }()
 	defer func() { cancelServe(); <-repairDone }()
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-serveCtx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
 	err = server.Serve(listener)
+	cancelServe()
+	<-shutdownDone
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -108,6 +112,9 @@ func reconcileManagedReplacement(ctx context.Context, host *managedsql.Host, cfg
 		plan, err := host.PlanVoterReplacement(ctx, operator.V1Alpha2RepairPodRequest{}, nil)
 		if err != nil {
 			return "closed-candidate-blocked", err
+		}
+		if plan == nil {
+			return "idle", nil
 		}
 		stage := "closed-remove"
 		if r.PreparedHandoff != nil {

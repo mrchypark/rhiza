@@ -187,6 +187,7 @@ func main() {
 		cancel()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "fault control drain failed:", err)
+			_ = control.Close()
 			os.Exit(1)
 		}
 	}
@@ -215,9 +216,13 @@ func main() {
 	for status, sample := range errorSamples {
 		samples["http_"+strconv.Itoa(status)] = sample
 	}
+	elapsedSec := duration.Seconds()
+	if elapsedSec <= 0 {
+		elapsedSec = 1e-9
+	}
 	output := result{
 		Requests: *requests, Successes: len(latencies), Errors: failures.Load(), Retries: retries.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
-		OpsPerSec: float64(*requests) / duration.Seconds(), SuccessOpsPerSec: float64(len(latencies)) / duration.Seconds(), P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
+		OpsPerSec: float64(*requests) / elapsedSec, SuccessOpsPerSec: float64(len(latencies)) / elapsedSec, P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
 		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
 		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
 		FaultOverlap: progress != nil,
