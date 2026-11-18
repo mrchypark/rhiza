@@ -1360,6 +1360,25 @@ func (m *Materializer) runNotifications() {
 	}
 }
 
+const sqliteWALTruncatePages = 4096
+
+func (m *Materializer) checkpointSQLiteWAL(db *sql.DB, truncateThreshold int) {
+	var busy, logPages, checkpointedPages int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logPages, &checkpointedPages); err != nil {
+		return
+	}
+	if busy == 0 && logPages >= truncateThreshold && checkpointedPages == logPages {
+		// TRUNCATE requires exclusive SQLite locking; skip it unless the materializer is idle.
+		if !m.mu.TryLock() {
+			return
+		}
+		defer m.mu.Unlock()
+		if m.db == db && m.db != nil {
+			_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+		}
+	}
+}
+
 func (m *Materializer) runSQLiteCheckpoints() {
 	defer m.walCheckpointWG.Done()
 	ticker := time.NewTicker(time.Second)
@@ -1376,7 +1395,7 @@ func (m *Materializer) runSQLiteCheckpoints() {
 			}
 			m.mu.RUnlock()
 			if db != nil {
-				_, _ = db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+				m.checkpointSQLiteWAL(db, sqliteWALTruncatePages)
 				m.walCheckpointIO.Done()
 			}
 		}
@@ -2665,7 +2684,12 @@ func (m *Materializer) reader() (*sql.DB, error) {
 
 func (m *Materializer) queryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	m.mu.RLock()
-	reader := m.readers[0]
+	var reader *sql.DB
+	if len(m.readers) > 0 && m.readers[0] != nil {
+		reader = m.readers[0]
+	} else {
+		reader = m.db
+	}
 	m.mu.RUnlock()
 
 	return reader.QueryRowContext(ctx, query, args...)

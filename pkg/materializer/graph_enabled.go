@@ -299,7 +299,7 @@ func validateLocalGraphStorage(path string, allowAbsent, disableLock bool) error
 		if err != nil {
 			return err
 		}
-		if !found || !bytes.Equal(format, graphStoragePolicy) {
+		if !found || (!bytes.Equal(format, graphStoragePolicy) && !bytes.Equal(format, graphOriginalStoragePolicy)) {
 			return fmt.Errorf("Local graph storage policy is missing or unsupported")
 		}
 		tip, found, err := tx.GetAppMetadata(graphTipKey)
@@ -1329,10 +1329,10 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(requestID)
-	if found && m.tip > request.Receipt.RetryThroughSlot {
-		found = false
+	if err != nil || !found || m.tip > request.Receipt.RetryThroughSlot {
+		return types.MutationReceipt{}, false, err
 	}
-	return request.Receipt, found, err
+	return request.Receipt, true, nil
 }
 
 func (m *Materializer) GraphRequestMatches(ctx context.Context, command types.GraphCommand) (bool, error) {
@@ -1358,13 +1358,10 @@ func (m *Materializer) GraphRequestStatus(_ context.Context, command types.Graph
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(command.RequestID)
-	if found && m.tip > request.Receipt.RetryThroughSlot {
-		found = false
-	}
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
-	if !found {
+	if !found || m.tip > request.Receipt.RetryThroughSlot {
 		return types.MutationReceipt{}, false, true, nil
 	}
 	return request.Receipt, true, request.Fingerprint == fingerprint, nil

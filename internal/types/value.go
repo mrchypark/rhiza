@@ -432,6 +432,9 @@ func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty graph command batch")
 	}
+	if len(commands) > MaxSQLCommandsPerDecidedValue {
+		return nil, true, fmt.Errorf("graph command batch exceeds %d commands", MaxSQLCommandsPerDecidedValue)
+	}
 	return commands, true, nil
 }
 
@@ -480,6 +483,9 @@ func DecodeKVBatch(value []byte) ([]KVCommand, bool, error) {
 	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty KV command batch")
+	}
+	if len(commands) > MaxSQLCommandsPerDecidedValue {
+		return nil, true, fmt.Errorf("KV command batch exceeds %d commands", MaxSQLCommandsPerDecidedValue)
 	}
 	return commands, true, nil
 }

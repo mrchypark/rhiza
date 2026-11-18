@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -52,13 +53,17 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 	repairDone := make(chan struct{})
 	go func() { defer close(repairDone); runManagedReplacementLoop(serveCtx, host, cfg) }()
 	defer func() { cancelServe(); <-repairDone }()
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-serveCtx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
 	err = server.Serve(listener)
+	cancelServe()
+	<-shutdownDone
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -66,8 +71,6 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 }
 
 func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg managedsql.Config) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
 	last := ""
 	for {
 		if ctx.Err() != nil {
@@ -87,10 +90,13 @@ func runManagedReplacementLoop(ctx context.Context, host *managedsql.Host, cfg m
 			log.Printf("managed replacement %s", outcome)
 			last = outcome
 		}
+		wait := 2*time.Second + time.Duration(rand.IntN(1000))*time.Millisecond
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
@@ -108,6 +114,9 @@ func reconcileManagedReplacement(ctx context.Context, host *managedsql.Host, cfg
 		plan, err := host.PlanVoterReplacement(ctx, operator.V1Alpha2RepairPodRequest{}, nil)
 		if err != nil {
 			return "closed-candidate-blocked", err
+		}
+		if plan == nil {
+			return "idle", nil
 		}
 		stage := "closed-remove"
 		if r.PreparedHandoff != nil {

@@ -2207,10 +2207,10 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	}
 	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationNotify, req.RequestID)
 	if err != nil {
-		return types.MutationReceipt{}, err
+		return types.MutationReceipt{}, commitUnknown(slot, req.RequestID, err)
 	}
 	if !found {
-		return types.MutationReceipt{}, fmt.Errorf("notification receipt is unavailable")
+		return types.MutationReceipt{}, commitUnknown(slot, req.RequestID, fmt.Errorf("notification receipt is unavailable"))
 	}
 	return receipt, nil
 }
