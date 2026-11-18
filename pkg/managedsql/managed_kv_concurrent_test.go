@@ -315,7 +315,9 @@ func TestManagedKVHostLocalObservationSurvivesQuorumLoss(t *testing.T) {
 	// A real own-nonce control ISR may be recorded, even in a reused vacant
 	// slot, but cannot certify/apply intent or replace runtime identity.
 	afterWrite, err := h.node.ManagedState()
-	if err != nil || afterWrite.WALIdentity != beforeWrite.WALIdentity || afterWrite.ExistingRegisteredWAL != beforeWrite.ExistingRegisteredWAL || afterWrite.CertifiedTip != beforeWrite.CertifiedTip || afterWrite.AppliedTip != beforeWrite.AppliedTip || afterWrite.RecorderTip < beforeWrite.RecorderTip {
+	// A prior certified slot may finish applying asynchronously, but the refused
+	// request cannot advance the certified prefix or apply beyond it.
+	if err != nil || afterWrite.WALIdentity != beforeWrite.WALIdentity || afterWrite.ExistingRegisteredWAL != beforeWrite.ExistingRegisteredWAL || afterWrite.CertifiedTip != beforeWrite.CertifiedTip || afterWrite.AppliedTip < beforeWrite.AppliedTip || afterWrite.AppliedTip > afterWrite.CertifiedTip || afterWrite.RecorderTip < beforeWrite.RecorderTip {
 		t.Fatalf("quorum-refused write changed runtime: before=%+v after=%+v err=%v", beforeWrite, afterWrite, err)
 	}
 	if after := hostQuorumLossCertifiedPrefix(t, ctx, client, configs[0].Runtime.NodeID, afterWrite.CertifiedTip); !reflect.DeepEqual(certified, after) {
