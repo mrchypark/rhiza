@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +92,83 @@ func TestTerminalDecisionCancelsUnneededPeerHandshake(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("blackholed peer dial did not report cancellation after terminal quorum")
+	}
+	t.Run("drains-before-close", testTerminalDecisionDrainsBeforeClose)
+}
+
+func testTerminalDecisionDrainsBeforeClose(t *testing.T) {
+	clusterID := types.ClusterID("cluster-drain")
+	a := testMember(clusterID, "a", "a-token")
+	b, _, bAcked := terminalACKPeerControlled(t, clusterID, "b", "b-token", nil)
+	c, cReceived, _ := terminalACKPeerControlled(t, clusterID, "c", "c-token", make(chan struct{}))
+	dAckGate := make(chan struct{})
+	d, dReceived, dAcked := terminalACKPeerControlled(t, clusterID, "d", "d-token", dAckGate)
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{a, b, c}}
+	next := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{a, b, d}}
+	transport := NewTransport(clusterID, "a", &old, "a-token")
+	transport.quic = &quic.Config{HandshakeIdleTimeout: 500 * time.Millisecond, MaxIdleTimeout: 500 * time.Millisecond}
+	t.Cleanup(func() { _ = transport.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	releaseEntered := make(chan struct{}, 1)
+	result := make(chan string, 1)
+	release := make(chan struct{})
+	var released atomic.Bool
+	var closeBeforeRelease atomic.Bool
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	restoreHook := localtesthooks.Set(func(event string) {
+		switch {
+		case strings.Contains(event, "network:peer-call:peer=c:phase=before-release"):
+			select {
+			case releaseEntered <- struct{}{}:
+			default:
+			}
+			<-release
+		case strings.Contains(event, "network:peer-call:peer=c:phase=after-release"):
+			released.Store(true)
+		case strings.Contains(event, "network:terminal-decision:slot=1:phase=close-start"):
+			if !released.Load() {
+				closeBeforeRelease.Store(true)
+			}
+		case strings.Contains(event, ":peer=c:") && strings.Contains(event, ":phase=result:error="):
+			select {
+			case result <- event:
+			default:
+			}
+		}
+	})
+	defer restoreHook()
+	done := make(chan error, 1)
+	go func() { done <- transport.sendTerminalDecision(ctx, quepaxa.Decision{Slot: 1}, old, next) }()
+	awaitTerminalSignal(t, cReceived, "connected unneeded peer request")
+	awaitTerminalSignal(t, bAcked, "old peer ACK")
+	awaitTerminalSignal(t, dReceived, "added peer request")
+	close(dAckGate)
+	awaitTerminalSignal(t, dAcked, "added peer ACK")
+	awaitTerminalSignal(t, releaseEntered, "canceled peer before release")
+	<-time.After(time.Second)
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("terminal decision after canceled call release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal decision did not return within cancellation bound")
+	}
+	select {
+	case event := <-result:
+		if !strings.Contains(event, "context canceled") {
+			t.Fatalf("unneeded peer result=%s, want observable context cancellation", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unneeded peer did not report cancellation")
+	}
+	if closeBeforeRelease.Load() {
+		t.Fatal("peer close started before canceled call released")
 	}
 }
 

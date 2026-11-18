@@ -641,7 +641,13 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 	if err != nil && response == nil && ctx.Err() == nil {
 		t.invalidate(to, conn)
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("network:peer-call:peer=%s:phase=before-release", to))
+	}
 	t.release(to, conn)
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("network:peer-call:peer=%s:phase=after-release", to))
+	}
 	if response != nil {
 		switch response.ErrorCode {
 		case peerErrorQuorum:
@@ -1151,7 +1157,12 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		return err
 	}
 	peer.quic = t.quic
-	defer peer.Close()
+	defer func() {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:phase=close-start", decision.Slot))
+		}
+		_ = peer.Close()
+	}()
 	peer.adminToken = t.adminToken
 	if peer.expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		if err := peer.ValidateManagedGraphWireBudget(); err != nil {
@@ -1159,7 +1170,11 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		}
 	}
 	callCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 	type result struct {
 		id  quepaxa.NodeID
 		err error
@@ -1171,7 +1186,9 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			continue
 		}
 		pending++
+		wg.Add(1)
 		go func(member quepaxa.Member) {
+			defer wg.Done()
 			req := peer.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
 			trace := ""
