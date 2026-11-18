@@ -87,6 +87,157 @@ func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	}
 }
 
+func TestCooperativeLedgerCapacityFailsClosed(t *testing.T) {
+	const limit = 700000 // Characterizes the persisted ledger contract.
+	boundary, below := ledgerRunsAroundCapacity(t, limit)
+	for _, tc := range []struct {
+		name       string
+		runs       int
+		wantStored bool
+	}{
+		{name: "below limit persists", runs: below, wantStored: true},
+		{name: "oversized update preserves evidence", runs: boundary},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initial := ledgerWithRuns(tc.runs)
+			if size := len(jsonBytes(initial)); size > limit {
+				t.Fatalf("initial ledger has %d bytes, limit is %d", size, limit)
+			}
+			identity := ledgerRunIdentity(tc.runs)
+			identity.WALIdentity = ""
+			expected := ledgerWithRuns(tc.runs)
+			if err := expected.Ledger.Register(identity); err != nil {
+				t.Fatal(err)
+			}
+			expectedSize := len(jsonBytes(expected))
+			if (expectedSize <= limit) != tc.wantStored {
+				t.Fatalf("updated ledger has %d bytes; wantStored=%t", expectedSize, tc.wantStored)
+			}
+
+			executor, mutations, persisted := newLedgerWriteFixture(t, initial)
+			before := persisted()
+			state, err := executor.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
+				return l.Register(identity)
+			})
+			if tc.wantStored {
+				if err != nil {
+					t.Fatalf("below-limit update failed: %v", err)
+				}
+				if mutations() != 1 {
+					t.Fatalf("below-limit update wrote %d times, want 1", mutations())
+				}
+			} else {
+				if err == nil || err.Error() != "fencing: ledger capacity exhausted; old evidence cannot be discarded" {
+					t.Fatalf("oversized update error = %v", err)
+				}
+				if len(jsonBytes(state)) <= limit {
+					t.Fatal("test did not characterize an oversized update")
+				}
+				if mutations() != 0 {
+					t.Fatalf("oversized update issued %d mutations, want 0", mutations())
+				}
+				if after := persisted(); after != before {
+					t.Fatal("oversized update changed persisted ledger evidence")
+				}
+			}
+
+			stored, err := executor.read(t.Context(), "sts", "source")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStored := initial
+			if tc.wantStored {
+				wantStored = expected
+			}
+			if got, want := string(jsonBytes(stored)), string(jsonBytes(wantStored)); got != want {
+				t.Fatal("persisted ledger differs from expected evidence")
+			}
+		})
+	}
+}
+
+func ledgerRunIdentity(index int) fencing.Identity {
+	return fencing.Identity{
+		SourceClusterID: "source",
+		NodeID:          fmt.Sprintf("node-%04d", index),
+		PodUID:          fmt.Sprintf("pod-%04d", index),
+		RunID:           fmt.Sprintf("%064x", index+1),
+		WALIdentity:     fmt.Sprintf("%064x", index+1),
+	}
+}
+
+func ledgerWithRuns(count int) fenceLedger {
+	state := fenceLedger{
+		StatefulSetUID: "sts",
+		Ledger: fencing.Ledger{
+			SourceClusterID: "source",
+			Runs:            make(map[string]fencing.Run, count),
+		},
+	}
+	for i := 0; i < count; i++ {
+		identity := ledgerRunIdentity(i)
+		state.Ledger.Runs[identity.RunID] = fencing.Run{Identity: identity}
+	}
+	return state
+}
+
+func ledgerRunsAroundCapacity(t *testing.T, limit int) (boundary, below int) {
+	t.Helper()
+	for {
+		candidate := boundary + 8
+		if len(jsonBytes(ledgerWithRuns(candidate))) > limit {
+			break
+		}
+		boundary = candidate
+	}
+	for len(jsonBytes(ledgerWithRuns(boundary+1))) <= limit {
+		boundary++
+	}
+	below = boundary - 64
+	if below < 1 || len(jsonBytes(ledgerWithRuns(below+1))) >= limit {
+		t.Fatal("could not construct ledgers on both sides of the capacity limit")
+	}
+	return boundary, below
+}
+
+func newLedgerWriteFixture(t *testing.T, state fenceLedger) (*FencingExecutor, func() int, func() string) {
+	t.Helper()
+	current := object{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   object{"resourceVersion": "1"},
+		"data":       object{"ledger.json": string(jsonBytes(state))},
+	}
+	mutations := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(current)
+		case http.MethodPost, http.MethodPut:
+			mutations++
+			var next object
+			if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			current = next
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &FencingExecutor{Kube: &Kubernetes{BaseURL: server.URL, Namespace: "test", TokenFile: token, Client: server.Client()}}
+	return executor,
+		func() int { return mutations },
+		func() string { return str(nested(current, "data", "ledger.json")) }
+}
+
 func supervisedTestPod() object {
 	return object{
 		"metadata": object{"name": "rhiza-0", "uid": "pod-uid", "annotations": object{fencingProtocolAnnotation: "1"}},
