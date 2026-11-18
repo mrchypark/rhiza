@@ -436,7 +436,7 @@ preserve_run_output() {
   cp "$out/$seq-$1.stdout" "$2"
 }
 validate_cold_inventory() {
-  before=$1; after=$2; pin_id=$3; status=$4; archive_head=$5; checkpoint_root=$6; gc_lock=$7; publisher=$8
+  before=$1; after=$2; pin_id=$3; status=$4; _unused_archive_head=$5; checkpoint_root=$6; gc_lock=$7; publisher=$8
   archive_pin_record=$9; checkpoint_pin_record=${10}; archive_head=${11}; learner_clock=${12}
   printf '%s' "$pin_id" | LC_ALL=C grep -Eq '^[a-f0-9]{64}$' || return 1
   archive_pin="${prefix}${cluster}/archive/recovery-pins/$pin_id"

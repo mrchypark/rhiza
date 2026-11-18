@@ -20,6 +20,7 @@ positive set proves are removed (run-owned namespace) so D1-D4 each start from
 their own precondition.
 """
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -82,6 +83,7 @@ class VoterCountChaos(Chaos):
         self.forwards = {}
         self.events = []
         self.acks = set()
+        self.acks_lock = threading.Lock()
         self.stop = threading.Event()
         self.writer = None
         self.row_seq = 0
@@ -324,7 +326,8 @@ class VoterCountChaos(Chaos):
                 try:
                     self.execute(VOTERS[0], "vc-write-%d" % i,
                                  "INSERT INTO chaos_items VALUES (%d, 'ack')" % i)
-                    self.acks.add(i)
+                    with self._acks_guard():
+                        self.acks.add(i)
                     i += 1
                 except Exception:
                     pass
@@ -339,14 +342,22 @@ class VoterCountChaos(Chaos):
         self.execute(VOTERS[0], "vc-schema",
                      "CREATE TABLE IF NOT EXISTS chaos_items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
         self.start_writer()
-        self.wait("workload began", lambda: len(self.acks) >= 5, 120)
-        self.event("prepare_pass", voters=list(VOTERS), acknowledged=len(self.acks))
+        self.wait("workload began", lambda: self._acks_len() >= 5, 120)
+        self.event("prepare_pass", voters=list(VOTERS), acknowledged=self._acks_len())
+
+    def _acks_guard(self):
+        return getattr(self, "acks_lock", None) or contextlib.nullcontext()
+
+    def _acks_len(self):
+        with self._acks_guard():
+            return len(self.acks)
 
     def readback(self, pod, tag):
         before = self.verify_data(pod)
         row = self.next_row()
-        self.acks.add(row)
         self.execute(pod, "vc-post-%s" % tag, "INSERT INTO chaos_items VALUES (%d, 'post')" % row)
+        with self._acks_guard():
+            self.acks.add(row)
         after = self.verify_data(pod)
         assert after >= before + 1, "scenario write was not readable afterwards: %s" % tag
         self.event("readback_pass", pod=pod, tag=tag, row=row, before=before, after=after)
