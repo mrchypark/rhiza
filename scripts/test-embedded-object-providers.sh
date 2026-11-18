@@ -112,9 +112,9 @@ cat "$run_dir/selected-tests.txt"
 failed=0
 for provider in s3 gcs azure; do
  case "$provider" in
-  s3) emulator_image=floci/floci:2.3.0; port=4566 ;;
-  gcs) emulator_image=floci/floci-gcp:0.11.0; port=4588 ;;
-  azure) emulator_image=floci/floci-az:0.15.0; port=4577 ;;
+  s3) emulator_image=floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9; port=4566 ;;
+  gcs) emulator_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12; port=4588 ;;
+  azure) emulator_image=floci/floci-az:0.15.0@sha256:530635d603223e120adbf9221a97560cffc6991d65fa0c72d0f79d1097974c89; port=4577 ;;
  esac
  docker pull "$emulator_image"
  docker image inspect "$emulator_image" --format '{{json .RepoDigests}}' >"$run_dir/$provider-image-digests.json"
