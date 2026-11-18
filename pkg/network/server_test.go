@@ -35,6 +35,19 @@ func (*flushSignalWriter) Write(payload []byte) (int, error) { return len(payloa
 func (*flushSignalWriter) WriteHeader(int)                   {}
 func (w *flushSignalWriter) Flush()                          { w.once.Do(func() { close(w.flushed) }) }
 
+func checkNotifyStreamHeaders(header http.Header) error {
+	for name, want := range map[string]string{
+		"Content-Type":      "text/event-stream",
+		"Cache-Control":     "no-cache",
+		"X-Accel-Buffering": "no",
+	} {
+		if got := header.Get(name); got != want {
+			return fmt.Errorf("successful stream %s=%q, want %q", name, got, want)
+		}
+	}
+	return nil
+}
+
 func (unavailableTransport) SendRecord(context.Context, quepaxa.NodeID, quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	return quepaxa.Summary{}, errors.New("unavailable")
 }
@@ -1732,11 +1745,17 @@ func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
 
 	w := &flushSignalWriter{header: make(http.Header), flushed: make(chan struct{})}
 	done := make(chan struct{})
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
-		server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/notify/subscribe?topic=topic", nil))
+		server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/notify/subscribe?topic=topic", nil).WithContext(requestCtx))
 		close(done)
 	}()
-	<-w.flushed
+	select {
+	case <-w.flushed:
+	case <-time.After(time.Second):
+		t.Fatal("notification stream did not flush headers")
+	}
 	if err := material.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1744,6 +1763,61 @@ func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("notification stream did not stop after materializer close")
+	}
+	if err := checkNotifyStreamHeaders(w.Header()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNotifyStreamHeaderCheckRejectsWrongValue(t *testing.T) {
+	header := http.Header{
+		"Content-Type":      {"text/event-stream"},
+		"Cache-Control":     {"no-cache"},
+		"X-Accel-Buffering": {"no"},
+	}
+	if err := checkNotifyStreamHeaders(header); err != nil {
+		t.Fatal(err)
+	}
+	header.Set("X-Accel-Buffering", "yes")
+	if err := checkNotifyStreamHeaders(header); err == nil {
+		t.Fatal("accepted a wrong X-Accel-Buffering value")
+	}
+}
+
+func TestNotifySubscribeAdmissionFailureIsJSONWithoutSSEHeaders(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := material.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/notify/subscribe?topic=topic", nil))
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+	if got := response.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type=%q, want application/json", got)
+	}
+	for _, header := range []string{"Cache-Control", "X-Accel-Buffering"} {
+		if got := response.Header.Get(header); got != "" {
+			t.Fatalf("admission failure leaked %s=%q", header, got)
+		}
+	}
+	var body ErrorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if body.Code != "overloaded" {
+		t.Fatalf("error code=%q, want overloaded", body.Code)
 	}
 }
 

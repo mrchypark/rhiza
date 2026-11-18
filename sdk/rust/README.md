@@ -19,6 +19,12 @@ rhizadb = "0.26.0"
 serde_json = "1"
 ```
 
+`rhizadb` 0.26.0 is the latest tagged release. The `execute_detailed` API
+described under [Managed SQL hosts](#managed-sql-hosts) is available on
+unreleased `main`; use a path dependency from a local `main` checkout until a
+release includes it. Applying this README's managed example to the 0.26.0 crate
+will not compile.
+
 For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers
 refresh the bundled native tree with `prepare-native.sh`; releases stage it with
 `stage-crate.sh`.
@@ -141,52 +147,136 @@ handle. It loads the verified runtime profile, Pod identity, bootstrap handoff,
 and optional repair handoff; cluster and Pod identity are taken from the
 process environment. The default paths are the installed paths:
 
-```rust
-let mut db = rhizadb::ManagedDb::open_from_env()?;
-let result = db.execute(
-    &rhizadb::ManagedExecuteRequest::sql("insert-42", "INSERT INTO app VALUES (?)")
-        .args([serde_json::json!("value")]),
-)?;
-result.require_committed()?;
-let rows = db.query(&rhizadb::ManagedQueryRequest::new("SELECT value FROM app"))?;
-db.close()?;
+```toml
+[dependencies]
+rhizadb = { path = "/path/to/rhiza/sdk/rust" }
+serde_json = "1"
 ```
 
-`statements` runs a transaction as one managed write. An output reference fills
-a `NULL` argument from an earlier statement's returned row:
+Replace the path with the local checkout containing unreleased `main`.
 
 ```rust
-let request = rhizadb::ManagedExecuteRequest {
-    request_id: "parent-and-child".into(),
-    sql: None,
-    args: vec![],
-    want_rows: false,
-    require_one: false,
-    statements: vec![
-        rhizadb::ManagedSqlStatement {
-            args: vec![serde_json::json!("parent")],
-            want_rows: true,
-            expected_returned_rows: Some(1),
-            ..rhizadb::ManagedSqlStatement::new(
-                "INSERT INTO parent(name) VALUES (?) RETURNING id",
-            )
-        },
-        rhizadb::ManagedSqlStatement {
-            args: vec![serde_json::Value::Null, serde_json::json!("child")],
-            output_refs: vec![rhizadb::ManagedSqlStatementOutputRef {
-                arg_index: 0,
-                statement_index: 0,
-                column_name: Some("id".into()),
-                column_index: None,
-            }],
-            ..rhizadb::ManagedSqlStatement::new(
-                "INSERT INTO child(parent_id, name) VALUES (?, ?)",
-            )
-        },
-    ],
+use rhizadb::{
+    ExecuteReturningResult, ManagedDb, ManagedExecuteRequest, ManagedQueryRequest,
+    ManagedRecoveryResult, ManagedSqlStatement, ManagedSqlStatementOutputRef, MutationKind,
 };
-db.execute(&request)?.require_committed()?;
+use serde_json::{json, Value};
+use std::error::Error;
+
+fn execute_managed(
+    db: &ManagedDb,
+    request: &ManagedExecuteRequest,
+) -> Result<ExecuteReturningResult, Box<dyn Error>> {
+    let result = match db.execute_detailed(request) {
+        Ok(result) => result,
+        Err(failure) if failure.error().code == "commit_unknown" => {
+            let original = match failure.mutation_context() {
+                Some(context)
+                    if context.kind() == MutationKind::Sql
+                        && context.request_id() == request.request_id.as_bytes() =>
+                {
+                    context.request_id()
+                }
+                Some(_) => return Err("mutation context changed".into()),
+                None => request.request_id.as_bytes(),
+            };
+            match db.recover_request(MutationKind::Sql, original)? {
+                ManagedRecoveryResult::Sql { request_id, result }
+                    if request_id == request.request_id.as_bytes() =>
+                {
+                    result
+                }
+                _ => return Err("original outcome remains unresolved".into()),
+            }
+        }
+        Err(failure) => return Err(failure.into_error().into()),
+    };
+
+    let receipt = &result.receipt;
+    receipt.require_committed()?;
+    let slot = receipt
+        .slot
+        .filter(|slot| *slot != 0)
+        .ok_or("committed receipt has no slot")?;
+    let retry_through = receipt
+        .retry_through_slot
+        .ok_or("committed receipt has no retry boundary")?;
+    if retry_through < slot
+        || receipt
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !code.is_empty())
+    {
+        return Err("committed receipt failed slot/retention validation".into());
+    }
+    Ok(result)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut db = ManagedDb::open_from_env()?;
+    let insert = ManagedExecuteRequest::sql(
+        "insert-42",
+        "INSERT INTO app VALUES (?)",
+    )
+    .args([json!("value")]);
+    execute_managed(&db, &insert)?;
+    let _rows = db.query(&ManagedQueryRequest::new("SELECT value FROM app"))?;
+
+    let transaction = ManagedExecuteRequest {
+        request_id: "parent-and-child".into(),
+        sql: None,
+        args: vec![],
+        want_rows: false,
+        require_one: false,
+        statements: vec![
+            ManagedSqlStatement {
+                args: vec![json!("parent")],
+                want_rows: true,
+                expected_returned_rows: Some(1),
+                ..ManagedSqlStatement::new("INSERT INTO parent(name) VALUES (?) RETURNING id")
+            },
+            ManagedSqlStatement {
+                args: vec![Value::Null, json!("child")],
+                output_refs: vec![ManagedSqlStatementOutputRef {
+                    arg_index: 0,
+                    statement_index: 0,
+                    column_name: Some("id".into()),
+                    column_index: None,
+                }],
+                ..ManagedSqlStatement::new("INSERT INTO child(parent_id, name) VALUES (?, ?)")
+            },
+        ],
+    };
+    execute_managed(&db, &transaction)?;
+
+    db.close()?;
+    Ok(())
+}
 ```
+
+Use `execute_detailed` for managed SQL mutations when the original outcome
+matters. `execute` remains source-compatible and returns only `Error`, so it
+does not expose `mutation_context`. On `commit_unknown`, keep the original request
+ID and intent. Validate the context when present, then use `recover_request` to
+resolve the exact engine-retained original; do not submit a replacement write as
+recovery. If the context is missing, use the known original kind and request ID
+with `recover_request`. Treat a mismatched context as unresolved. A mismatched
+recovery result is not a rollback confirmation either.
+
+Before accepting a receipt, require a committed status, a nonzero slot, and a
+retention boundary at or after that slot. Do not require the recovered canonical
+slot or boundary to equal the `commit_unknown` context: recovery returns the
+canonical first receipt, while a duplicate submission may have a later slot. The
+unknown attempt's slot and boundary are diagnostic retention hints, not canonical
+receipt identity. `retry_through_slot` is the inclusive retention boundary for
+the same request ID and intent; a material tip beyond it means the retained
+outcome is expired, not that the original did not commit. Exact recovery submits
+no write.
+
+The complete wrapper above also shows the transaction form: `statements` runs as
+one managed write, and an output reference fills a `NULL` argument from an earlier
+statement's returned row. Route both single-statement and transaction requests
+through the same exact-recovery helper.
 
 `ManagedDb` deliberately has no generic operation escape hatch, local mode,
 or legacy operator listener or membership methods. It exposes typed SQL, KV,
@@ -198,12 +288,11 @@ generation 0, with `before-ack` durability; see the
 original pending request, while `recover_request` selects an exact kind and ID.
 If the per-handle hint is missing or ambiguous, use `recover_request` with the
 known original kind and request ID; the engine must still retain that original.
-Writes are never automatically retried with a new request ID. An
-`Error` such as `commit_unknown` does not establish rollback. Preserve the
-original kind, raw request ID, intent, and any known slot. Use
-`recover_request(kind, request_id)` to resolve that exact retained original;
-do not resubmit the mutation as recovery. Calls use the native bridge's
-30-second default timeout.
+Writes are never automatically retried with a new request ID. A
+`commit_unknown` failure does not establish rollback. Preserve the original kind,
+raw request ID, intent, and any known slot. Use `recover_request(kind, request_id)`
+to resolve that exact retained original; do not resubmit the mutation as recovery.
+Calls use the native bridge's 30-second default timeout.
 
 ## Prebuilt native archives
 
