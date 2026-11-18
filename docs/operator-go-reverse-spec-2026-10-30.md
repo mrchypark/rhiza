@@ -6,6 +6,9 @@ not a proposed protocol. Canonical sources below are under
 `/Users/cypark/.codex/worktrees/quepaxa-go-reverse-spec/rhiza` (not this
 temporary checkout).
 
+The `Controller.Run` loop described below is a commit-scoped historical record;
+the public method has since been removed from the current package.
+
 ## Boundary and runtime loop
 
 `Controller.Run(ctx, interval)` requires non-nil `Kube` and `Bucket` and an

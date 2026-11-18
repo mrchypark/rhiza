@@ -66,13 +66,6 @@ type sourceState struct {
 	stateful        object
 }
 
-// ErrHARecoveryUnavailable prevents the legacy engine from running while the
-// v1alpha2 recovery implementation and its safety gates are incomplete.
-var ErrHARecoveryUnavailable = errors.New("HA recovery is unavailable")
-
-func (c *Controller) Run(ctx context.Context, interval time.Duration) error {
-	return ErrHARecoveryUnavailable
-}
 func (c *Controller) reconcileAll(ctx context.Context) error {
 	var resources recoveryList
 	if err := c.Kube.Get(ctx, c.resourcePath(""), &resources); err != nil {
