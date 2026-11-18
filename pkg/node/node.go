@@ -672,9 +672,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			_ = material.Close()
 			return fmt.Errorf("configure local graph indexes: %w", err)
 		}
-		if n.managedStartup != nil {
-			n.material = material
-		}
+		n.material = material
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
@@ -796,6 +794,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("writable WAL recovery base differs from authorized Local restore")
 		}
 		material, err = materializer.OpenLocalFromBase(filepath.Join(n.config.DataDir, "sqlite.db"), 4, *localRestoreAuthority, localRestoreFiles, n.config.LocalGraphNodePropertyIndexes)
+		if err != nil {
+			return err
+		}
 	} else if material == nil && !deferredManagedGraph {
 		return fmt.Errorf("materializer was not opened before Core initialization")
 	}
