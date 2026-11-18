@@ -26,6 +26,7 @@ class Chaos:
         self.forwards = {}
         self.events = []
         self.acks = {0}
+        self.acks_lock = threading.Lock()
         self.stop = threading.Event()
         self.writer = None
         self.admin = "chaos-admin"
@@ -194,7 +195,8 @@ class Chaos:
             while not self.stop.is_set() and i <= 1000:
                 try:
                     self.execute("rhiza-0", f"chaos-write-{i}", f"INSERT INTO chaos_items VALUES ({i}, 'acknowledged')")
-                    self.acks.add(i)
+                    with self.acks_lock:
+                        self.acks.add(i)
                     i += 1
                 except (RuntimeError, OSError, http.client.HTTPException, ValueError):
                     pass  # Retry the same request ID after the injected fault.
@@ -203,7 +205,12 @@ class Chaos:
         self.writer.start()
 
     def verify_data(self, pod):
-        expected = self.acks.copy()
+        lock = getattr(self, "acks_lock", None)
+        if lock is not None:
+            with lock:
+                expected = self.acks.copy()
+        else:
+            expected = self.acks.copy()
         data = self.http(pod, "/sql/query", {
             "sql": "SELECT id FROM chaos_items ORDER BY id",
             "consistency": "linearizable",
@@ -286,7 +293,8 @@ class Chaos:
         assert self.status("learner-a")["voting"]
         assert self.get("statefulset", "rhiza")["spec"]["replicas"] == 2
         self.execute("learner-a", "promoted-write", "INSERT INTO chaos_items VALUES (10001, 'promoted')")
-        self.acks.add(10001)
+        with self.acks_lock:
+            self.acks.add(10001)
         self.event("partition_and_operator_restart_pass", config=self.status("learner-a")["config_id"])
 
         # A second replacement uses an already promoted standalone voter.
@@ -354,6 +362,12 @@ class Chaos:
             self.writer.join(timeout=15)
         for _, proc, _ in self.forwards.values():
             proc.terminate()
+        for _, proc, _ in self.forwards.values():
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         for kind in ("pods", "statefulsets", "deployments", "rhizarecoveries", "events"):
             try:
                 (self.out / f"{kind}.json").write_text(self.k("get", kind, "-o", "json"))

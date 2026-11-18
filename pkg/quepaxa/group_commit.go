@@ -38,6 +38,9 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 // syncBatch joins the pending batch before requesting an early flush. The
 // existing worker still serializes WAL Sync and publishes the shared result.
 func (g *groupCommit) syncBatch(ctx context.Context, immediate bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	if g.pending == nil {
 		g.pending = &commitBatch{done: make(chan struct{})}

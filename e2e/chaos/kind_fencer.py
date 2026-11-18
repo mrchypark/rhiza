@@ -243,7 +243,12 @@ class _FenceHandler(BaseHTTPRequestHandler):
         if urllib.parse.urlsplit(self.path).path != WEBHOOK_PATH:
             self.send_error(404)
             return
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            return
         if length <= 0 or length > MAX_BODY:
             self._respond({"uid": "", "allowed": False,
                            "status": {"message": "invalid content length"}})
