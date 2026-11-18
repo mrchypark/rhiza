@@ -964,7 +964,9 @@ func (r *ReadReplica) finishLearnerCheckpoint(ctx context.Context, job *learnerC
 	localtesthooks.Hit("learner:checkpoint-compaction-finished")
 	r.haltLearnerCheckpointRenewal(job)
 	job.mu.Lock()
-	leaseLost, leaseErr := job.leaseLost, job.leaseErr
+	leaseLost, leaseErr, deadline := job.leaseLost, job.leaseErr, job.deadline
+	// This is post-commit detection; it cannot undo compaction or earlier root deletion.
+	leaseExpired := !time.Now().Before(deadline)
 	job.phase = learnerCheckpointVerifying
 	job.mu.Unlock()
 	if compactErr != nil {
@@ -974,8 +976,17 @@ func (r *ReadReplica) finishLearnerCheckpoint(ctx context.Context, job *learnerC
 		return failure
 	}
 	r.syncedHead = nil
-	if leaseLost {
+	if leaseLost || leaseErr != nil {
+		if leaseErr == nil {
+			leaseErr = fmt.Errorf("checkpoint recovery pin lease loss was not reported")
+		}
 		failure := fmt.Errorf("checkpoint floor committed after pin lease loss; reopen required: %w", leaseErr)
+		r.latchLearnerCheckpointFailure(failure)
+		r.stopLearnerCheckpointJob()
+		return failure
+	}
+	if leaseExpired {
+		failure := fmt.Errorf("checkpoint floor committed after confirmed renewal deadline expiration; reopen required: confirmed renewal deadline expired after compaction")
 		r.latchLearnerCheckpointFailure(failure)
 		r.stopLearnerCheckpointJob()
 		return failure
