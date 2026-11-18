@@ -186,6 +186,9 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 				}
 				return a.publish(workCtx, a.candidate)
 			})
+			if claim != nil {
+				a.candidate.claim = claim
+			}
 			if errors.Is(err, ErrPublisherFenced) {
 				a.candidate = nil
 				return a.create(ctx)
@@ -199,7 +202,6 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 				}
 				return 0, err
 			}
-			a.candidate.claim = claim
 		} else if a.publish == nil {
 			return 0, fmt.Errorf("checkpoint certification callback is required")
 		} else if err := a.publish(ctx, a.candidate); err != nil {
@@ -215,12 +217,13 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 			return 0, fmt.Errorf("checkpoint candidate was not promoted after certification")
 		}
 		index := a.candidate.Index
-		if a.candidate.claim != nil {
-			if err := a.manager.ReleasePublisherClaim(ctx, a.candidate.claim); err != nil && !errors.Is(err, ErrPublisherFenced) {
+		promotedClaim := a.candidate.claim
+		a.candidate = nil
+		if promotedClaim != nil {
+			if err := a.manager.ReleasePublisherClaim(ctx, promotedClaim); err != nil && !errors.Is(err, ErrPublisherFenced) {
 				return 0, err
 			}
 		}
-		a.candidate = nil
 		return index, nil
 	}
 	var claim *PublisherClaim

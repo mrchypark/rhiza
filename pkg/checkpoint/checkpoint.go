@@ -1078,12 +1078,15 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 		return nil, err
 	}
 	files := make([]File, 0, len(root.Files))
+	cleanupFiles := func() {
+		for _, created := range files {
+			_ = os.Remove(created.Path)
+		}
+	}
 	for _, file := range root.Files {
 		file.Path = filePath(dir, file.Role)
 		if err := m.downloadFile(ctx, root.Index, file); err != nil {
-			for _, created := range files {
-				_ = os.Remove(created.Path)
-			}
+			cleanupFiles()
 			return nil, err
 		}
 		files = append(files, file)
@@ -1091,6 +1094,7 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 	for _, file := range files {
 		if file.Role == RoleSQLite {
 			if err := sqlpolicy.CheckFileForPolicy(ctx, file.Path, m.expectedPolicy); err != nil {
+				cleanupFiles()
 				return nil, err
 			}
 		}
@@ -1098,15 +1102,25 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 	m.verifiedMu.Lock()
 	if err := m.loadVerifiedBlocks(); err != nil {
 		m.verifiedMu.Unlock()
+		cleanupFiles()
 		return nil, err
 	}
+	added := make([]string, 0)
 	for _, file := range root.Files {
 		for _, block := range file.Blocks {
-			m.verified[blockObjectKey(block)] = block.Size
+			key := blockObjectKey(block)
+			if _, exists := m.verified[key]; !exists {
+				added = append(added, key)
+			}
+			m.verified[key] = block.Size
 		}
 	}
 	if err := m.storeVerifiedBlocks(); err != nil {
+		for _, key := range added {
+			delete(m.verified, key)
+		}
 		m.verifiedMu.Unlock()
+		cleanupFiles()
 		return nil, err
 	}
 	m.verifiedRoots[root.RootHash] = verifiedRoot{index: root.Index, state: root.Hash}
