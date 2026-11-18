@@ -115,6 +115,8 @@ fn main() {
         "go.sum",
         "rhiza.go",
         "replica.go",
+        "replica_learner_checkpoint.go",
+        "replica_sync.go",
         "membership.go",
         "config_env.go",
         "operator_handler.go",
