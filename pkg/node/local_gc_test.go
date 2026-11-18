@@ -929,6 +929,21 @@ func TestLocalGCConfigPreservesNonLocalDefaults(t *testing.T) {
 	}
 }
 
+func TestLocalGCConfigPreservesPositiveNonLocalSettings(t *testing.T) {
+	config := types.ExecutionConfig{
+		ObjStoreGCInterval:    time.Hour,
+		ObjStoreGCGracePeriod: 48 * time.Hour,
+		CheckpointRetainCount: 2,
+	}
+	before := config
+	if err := validateLocalGCConfig(&config); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(config, before) {
+		t.Fatalf("positive non-Local configuration changed: %+v", config)
+	}
+}
+
 func TestLocalGCConfigInvalidBeforeIO(t *testing.T) {
 	for _, test := range []struct {
 		name string

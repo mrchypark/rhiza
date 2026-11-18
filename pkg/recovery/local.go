@@ -322,6 +322,8 @@ func createLocalArchiveFromPrepared(ctx context.Context, genesis *LocalArchiveGe
 
 // ReadOnly preserves the captured archive view and rejects every mutation.
 func (a *LocalArchive) ReadOnly() *LocalArchive {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return &LocalArchive{
 		bucket: &readOnlyLocalArchiveBucket{Bucket: a.bucket}, prefix: a.prefix,
 		Binding: a.Binding, head: a.head, headHash: a.headHash, version: a.version,

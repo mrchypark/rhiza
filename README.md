@@ -58,11 +58,14 @@ After final lease-margin hardening, all six GC tests and two strengthened
 restore tests passed again on each provider, without skips.
 `CheckpointInterval` defaults to 15 minutes and skips new periodic
 checkpoints when state is unchanged. `CheckpointRetainCount` is an `int`; zero
-selects 3 snapshots. `ObjStoreGCInterval` defaults to 1 hour and
-environment configuration defaults GC grace to 24 hours. Direct Go
+selects 3 snapshots. `ObjStoreGCInterval` defaults to 1 hour for Local
+backup GC, and environment configuration defaults GC grace to 24 hours. Direct Go
 `ObjStoreGCGracePeriod` zero also selects 24 hours, including explicit environment
 zero; positive values are preserved. Never
 delete backup objects based only on age.
+Non-Local HA checkpoint and archive managers are append-only and do not run
+online GC or reclaim objects. Positive GC settings are accepted but do not
+enable HA reclamation.
 
 ```go
 db, err := rhiza.Open(ctx, rhiza.Config{
@@ -134,7 +137,7 @@ keep the operator loop running: it applies CR replica targets one step at a time
 while the Rhiza Host certifies membership through QuePaxa. Manual mode changes
 `voterCount` and the Deployment together. Pod loss alone never removes
 membership. Ordinary requests do not reserve a Kubernetes CR per mutation. HA
-object data is append-only with no online delete GC. Recreate rollout enforcement
+object data is append-only with no online delete GC or reclamation. Recreate rollout enforcement
 and peer/client Service management are not supplied by the initializer.
 Whole-generation DR is not implemented by the operator: recovery API/schema fields
 are not an executor. Preserve pending/UNKNOWN evidence and restore the original

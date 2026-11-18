@@ -74,8 +74,10 @@ type ExecutionConfig struct {
 	ObjStoreDurability             ObjectStoreDurability `json:"objstore_durability"`
 	ObjStoreSyncInterval           time.Duration         `json:"objstore_sync_interval"`
 	ObjStoreBatchDelay             time.Duration         `json:"objstore_batch_delay"`
-	ObjStoreGCInterval             time.Duration         `json:"objstore_gc_interval"`
-	ObjStoreGCGracePeriod          time.Duration         `json:"objstore_gc_grace_period"`
+	// ObjStoreGCInterval controls Local backup GC. Non-Local HA managers remain
+	// append-only; positive values are accepted but do not reclaim HA data.
+	ObjStoreGCInterval    time.Duration `json:"objstore_gc_interval"`
+	ObjStoreGCGracePeriod time.Duration `json:"objstore_gc_grace_period"`
 
 	// Timing
 	CheckpointInterval    time.Duration `json:"checkpoint_interval"`

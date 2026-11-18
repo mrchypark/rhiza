@@ -206,7 +206,8 @@ Deployment or external lease service is not required for normal quorum repair.
 The reference-host loop adds a fresh voter ID/WAL, verifies certified admission,
 then removes the failed identity. Lost WALs never reuse voter IDs;
 same-identity rejoin requires the original WAL and current certified membership.
-HA object data is append-only, with no online delete GC.
+HA object data is append-only, with no online delete GC or reclamation. Positive
+`ObjStoreGCInterval` settings are accepted but do not enable HA GC.
 Normal managed HA supports only the explicit policy-9 request and policy-10
 Graph append-only profiles. Retired policy-7/8 profiles are not success lanes
 or implicit defaults; their data must not be relabeled or silently migrated.

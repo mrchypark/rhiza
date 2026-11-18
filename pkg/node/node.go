@@ -672,9 +672,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			_ = material.Close()
 			return fmt.Errorf("configure local graph indexes: %w", err)
 		}
-		if n.managedStartup != nil {
-			n.material = material
-		}
+		n.material = material
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
@@ -796,6 +794,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return fmt.Errorf("writable WAL recovery base differs from authorized Local restore")
 		}
 		material, err = materializer.OpenLocalFromBase(filepath.Join(n.config.DataDir, "sqlite.db"), 4, *localRestoreAuthority, localRestoreFiles, n.config.LocalGraphNodePropertyIndexes)
+		if err != nil {
+			return err
+		}
 	} else if material == nil && !deferredManagedGraph {
 		return fmt.Errorf("materializer was not opened before Core initialization")
 	}
@@ -1523,7 +1524,7 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					return err
 				}
 				seal := quepaxa.CheckpointSeal{
-					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
+					ConfigID: core.ClusterForSlot(quepaxa.Slot(root.Index) + 1).ConfigID, Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
 					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following,
 					GenerationAnchorHash: core.GenerationAnchorHash(),
 				}
@@ -1568,7 +1569,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			return nil
 		})
 	}
-	if n.checkpoints != nil && n.managedStartup == nil && n.config.ObjStoreGCInterval > 0 {
+	// n.checkpoints is currently initialized only for non-Local append-only
+	// managers. Keep this legacy worker Local-only so HA never starts it.
+	if n.config.Local && n.checkpoints != nil && n.config.ObjStoreGCInterval > 0 {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()

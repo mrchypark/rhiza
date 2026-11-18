@@ -2,8 +2,12 @@ package fencing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -117,5 +121,41 @@ func TestSupervisorExitedChildReplaysOnlySameReceiptDuringAuthorityOutage(t *tes
 	}
 	if a.drains != 2 || a.exits != 2 || cleanups != 1 {
 		t.Fatalf("drains=%d exits=%d namespace=%d", a.drains, a.exits, cleanups)
+	}
+}
+
+func TestSupervisorRetainsUnknownMutationBlockerAcrossDrainOutage(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = "wal"
+	a := &completionAuthority{
+		request:         StopRequest{OperationID: "op", RequestHash: "hash", Identity: id},
+		transientDrains: 1,
+	}
+	s := &Supervisor{Authority: a, bound: id, ticket: "ticket"}
+	h := s.handler()
+
+	post := func(receipt DrainReceipt) int {
+		raw, err := json.Marshal(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/drained", strings.NewReader(string(raw)))
+		req.Header.Set("Authorization", "Bearer ticket")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := post(DrainReceipt{Request: a.request, WritersJoined: true, UnknownMutations: 1}); code != http.StatusConflict {
+		t.Fatalf("expected 409 for unclean drain, got %d", code)
+	}
+
+	if code := post(DrainReceipt{Request: a.request, WritersJoined: true}); code != http.StatusConflict {
+		t.Fatalf("expected 409 when clean drain follows unknown-mutation drain, got %d", code)
+	}
+
+	err := s.finishExitedChild(t.Context(), func(context.Context) error { return nil })
+	if err == nil || a.drains != 2 || a.exits != 0 {
+		t.Fatalf("expected exit blocked and drain retried, err=%v drains=%d exits=%d", err, a.drains, a.exits)
 	}
 }

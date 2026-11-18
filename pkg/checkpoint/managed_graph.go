@@ -300,7 +300,8 @@ func (m *Manager) PromoteManagedAppendOnlyLocator(ctx context.Context, l Managed
 	if err := l.validate(policy); err != nil {
 		return err
 	}
-	if _, err := m.OpenRoot(ctx, l.Index, l.RootHash); err != nil {
+	root, err := m.OpenRoot(ctx, l.Index, l.RootHash)
+	if err != nil {
 		return err
 	}
 	data, err := json.Marshal(l)
@@ -335,21 +336,26 @@ func (m *Manager) PromoteManagedAppendOnlyLocator(ctx context.Context, l Managed
 			priorRank := [2]uint64{prior.Index, prior.SealDecisionSlot}
 			newRank := [2]uint64{l.Index, l.SealDecisionSlot}
 			if priorRank[0] > newRank[0] || priorRank[0] == newRank[0] && priorRank[1] > newRank[1] {
+				m.observeManagedAppendOnlyRoot(ctx, policy, prior)
 				return ErrStaleCheckpoint
 			}
 			if priorRank == newRank {
 				if prior != l {
+					m.observeManagedAppendOnlyRoot(ctx, policy, prior)
 					return fmt.Errorf("conflicting managed append-only locator at equal rank")
 				}
+				m.rememberManagedAppendOnlyRoot(policy, l, root)
 				return nil
 			}
 			options = []objstore.ObjectUploadOption{objstore.WithIfMatch(attr.Version)}
 		}
 		err = m.bucket.Upload(ctx, key, bytes.NewReader(data), options...)
 		if err == nil {
+			m.rememberManagedAppendOnlyRoot(policy, l, root)
 			return nil
 		}
 		if stored, exists, readErr := m.LoadManagedAppendOnlyLocator(ctx, policy); readErr == nil && exists && stored == l {
+			m.rememberManagedAppendOnlyRoot(policy, l, root)
 			return nil
 		}
 		if !m.bucket.IsConditionNotMetErr(err) {
@@ -357,4 +363,50 @@ func (m *Manager) PromoteManagedAppendOnlyLocator(ctx context.Context, l Managed
 		}
 	}
 	return fmt.Errorf("managed append-only CURRENT CAS did not converge")
+}
+
+// rememberManagedAppendOnlyRoot updates only in-memory state from an already
+// verified root. A higher cut is monotonic; an ambiguous same-cut root clears
+// the cache rather than risking reuse from the wrong decision.
+func (m *Manager) rememberManagedAppendOnlyRoot(policy sqlpolicy.MaterializationPolicy, locator ManagedAppendOnlyLocator, root *Checkpoint) {
+	if policy != sqlpolicy.ManagedRequestMaterializationPolicy {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if root == nil || root.Index != locator.Index || root.RootHash != locator.RootHash || root.Generation != locator.Index {
+		return
+	}
+	if m.certified != nil && root.Index < m.certified.Index {
+		return
+	}
+	if m.certified != nil && root.Index == m.certified.Index && root.RootHash != m.certified.RootHash {
+		m.certified = nil
+		return
+	}
+	copy := *root
+	m.certified = &copy
+	// Append-only managers do not run GarbageCollectFrom; keep only the latest certified root in memory.
+	m.checkpoints = []Checkpoint{copy}
+}
+
+// observeManagedAppendOnlyRoot makes a best-effort cache update from a locator
+// already read from CURRENT. Its read failure cannot change the caller's result.
+func (m *Manager) observeManagedAppendOnlyRoot(ctx context.Context, policy sqlpolicy.MaterializationPolicy, locator ManagedAppendOnlyLocator) {
+	if policy != sqlpolicy.ManagedRequestMaterializationPolicy {
+		return
+	}
+	if latest := m.Latest(); latest != nil && (latest.Index > locator.Index || latest.Index == locator.Index && latest.RootHash == locator.RootHash) {
+		return
+	}
+	root, err := m.OpenRoot(ctx, locator.Index, locator.RootHash)
+	if err != nil {
+		m.mu.Lock()
+		if m.certified != nil && m.certified.Index == locator.Index && m.certified.RootHash != locator.RootHash {
+			m.certified = nil
+		}
+		m.mu.Unlock()
+		return
+	}
+	m.rememberManagedAppendOnlyRoot(policy, locator, root)
 }
