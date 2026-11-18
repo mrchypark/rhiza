@@ -655,7 +655,7 @@ func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster
 			return quepaxa.Cluster{}, err
 		}
 		if checkpoint {
-			return s.server.core.ClusterForSlot(seal.Index), nil
+			return s.server.core.ClusterForSlot(seal.Index + 1), nil
 		}
 	}
 	return s.server.core.CurrentCluster(), nil
