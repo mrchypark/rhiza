@@ -113,13 +113,6 @@ func checkFile(ctx context.Context, path string, immutable bool, expected Materi
 		return fmt.Errorf("%w: %v", ErrIncompatible, err)
 	}
 	defer db.Close()
-	var policy string
-	if err := db.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
-		return fmt.Errorf("%w: missing materialization marker: %v", ErrIncompatible, err)
-	}
-	if policy != strconv.Itoa(int(expected)) {
-		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
-	}
 	rows, err := db.QueryContext(ctx, `PRAGMA main.table_list`)
 	if err != nil {
 		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
@@ -137,6 +130,13 @@ func checkFile(ctx context.Context, path string, immutable bool, expected Materi
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+	}
+	var policy string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&policy); err != nil {
+		return fmt.Errorf("%w: missing materialization marker: %v", ErrIncompatible, err)
+	}
+	if policy != strconv.Itoa(int(expected)) {
+		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
 	}
 	return nil
 }
