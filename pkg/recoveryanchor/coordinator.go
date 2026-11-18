@@ -258,8 +258,8 @@ func validateFrozen(record Record, req Request, rhash string) error {
 }
 
 func (c *Coordinator) Verify(ctx context.Context, req Request, receipt Receipt) error {
-	if c.Backend == nil {
-		return fmt.Errorf("backend is required")
+	if c.Backend == nil || c.EvidenceFormat == "" {
+		return fmt.Errorf("backend and evidence format are required")
 	}
 	rhash, err := RequestHash(req)
 	if err != nil {
