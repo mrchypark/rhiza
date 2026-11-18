@@ -157,7 +157,7 @@ func ValidateConfig(cfg Config) error {
 			return fmt.Errorf("GCS endpoint and insecure overrides are unsupported")
 		}
 	case ProviderAzure:
-		if cfg.Bucket == "" || cfg.AzureStorageAccount == "" {
+		if cfg.Bucket == "" || (cfg.AzureStorageAccount == "" && cfg.AzureConnectionString == "") {
 			return fmt.Errorf("Azure container and storage account are required")
 		}
 		if cfg.Insecure {
