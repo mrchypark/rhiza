@@ -110,6 +110,13 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	}
 	h := &Host{cfg: cfg, node: node.New(&cfg.Runtime)}
 	h.admissionLifetime, h.stopAdmission = context.WithCancel(context.Background())
+	opened := false
+	defer func() {
+		if !opened {
+			h.stopAdmission()
+			_ = h.node.Shutdown()
+		}
+	}()
 	source, member, err := h.node.PreparedStartupBindingDigestsForProtocol(cfg.Plan.ApplicationProtocol)
 	if err != nil {
 		return nil, logManagedHostOpenFailure(openStage, err)
@@ -224,6 +231,7 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if err := h.node.OpenManaged(ctx, node.ManagedStartupConfig{StorageRoot: cfg.StorageRoot, PeerRecovery: true, Identity: h.identity, Checker: h, Prepared: cfg.Prepared, RepairOrigin: cfg.RepairOrigin, BootstrapMember: cfg.Runtime.Learner == nil}); err != nil {
 		return nil, logManagedHostOpenFailure(openStage, err)
 	}
+	opened = true
 	openStage = "host_initialization"
 	if initial.Assignment().State == "Unused" {
 		if graphBootstrap {
@@ -365,15 +373,11 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 		}
 		return nil
 	}
-	_, err = h.live(ctx)
+	a, err := h.live(ctx)
 	if err != nil {
 		return err
 	}
 	if i.Fresh {
-		a, err := h.live(ctx)
-		if err != nil {
-			return err
-		}
 		if _, pending := a.Pending(); a.EverApplicationReserved() || pending {
 			// Keep the owner and private peers alive; live application admission
 			// below requires actual history rather than this stale startup hint.

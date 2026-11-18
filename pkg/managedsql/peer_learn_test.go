@@ -61,7 +61,7 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 				h, err := fixture.open(ctx, configs[i])
 				if h != nil {
 					t.Cleanup(func() {
-						if err := h.Close(); err != nil {
+						if err := fixture.closeHost(h); err != nil {
 							t.Error(err)
 						}
 					})
@@ -235,7 +235,7 @@ func TestActualManagedPeerLearnRequiresRuntimeBinding(t *testing.T) {
 			}
 			before, applied := readWAL(), readApplied()
 			closeStarted = true
-			go func() { closeDone <- hosts[1].Close() }()
+			go func() { closeDone <- fixture.closeHost(hosts[1]) }()
 			ticker := time.NewTicker(10 * time.Millisecond)
 			defer ticker.Stop()
 			for {
