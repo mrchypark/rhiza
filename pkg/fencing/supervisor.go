@@ -139,6 +139,11 @@ func (s *Supervisor) finishExitedChild(ctx context.Context, namespace func(conte
 	receipt := s.drain
 	s.mu.Unlock()
 	if receipt != nil {
+		if !receipt.Clean() && receipt.UnknownMutations > 0 {
+			if err := retryAuthorityTransition(ctx, func() error { return s.Authority.Drain(ctx, *receipt) }); err != nil {
+				return err
+			}
+		}
 		return s.finishDrain(ctx, *receipt, func() error { return nil }, namespace)
 	}
 	return s.recordNeverBoundExit(ctx, namespace)
@@ -277,13 +282,32 @@ func (s *Supervisor) handler() http.Handler {
 					err = fmt.Errorf("fencing: unmatched drain request")
 				}
 				if err == nil {
-					s.mu.Lock()
-					if s.drain == nil {
-						s.drain = &receipt
-					} else if *s.drain != receipt {
-						err = fmt.Errorf("fencing: drain changed")
+					if !receipt.Clean() {
+						if receipt.UnknownMutations > 0 {
+							s.mu.Lock()
+							if s.drain == nil {
+								latched := receipt
+								s.drain = &latched
+							} else if *s.drain != receipt {
+								err = fmt.Errorf("fencing: drain changed")
+							}
+							s.mu.Unlock()
+							if err == nil {
+								_ = s.Authority.Drain(r.Context(), receipt)
+							}
+						}
+						if err == nil {
+							err = fmt.Errorf("fencing: drain receipt is not clean")
+						}
+					} else {
+						s.mu.Lock()
+						if s.drain == nil {
+							s.drain = &receipt
+						} else if *s.drain != receipt {
+							err = fmt.Errorf("fencing: drain changed")
+						}
+						s.mu.Unlock()
 					}
-					s.mu.Unlock()
 				}
 			}
 		} else {
@@ -319,35 +343,41 @@ func (s *Supervisor) handler() http.Handler {
 
 func (s *Supervisor) identityRequest(ctx context.Context, path string, identity Identity) (any, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	bound := s.bound
+	s.mu.Unlock()
 	switch path {
 	case "/v1/startup":
-		if identity.SourceClusterID != s.bound.SourceClusterID || identity.NodeID != s.bound.NodeID {
+		if identity.SourceClusterID != bound.SourceClusterID || identity.NodeID != bound.NodeID {
 			return nil, fmt.Errorf("fencing: startup identity mismatch")
 		}
-		if _, err := s.Authority.Stop(ctx, s.bound); err != ErrPending {
+		if _, err := s.Authority.Stop(ctx, bound); err != ErrPending {
 			if err == nil {
 				return nil, ErrClosed
 			}
 			return nil, err
 		}
-		return s.bound, nil
+		return bound, nil
 	case "/v1/bind":
 		if identity.WALIdentity == "" {
 			return nil, fmt.Errorf("fencing: empty WAL")
 		}
 		before := identity
-		before.WALIdentity = s.bound.WALIdentity
-		if before != s.bound || (s.bound.WALIdentity != "" && s.bound.WALIdentity != identity.WALIdentity) {
+		before.WALIdentity = bound.WALIdentity
+		if before != bound || (bound.WALIdentity != "" && bound.WALIdentity != identity.WALIdentity) {
 			return nil, fmt.Errorf("fencing: binding differs")
 		}
 		if err := s.Authority.Bind(ctx, identity); err != nil {
 			return nil, err
 		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.bound.WALIdentity != "" && s.bound.WALIdentity != identity.WALIdentity {
+			return nil, fmt.Errorf("fencing: binding differs")
+		}
 		s.bound = identity
 		return nil, nil
 	case "/v1/stop":
-		if identity != s.bound {
+		if identity != bound {
 			return nil, fmt.Errorf("fencing: incarnation differs")
 		}
 		return s.Authority.Stop(ctx, identity)

@@ -99,8 +99,13 @@ func (l *Ledger) CloseNodes(operationID, requestHash string, nodeIDs []string) e
 		if nodeID == "" {
 			return fmt.Errorf("fencing: empty voter slot")
 		}
-		if old, ok := l.ClosedNodes[nodeID]; ok && old.OperationID == operationID && old.RequestHash != requestHash {
-			return fmt.Errorf("fencing: immutable voter request hash changed")
+		if old, ok := l.ClosedNodes[nodeID]; ok {
+			if old.OperationID != operationID {
+				return ErrClosed
+			}
+			if old.RequestHash != requestHash {
+				return fmt.Errorf("fencing: immutable voter request hash changed")
+			}
 		}
 	}
 	if l.ClosedNodes == nil {
