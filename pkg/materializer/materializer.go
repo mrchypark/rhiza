@@ -839,21 +839,27 @@ func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKi
 		}
 		return record.fingerprint == fingerprint, true, nil
 	}
+	_, found, matches, err := m.requestStatus(ctx, kind, requestID, fingerprint)
+	return matches, found, err
+}
+
+// requestStatus returns the retained receipt and fingerprint match from one lookup.
+func (m *Materializer) requestStatus(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
 	reader, err := m.reader()
 	if err != nil {
-		return false, false, err
+		return types.MutationReceipt{}, false, false, err
 	}
 	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
-		return true, false, nil
+		return types.MutationReceipt{}, false, true, nil
 	}
 	if err != nil {
-		return false, false, err
+		return types.MutationReceipt{}, false, false, err
 	}
 	if m.Tip() > record.receipt.RetryThroughSlot {
-		return true, false, nil
+		return types.MutationReceipt{}, false, true, nil
 	}
-	return record.fingerprint == fingerprint, true, nil
+	return record.receipt, true, record.fingerprint == fingerprint, nil
 }
 
 func (m *Materializer) receiptInTx(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string) (storedReceipt, bool, error) {
@@ -1111,11 +1117,7 @@ func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string
 	if len(receipts) == 1 {
 		pending := receipts[0]
 		receipt := pending.record.receipt
-		encodedResult, err := encodeSQLResult(pending.record.sqlResult)
-		if err != nil {
-			return false, err
-		}
-		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, encodedResult)
+		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, pending.encodedResult)
 		if err != nil {
 			return false, err
 		}
@@ -1143,11 +1145,7 @@ func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string
 		}
 		query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		receipt := pending.record.receipt
-		encodedResult, err := encodeSQLResult(pending.record.sqlResult)
-		if err != nil {
-			return false, err
-		}
-		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, encodedResult)
+		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, pending.encodedResult)
 	}
 	query.WriteString(` ON CONFLICT(kind, request_id) DO NOTHING`)
 	result, err := execPrepared(ctx, tx, prepared, query.String(), args...)
@@ -1197,6 +1195,7 @@ type pendingNotification struct {
 type pendingSQLReceipt struct {
 	requestID     string
 	record        storedReceipt
+	encodedResult []byte
 	persisted     bool
 	executionItem []byte
 	batchIndex    uint32
@@ -1277,6 +1276,11 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	pending := make([]pendingNotification, 0)
 	m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
 	m.pendingSQLResultBytes = 0
+	defer func() {
+		clear(m.pendingSQLReceipts)
+		m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
+		m.pendingSQLResultBytes = 0
+	}()
 	for _, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
@@ -1336,9 +1340,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		clear(m.recentSQLReceipts)
 	}
 	for _, pending := range pendingReceipts {
-		record := pending.record
-		record.sqlResult = types.SQLCommandResult{}
-		m.recentSQLReceipts[pending.requestID] = record
+		m.recentSQLReceipts[pending.requestID] = pending.record
 	}
 	for _, notification := range pending {
 		m.enqueueNotification(notification)
@@ -1519,14 +1521,24 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		commands = nil
 		batched = true
 	} else if kv {
-		if err := m.applyKV(ctx, tx, slot, kvCommand, 0); err != nil {
+		if err := m.applyKV(ctx, tx, nil, slot, kvCommand, 0); err != nil {
 			return err
 		}
 		commands = nil
 		batched = true
 	} else if kvBatch {
+		var kvStatements map[string]*sql.Stmt
+		if len(kvCommands) > 1 {
+			// Statements prepared as internal KV must never be reused as user SQL.
+			kvStatements = make(map[string]*sql.Stmt)
+			defer func() {
+				for _, statement := range kvStatements {
+					statement.Close()
+				}
+			}()
+		}
 		for index, command := range kvCommands {
-			if err := m.applyKV(ctx, tx, slot, command, uint32(index)); err != nil {
+			if err := m.applyKV(ctx, tx, kvStatements, slot, command, uint32(index)); err != nil {
 				return err
 			}
 		}
@@ -1578,7 +1590,8 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
-		result, executeErr := executeSQLCommand(ctx, conn, tx, statements, command)
+		var encodedResult []byte
+		result, executeErr := executeSQLCommand(ctx, conn, tx, statements, command, &encodedResult)
 		if errors.Is(executeErr, errSQLPolicyState) {
 			return executeErr
 		}
@@ -1614,9 +1627,8 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 			if len(command.Statements) == 0 && command.WantRows {
 				storedResult = result
 			}
-			encodedResult, err := encodeSQLResult(storedResult)
-			if err != nil {
-				return fmt.Errorf("encode retained SQL result: %w", err)
+			if len(storedResult.Statements) == 0 {
+				encodedResult = nil
 			}
 			if !m.sqlReceiptRetention.admits(0, m.idempotencyWindow) {
 				return fmt.Errorf("SQL receipt envelope counter exceeds policy bounds")
@@ -1631,7 +1643,14 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 				receipt = types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeResultRetentionFull, RetryThroughSlot: slot + m.idempotencyWindow - 1}
 			}
 			m.sqlReceiptRetention.add(uint64(len(encodedResult)))
-			pendingReceipt := pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}}
+			resultCharge := max(sqlResultWorkingBytes(storedResult), len(encodedResult))
+			if cap(encodedResult) > resultCharge {
+				// Do not retain spare encoder capacity beyond the working-set charge.
+				compact := make([]byte, len(encodedResult))
+				copy(compact, encodedResult)
+				encodedResult = compact
+			}
+			pendingReceipt := pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}, encodedResult: encodedResult}
 			if originalsPolicy(m.materializationPolicy) {
 				pendingReceipt.executionItem, err = types.EncodeSQLBatchItem(command)
 				if err != nil {
@@ -1640,7 +1659,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 				pendingReceipt.batchIndex = uint32(commandIndex)
 			}
 			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingReceipt)
-			m.pendingSQLResultBytes += sqlResultWorkingBytes(storedResult)
+			m.pendingSQLResultBytes += resultCharge
 			if m.pendingSQLResultBytes >= MaxMutationResultBytes {
 				if err := m.flushPendingSQLReceipts(ctx, tx, statements); err != nil {
 					return err
@@ -1720,7 +1739,14 @@ func (m *Materializer) NotificationDrops() uint64 {
 	return m.notifyDrops.Load()
 }
 
-func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand, batchIndex uint32) error {
+func execKV(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string, args ...any) (sql.Result, error) {
+	if prepared == nil {
+		return tx.ExecContext(ctx, query, args...)
+	}
+	return execPrepared(ctx, tx, prepared, query, args...)
+}
+
+func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, slot uint64, command types.KVCommand, batchIndex uint32) error {
 	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
@@ -1738,16 +1764,17 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	} else if found {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE rowid IN (SELECT rowid FROM _rhiza_kv WHERE expires_at_unix_ms > 0 AND expires_at_unix_ms <= ? LIMIT 256)`, command.ObservedAtUnixMS); err != nil {
+	if _, err := execKV(ctx, tx, prepared, `DELETE FROM _rhiza_kv WHERE rowid IN (SELECT rowid FROM _rhiza_kv WHERE expires_at_unix_ms > 0 AND expires_at_unix_ms <= ? LIMIT 256)`, command.ObservedAtUnixMS); err != nil {
 		return fmt.Errorf("prune expired KV entries: %w", err)
 	}
 	receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true}
+	const upsert = `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`
 	switch command.Operation {
 	case "put":
-		_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
+		_, err = execKV(ctx, tx, prepared, upsert, command.Key, command.Value, command.ExpiresAtUnixMS)
 	case "delete":
 		var affected sql.Result
-		affected, err = tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE key = ?`, command.Key)
+		affected, err = execKV(ctx, tx, prepared, `DELETE FROM _rhiza_kv WHERE key = ?`, command.Key)
 		if err == nil {
 			rows, _ := affected.RowsAffected()
 			receipt.Applied = rows > 0
@@ -1762,7 +1789,7 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 		}
 		receipt.Applied = exists == command.ExpectedExists && (!exists || bytes.Equal(current, command.Expected))
 		if receipt.Applied {
-			_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
+			_, err = execKV(ctx, tx, prepared, upsert, command.Key, command.Value, command.ExpiresAtUnixMS)
 		}
 	}
 	if err != nil {
@@ -1834,6 +1861,15 @@ func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCom
 	}
 	matches, _, err := m.requestMatches(ctx, types.MutationKV, command.RequestID, fingerprint)
 	return matches, err
+}
+
+// KVRequestStatus returns the retained receipt and fingerprint match in one lookup.
+func (m *Materializer) KVRequestStatus(ctx context.Context, command types.KVCommand) (types.MutationReceipt, bool, bool, error) {
+	fingerprint, err := types.KVFingerprint(command)
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	return m.requestStatus(ctx, types.MutationKV, command.RequestID, fingerprint)
 }
 
 // NotifyRequestMatches checks whether a request ID is unused or has identical content.
@@ -2057,7 +2093,7 @@ func validatePublicSQL(query string) error {
 	return nil
 }
 
-func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
+func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand, encodedResult *[]byte) (types.SQLCommandResult, error) {
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -2219,8 +2255,12 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 		result.Statements = append(result.Statements, statementResult)
 	}
 	if wantsRows {
-		if _, err := encodeSQLResult(result); err != nil {
+		encoded, err := encodeSQLResult(result)
+		if err != nil {
 			return result, err
+		}
+		if command.RequestID != "" {
+			*encodedResult = encoded
 		}
 	}
 	return result, nil
@@ -2366,8 +2406,8 @@ func (m *Materializer) flushPendingSQLReceipts(ctx context.Context, tx *sql.Tx, 
 				return err
 			}
 		}
-		m.pendingSQLReceipts[i].record.sqlResult = types.SQLCommandResult{}
-		m.pendingSQLReceipts[i].persisted = true
+		pending.encodedResult = nil
+		pending.persisted = true
 	}
 	m.pendingSQLResultBytes = 0
 	return nil

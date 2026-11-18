@@ -441,6 +441,42 @@ func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
 	})
 }
 
+func TestKVRequestStatusCombinesReceiptAndMatch(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	first := types.KVCommand{RequestID: "status", Operation: "put", Key: "key", Value: []byte("value"), ObservedAtUnixMS: 1}
+	if receipt, found, matches, err := m.KVRequestStatus(ctx, first); err != nil || found || !matches || receipt != (types.MutationReceipt{}) {
+		t.Fatalf("missing status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	value, err := types.EncodeKVCommand(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.KVRequestStatus(ctx, first)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("exact status receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := first
+	conflict.Value = []byte("other")
+	if got, found, matches, err := m.KVRequestStatus(ctx, conflict); err != nil || !found || matches || got != receipt {
+		t.Fatalf("conflict status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+	m.mu.Lock()
+	m.tip = receipt.RetryThroughSlot + 1
+	m.mu.Unlock()
+	if got, found, matches, err := m.KVRequestStatus(ctx, first); err != nil || found || !matches || got != (types.MutationReceipt{}) {
+		t.Fatalf("expired status receipt=%+v found=%v matches=%v err=%v", got, found, matches, err)
+	}
+}
+
 func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(t.TempDir()+"/failure.db", 1)
@@ -1549,6 +1585,58 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 				if err := m.ApplyBatch(context.Background(), decisions); err != nil {
 					b.Fatal(err)
 				}
+			}
+		})
+	}
+}
+
+// Use -benchtime=200x to measure both payload sizes within the receipt budget.
+func BenchmarkSQLReturningReceipt(b *testing.B) {
+	for _, size := range []int{4096, 600000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			if size == 600000 && b.N > 200 {
+				b.Skip("use -benchtime=200x to stay within the retained-result budget")
+			}
+			m, err := Open(filepath.Join(b.TempDir(), "returning.db"), 1, 1024)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			setup, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "setup", Statements: []types.SQLStatement{
+				{SQL: "CREATE TABLE returning_payload (count INTEGER NOT NULL, payload BLOB NOT NULL)"},
+				{SQL: "INSERT INTO returning_payload VALUES (0, zeroblob(?))", Args: []any{size}},
+			}}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := m.Apply(b.Context(), 1, setup); err != nil {
+				b.Fatal(err)
+			}
+			command := types.SQLCommand{SQL: "UPDATE returning_payload SET count=count+1 RETURNING payload", WantRows: true}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := range b.N {
+				slot := uint64(iteration) + 2
+				command.RequestID = "return-" + strconv.FormatUint(slot, 10)
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := m.Apply(b.Context(), slot, value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			fingerprint, err := types.SQLFingerprint(command)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_, result, found, matches, err := m.SQLRequestResultFingerprint(b.Context(), command.RequestID, fingerprint, true)
+			if err != nil || !found || !matches || len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0]) != 1 {
+				b.Fatalf("receipt missing after benchmark: found=%v matches=%v err=%v", found, matches, err)
+			}
+			if payload, ok := result.Statements[0].Rows[0][0].([]byte); !ok || len(payload) != size {
+				b.Fatalf("returned payload length=%d, blob=%v", len(payload), ok)
 			}
 		})
 	}

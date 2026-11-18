@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -221,6 +222,42 @@ func TestSQLReceiptResultsFlushAtAggregateWorkingSetBudget(t *testing.T) {
 		if err != nil || !found || !matches || len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0][0].([]byte)) != 600_000 {
 			t.Fatalf("request=%s found=%v match=%v result=%#v err=%v", command.RequestID, found, matches, result, err)
 		}
+	}
+}
+
+func TestSQLReturningReceiptReleasesPendingResultOnRollback(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "returning.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "pending", SQL: "SELECT zeroblob(131072) AS payload", WantRows: true}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(t.Context(), []quepaxa.DecidedValue{{Slot: 1, Value: value}, {Slot: 3, Value: value}}); err == nil {
+		t.Fatal("expected a slot-gap rollback")
+	}
+	if m.pendingSQLResultBytes != 0 || cap(m.pendingSQLReceipts) == 0 || m.pendingSQLReceipts[:cap(m.pendingSQLReceipts)][0].encodedResult != nil {
+		t.Fatal("rolled back batch retained its pending result")
+	}
+	if _, found, err := m.MutationReceipt(t.Context(), types.MutationSQL, command.RequestID); err != nil || found {
+		t.Fatalf("rolled back receipt: found=%v err=%v", found, err)
+	}
+	if err := m.Apply(t.Context(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, result, found, matches, err := m.SQLRequestResultFingerprint(t.Context(), command.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0]) != 1 {
+		t.Fatalf("replayed receipt: found=%v matches=%v err=%v", found, matches, err)
+	}
+	if payload, ok := result.Statements[0].Rows[0][0].([]byte); !ok || len(payload) != 131072 {
+		t.Fatalf("replayed result length=%d, blob=%v", len(payload), ok)
 	}
 }
 
