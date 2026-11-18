@@ -754,6 +754,8 @@ impl ManagedDb {
     pub fn open_from_env() -> Result<Self> {
         Self::open(ManagedOpenConfig::default())
     }
+    /// Source-compatible SQL entry point; use [`Self::execute_detailed`] when a
+    /// `commit_unknown` result must retain its original mutation context.
     pub fn execute(&self, request: &ManagedExecuteRequest) -> Result<ExecuteReturningResult> {
         self.call("execute", serde_json::to_value(request).map_err(internal)?)
     }
@@ -1412,6 +1414,39 @@ mod managed_kv_wire_tests {
                 .unwrap_err();
         assert_eq!(old.error().code, "closed");
         assert!(old.mutation_context().is_none());
+    }
+
+    #[test]
+    fn execute_detailed_ffi_decoder_keeps_unknown_context() {
+        // Decoder-only: there is no Rust FFI injection point for invoking the method.
+        let request = ManagedExecuteRequest::sql("sql-original", "INSERT INTO t VALUES (1)");
+        let request_wire = serde_json::to_value(&request).unwrap();
+        let raw = serde_json::to_vec(&json!({
+            "error": {
+                "code": "commit_unknown",
+                "message": "managed operation rejected",
+                "mutation_context": {
+                    "kind": "sql",
+                    "request_id_b64": STANDARD.encode(request_wire["request_id"].as_str().unwrap()),
+                    "slot": 17,
+                    "retry_through_slot": 1040
+                }
+            }
+        }))
+        .unwrap();
+
+        let failure = decode_detailed_bytes::<ExecuteReturningResult>(&raw).unwrap_err();
+        let context = failure.mutation_context().unwrap();
+        assert_eq!(failure.error().code, "commit_unknown");
+        assert_eq!(context.kind(), MutationKind::Sql);
+        assert_eq!(context.request_id(), b"sql-original");
+        assert_eq!(context.slot(), 17);
+        assert_eq!(context.retry_through_slot(), 1040);
+        let _: fn(
+            &ManagedDb,
+            &ManagedExecuteRequest,
+        ) -> std::result::Result<ExecuteReturningResult, ManagedMutationError> =
+            ManagedDb::execute_detailed;
     }
 
     #[test]
