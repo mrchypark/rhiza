@@ -156,3 +156,48 @@ func TestManagedGraphStalePromotionAuthenticatesNewerLocator(t *testing.T) {
 		t.Fatal("same-cut conflicting hint was accepted")
 	}
 }
+
+func TestManagedGraphSameCutHigherSlotPromotionAuthenticatesNewerLocator(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	n, core, archive, _ := newManagedAppendOnlySelectorFixture(t)
+	sealedA, found, err := core.LatestManagedCheckpointSeal()
+	if err != nil || !found {
+		t.Fatalf("certified A missing: %+v found=%t err=%v", sealedA, found, err)
+	}
+	if err := archive.SyncThrough(ctx, core, sealedA.DecisionSlot); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.promoteManagedGraphSeal(ctx, sealedA); err != nil {
+		t.Fatalf("promote same-cut A: %v", err)
+	}
+	decisionA, exists := core.CertifiedValue(sealedA.DecisionSlot)
+	if !exists {
+		t.Fatal("same-cut A certificate missing")
+	}
+	slotB, _, err := core.Propose(ctx, decisionA.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slotB <= sealedA.DecisionSlot {
+		t.Fatalf("same-cut decision slots=%d,%d", sealedA.DecisionSlot, slotB)
+	}
+	if err := archive.SyncThrough(ctx, core, slotB); err != nil {
+		t.Fatal(err)
+	}
+	sealedB := quepaxa.SealedCheckpoint{CheckpointSeal: sealedA.CheckpointSeal, DecisionSlot: slotB}
+	if err := n.promoteManagedGraphSeal(ctx, sealedB); err != nil {
+		t.Fatal(err)
+	}
+	want, found, err := n.checkpoints.LoadManagedGraphLocator(ctx)
+	if err != nil || !found || want.Index != uint64(sealedA.Index) || want.RootHash != sealedA.RootHash || want.SealDecisionSlot != uint64(slotB) {
+		t.Fatalf("same-cut newer locator missing: %+v found=%t err=%v", want, found, err)
+	}
+	if err := n.promoteManagedGraphSeal(ctx, sealedA); err != nil {
+		t.Fatalf("same-cut higher-slot CURRENT was not authenticated: %v", err)
+	}
+	got, found, err := n.checkpoints.LoadManagedGraphLocator(ctx)
+	if err != nil || !found || got != want {
+		t.Fatalf("same-cut stale promotion changed CURRENT: %+v found=%t err=%v", got, found, err)
+	}
+}

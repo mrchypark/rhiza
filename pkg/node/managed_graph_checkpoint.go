@@ -513,7 +513,7 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 	if !exists || d.Slot <= seal.Index || sha256.Sum256(d.Value) != d.Hash {
 		return fmt.Errorf("managed Graph exact certified seal unavailable")
 	}
-	if err := n.core.ValidateCheckpointBase(ctx, seal.CheckpointSeal, d); err != nil {
+	if err := n.validateManagedGraphCheckpoint(ctx, n.core, seal, d); err != nil {
 		return err
 	}
 	root, err := n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
@@ -539,11 +539,14 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 		return err
 	}
 	// A different healthy publisher may already have advanced the discovery
-	// hint beyond this captured startup root. The hint alone is not authority:
-	// authenticate its exact immutable root and fixed-HEAD archived certificate
-	// with this runtime's trusted membership/lineage. Never roll CURRENT back.
+	// hint beyond this captured startup root, including at the same cut and a
+	// later decision slot. The hint alone is not authority: authenticate its
+	// exact immutable root and fixed-HEAD archived certificate with this
+	// runtime's trusted membership/lineage. Never roll CURRENT back.
 	current, exists, readErr := n.checkpoints.LoadManagedGraphLocator(ctx)
-	if readErr != nil || !exists || current.Index <= uint64(seal.Index) {
+	currentIndex, sealIndex := current.Index, uint64(seal.Index)
+	if readErr != nil || !exists || currentIndex < sealIndex ||
+		currentIndex == sealIndex && current.SealDecisionSlot <= uint64(d.Slot) {
 		return errors.Join(err, readErr, fmt.Errorf("newer managed Graph locator unavailable"))
 	}
 	newer, tip, readErr := n.archive.ObserveManagedGraphDecision(ctx, quepaxa.Slot(current.SealDecisionSlot))
@@ -558,7 +561,12 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 	if rootErr != nil || newRoot == nil || newRoot.Generation != current.Index || newRoot.Hash != newSeal.StateHash || newRoot.SQLExecutionPolicy != int(sqlpolicy.ManagedGraphRequestMaterializationPolicy) {
 		return errors.Join(err, rootErr, fmt.Errorf("newer managed Graph root differs"))
 	}
-	if proofErr := n.core.ValidateCheckpointBase(ctx, newSeal, newer); proofErr != nil {
+	local, exists := n.core.CertifiedValue(quepaxa.Slot(current.SealDecisionSlot))
+	if !exists {
+		return errors.Join(err, fmt.Errorf("newer managed Graph local certificate unavailable"))
+	}
+	newSealed := quepaxa.SealedCheckpoint{CheckpointSeal: newSeal, DecisionSlot: quepaxa.Slot(current.SealDecisionSlot)}
+	if proofErr := n.validateManagedGraphArchivedSeal(ctx, newSealed, local, newer, tip); proofErr != nil {
 		return errors.Join(err, proofErr)
 	}
 	n.markManagedGraphInitialRootComplete()
@@ -572,5 +580,10 @@ func (n *Node) validateManagedGraphArchivedSeal(ctx context.Context, seal quepax
 	// Recorder summary order (and even the sufficient quorum subset) is not a
 	// decision identity. Authenticate the archived proof independently instead
 	// of comparing its physical encoding with the local retained certificate.
-	return n.core.ValidateCheckpointBase(ctx, seal.CheckpointSeal, archived)
+	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
+		if err := n.core.ValidateCertifiedValue(ctx, archived); err != nil {
+			return fmt.Errorf("managed Graph archived certificate is invalid: %w", err)
+		}
+	}
+	return n.validateManagedGraphCheckpoint(ctx, n.core, seal, archived)
 }
