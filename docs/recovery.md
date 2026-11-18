@@ -83,6 +83,11 @@ delete GC is not part of the HA contract. Certified checkpoint and archive
 validation still protect recovery. Local-mode restore pins and GC have their
 own contract and are not removed by this boundary.
 
+Managed checkpoint publication does not itself trim the archive or establish a
+new recovery floor. It publishes the certified checkpoint prefix and promotes
+the exact certified root to `CURRENT`; archive floor changes remain a separate
+operation.
+
 Graceful close drains and joins local work and syncs/closes the WAL. For
 archive-publishing voting nodes, it also publishes the final local certified
 prefix; reconfiguration non-voters retain their publication restriction. Close
@@ -119,6 +124,16 @@ the library alone does not add that loop to an arbitrary embedding application.
 The two init containers prepare identity and wait for the committed plan; the
 main engine performs verified startup/adoption and catch-up. NoPVC uses an
 `emptyDir`, so a container restart and a new Pod are different recovery events.
+A container restart is not equivalent to replacement with a new Pod, whose
+Pod-local `emptyDir` is a different storage lifetime. The supported prepared
+path adopts a frozen certified root at or above the archive floor that existed
+before replacement, then joins or replays the certified suffix. The tests do not
+establish that either event preserves local application state, voter identity,
+or an old WAL. A local tip below that floor is the unsupported unexpected-
+recovery case: managed catch-up fails closed without uploading or deleting
+archive/checkpoint objects and must not be treated as a live restore or as
+authorization to lower the floor. Kubernetes replica control alone does not
+establish that this below-floor case is repaired automatically.
 The managed cluster remains limited to 3 through 64 voters. Each replica-count
 change is one QuePaxa-certified step; a decrease is a staged leave completed only
 after the removed Pod's voter ID, certified target, and live write/readback are

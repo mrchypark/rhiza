@@ -5,10 +5,13 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -22,6 +25,115 @@ import (
 type managedCatchupBucket struct {
 	objstore.Bucket
 	writes atomic.Int64
+}
+
+func TestManagedPublisherPublishesExactCheckpointWithoutTrimmingArchive(t *testing.T) {
+	tests := []struct {
+		name        string
+		policy      sqlpolicy.MaterializationPolicy
+		protocol    string
+		validate    func([]byte) error
+		clusterName string
+	}{
+		{
+			name: "request", policy: sqlpolicy.ManagedRequestMaterializationPolicy,
+			protocol: sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol, validate: types.ValidateManagedKVExecutionPolicy,
+			clusterName: "managed-request-catchup-publication",
+		},
+		{
+			name: "graph", policy: sqlpolicy.ManagedGraphRequestMaterializationPolicy,
+			protocol: sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, validate: types.ValidateManagedGraphExecutionPolicy,
+			clusterName: "managed-graph-catchup-publication",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			fixture := newManagedAppendOnlyAdmissionFixture(t, test.clusterName, test.policy, test.protocol, test.validate)
+			n := fixture.node
+			fixture.transport.releaseAll()
+			n.managedGraphInitialRootDone = make(chan struct{})
+			beforePublication := fixture.bucket.mutationSnapshot()
+			if err := n.publishManagedAppendOnlyCheckpoint(ctx); err != nil {
+				t.Fatal(err)
+			}
+			sealed, ok, err := n.core.LatestManagedCheckpointSeal()
+			if err != nil || !ok {
+				t.Fatalf("certified QCKP unavailable: ok=%t err=%v", ok, err)
+			}
+			locator, exists, err := n.checkpoints.LoadManagedAppendOnlyLocator(ctx, test.policy)
+			decision, certified := n.core.CertifiedValue(sealed.DecisionSlot)
+			if err != nil || !exists || !certified || locator.Policy != int(test.policy) || locator.Index != uint64(sealed.Index) || locator.RootHash != sealed.RootHash || locator.SealDecisionSlot != uint64(sealed.DecisionSlot) || locator.SealDecisionHash != decision.Hash {
+				t.Fatalf("CURRENT does not identify the exact published QCKP: locator=%+v exists=%t decision=%+v certified=%t seal=%+v err=%v", locator, exists, decision, certified, sealed, err)
+			}
+			if n.archive.Tip() != sealed.DecisionSlot {
+				t.Fatalf("publisher changed archived tip: got=%d want=%d", n.archive.Tip(), sealed.DecisionSlot)
+			}
+			if base, _, ok := n.archive.RecoveryBase(); ok {
+				t.Fatalf("production publisher trimmed archive base: %+v", base)
+			}
+			for _, mutation := range fixture.bucket.mutationSnapshot()[len(beforePublication):] {
+				if mutation.operation == "delete" {
+					t.Fatalf("production publisher destructively mutated archive: key=%s", mutation.key)
+				}
+			}
+			decision, ok = n.core.CertifiedValue(sealed.DecisionSlot)
+			if !ok {
+				t.Fatal("published QCKP certificate unavailable")
+			}
+			if err := n.archive.TrimThrough(ctx, sealed, decision); err != nil {
+				t.Fatal(err)
+			}
+			if base, _, ok := n.archive.RecoveryBase(); !ok || base.Index != sealed.Index {
+				t.Fatalf("manual recovery floor unavailable: base=%+v ok=%t", base, ok)
+			}
+
+			beforeCatchup := fixture.bucket.mutationSnapshot()
+			below := &Node{config: n.config, managedStartup: n.managedStartup, archive: n.archive, core: newEmptyManagedAppendOnlyCore(t, fixture)}
+			below.ready.Store(true)
+			err = below.catchUpArchive(ctx)
+			if err == nil || !strings.Contains(err.Error(), "managed checkpoint catch-up is unavailable") || below.ready.Load() {
+				t.Fatalf("below-floor catch-up did not fail closed: err=%v ready=%t", err, below.ready.Load())
+			}
+			if after := fixture.bucket.mutationSnapshot(); !reflect.DeepEqual(after, beforeCatchup) {
+				t.Fatalf("below-floor catch-up mutated storage: before=%v after=%v", beforeCatchup, after)
+			}
+		})
+	}
+}
+
+func newEmptyManagedAppendOnlyCore(t *testing.T, fixture *managedGraphAppendOnlyAdmissionFixture) *quepaxa.Core {
+	t.Helper()
+	n := fixture.node
+	nonce, registered := n.wal.Identity()
+	if !registered || len(nonce) != 32 {
+		t.Fatal("admitted fixture WAL identity unavailable")
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	if err := wal.BindIdentity(nonce); err != nil {
+		t.Fatal(err)
+	}
+	var walIdentity [32]byte
+	copy(walIdentity[:], nonce)
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID: n.config.NodeID, Cluster: n.core.CurrentCluster(), WAL: wal, Transport: fixture.transport, ValidateValue: fixture.validate,
+		ManagedAppendOnly: &quepaxa.ManagedAppendOnlyConfig{Binding: quepaxa.ManagedAppendOnlyBinding{
+			ApplicationProtocol: fixture.protocol, BootstrapPlanDigest: n.managedStartup.Identity.BootstrapPlanDigest,
+			MemberConfigDigest: n.managedStartup.Identity.Member.ConfigDigest, Generation: 0, WALIdentity: walIdentity,
+		}, Verify: n.verifyManagedAppendOnlyCandidate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	return core
 }
 
 func TestManagedCatchupArchiveBaseTrigger(t *testing.T) {
