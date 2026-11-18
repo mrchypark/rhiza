@@ -1359,9 +1359,6 @@ func (m *Materializer) GraphRequestStatus(_ context.Context, command types.Graph
 	defer g.mu.RUnlock()
 	request, found, err := g.request(command.RequestID)
 	if err != nil {
-		return false, err
-	}
-	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
 	if !found || m.tip > request.Receipt.RetryThroughSlot {
