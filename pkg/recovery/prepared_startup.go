@@ -398,6 +398,9 @@ func VerifyRestoredPreparedStartupForPolicy(ctx context.Context, dataDir, handof
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("invalid restored prepared file")
 		}
+		if path == suffixPath && info.Size() != int64(len(wantSuffix)) {
+			return nil, fmt.Errorf("restored suffix differs from verified history")
+		}
 	}
 	restoredSuffix, err := os.ReadFile(suffixPath)
 	if err != nil || !bytes.Equal(restoredSuffix, wantSuffix) {

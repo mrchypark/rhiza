@@ -56,7 +56,15 @@ func cloneGraphCommandForOrdinaryEncoding(command GraphCommand) (GraphCommand, e
 	if err != nil {
 		return GraphCommand{}, err
 	}
-	command.Args = args.(map[string]any)
+	if args != nil {
+		mapped, ok := args.(map[string]any)
+		if !ok {
+			return GraphCommand{}, fmt.Errorf("graph args must be a map")
+		}
+		command.Args = mapped
+	} else {
+		command.Args = nil
+	}
 	if command.Events != nil {
 		events := make([]GraphStreamEvent, len(command.Events))
 		copy(events, command.Events)
