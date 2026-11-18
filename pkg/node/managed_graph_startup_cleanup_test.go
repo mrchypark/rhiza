@@ -450,6 +450,29 @@ func newPreparedLearnerFixture(t *testing.T, advanceCurrentAfterH ...bool) *prep
 	return &preparedLearnerFixture{ctx: ctx, node: node, sourceCore: cores[0], protocol: protocol, dataDir: dataDir, cut: quepaxa.Slot(cut), sealA: sealedA, sealB: sealedB, rootA: rootA.RootHash, rootB: rootB.RootHash, currentRoot: currentRoot, currentSeal: currentSeal, viewTip: view.Tip(), suffixJ: suffixJ}
 }
 
+func TestManagedGraphPromotesAlternatePhysicalRootAtSameCutAboveFloor(t *testing.T) {
+	fixture := newPreparedLearnerFixture(t)
+	node := fixture.node
+	floor, floorRoot, ok := node.core.RecoveryRoot()
+	if !ok || floor != fixture.cut || floorRoot != fixture.rootA || fixture.rootA == fixture.rootB {
+		t.Fatalf("fixture lacks physical A floor and alternate B: floor=%d root=%x A=%x B=%x ok=%t", floor, floorRoot, fixture.rootA, fixture.rootB, ok)
+	}
+	if err := node.promoteManagedGraphSeal(fixture.ctx, fixture.sealB); err != nil {
+		t.Fatalf("alternate physical B above same-cut A floor was rejected: %v", err)
+	}
+	current, exists, err := node.checkpoints.LoadManagedGraphLocator(fixture.ctx)
+	if err != nil || !exists || current.Index != uint64(fixture.sealB.Index) || current.RootHash != fixture.rootB || current.SealDecisionSlot != uint64(fixture.sealB.DecisionSlot) {
+		t.Fatalf("alternate physical B was not installed as CURRENT: %+v exists=%t err=%v", current, exists, err)
+	}
+	if err := node.promoteManagedGraphSeal(fixture.ctx, fixture.sealA); err != nil {
+		t.Fatalf("stale A at the same cut was not reconciled against certified B: %v", err)
+	}
+	got, exists, err := node.checkpoints.LoadManagedGraphLocator(fixture.ctx)
+	if err != nil || !exists || got != current {
+		t.Fatalf("stale A rolled back alternate physical B: %+v exists=%t err=%v", got, exists, err)
+	}
+}
+
 func TestManagedGraphStartupInstallPreparedLearnerFreshOpenCancellationClosesHandle(t *testing.T) {
 	fixture := newPreparedLearnerFixture(t)
 	ctx, node := fixture.ctx, fixture.node

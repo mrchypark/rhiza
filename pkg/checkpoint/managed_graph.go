@@ -67,7 +67,7 @@ func (m *Manager) CreateManagedGraphCandidate(ctx context.Context, sources []Sou
 	}
 	for _, source := range sources {
 		if source.Role == RoleSQLite {
-			if err := sqlpolicy.CheckFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
+			if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
 				return nil, err
 			}
 		}
@@ -85,6 +85,13 @@ func (m *Manager) CreateManagedAppendOnlyCandidate(ctx context.Context, sources 
 	}
 	if err := m.validateSourceProfile(sources); err != nil {
 		return nil, err
+	}
+	for _, source := range sources {
+		if source.Role == RoleSQLite {
+			if err := sqlpolicy.CheckSnapshotFileForPolicy(ctx, source.Path, m.expectedPolicy); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return m.uploadCandidate(ctx, sources, cut, cut, nil, nil)
 }
@@ -146,58 +153,7 @@ func (m *Manager) PromoteManagedGraphLocator(ctx context.Context, l ManagedGraph
 	if err := l.validate(); err != nil {
 		return err
 	}
-	if _, err := m.OpenRoot(ctx, l.Index, l.RootHash); err != nil {
-		return err
-	}
-	data, err := json.Marshal(l)
-	if err != nil {
-		return err
-	}
-	key := m.key("checkpoint/CURRENT")
-	for range 4 {
-		attr, attrErr := m.bucket.Attributes(objmetrics.WithExpectedNotFound(ctx), key)
-		options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
-		if attrErr != nil && !m.bucket.IsObjNotFoundErr(attrErr) {
-			return attrErr
-		}
-		if attrErr == nil {
-			if attr.Version == nil {
-				return fmt.Errorf("managed Graph CURRENT lacks conditional version")
-			}
-			prior, exists, err := m.readManagedGraphLocator(ctx)
-			if err != nil || !exists {
-				return errors.Join(err, fmt.Errorf("managed Graph CURRENT changed during read"))
-			}
-			after, err := m.bucket.Attributes(ctx, key)
-			if err != nil {
-				return err
-			}
-			if after.Version == nil || *after.Version != *attr.Version {
-				continue
-			}
-			if prior.Index > l.Index {
-				return ErrStaleCheckpoint
-			}
-			if prior.Index == l.Index {
-				if prior != l {
-					return fmt.Errorf("conflicting managed Graph locator at same cut")
-				}
-				return nil
-			}
-			options = []objstore.ObjectUploadOption{objstore.WithIfMatch(attr.Version)}
-		}
-		err = m.bucket.Upload(ctx, key, bytes.NewReader(data), options...)
-		if err == nil {
-			return nil
-		}
-		if stored, exists, readErr := m.readManagedGraphLocator(ctx); readErr == nil && exists && stored == l {
-			return nil
-		}
-		if !m.bucket.IsConditionNotMetErr(err) {
-			return err
-		}
-	}
-	return fmt.Errorf("managed Graph CURRENT CAS did not converge")
+	return m.PromoteManagedAppendOnlyLocator(ctx, ManagedAppendOnlyLocator(l))
 }
 
 func managedCurrentReadFailureDiagnostic(stage string, err error) string {

@@ -105,6 +105,23 @@ func TestManagedGraphImmutableCandidateAndLocator(t *testing.T) {
 	if err := cp.PromoteManagedGraphLocator(ctx, conflict); err == nil {
 		t.Fatal("same-cut locator conflict accepted")
 	}
+	higher := l
+	higher.SealDecisionSlot++
+	higher.SealDecisionHash = sha256.Sum256([]byte("fixture-seal-later"))
+	if err := cp.PromoteManagedGraphLocator(ctx, higher); err != nil {
+		t.Fatalf("same-cut higher decision slot was rejected: %v", err)
+	}
+	got, exists, err = cp.LoadManagedGraphLocator(ctx)
+	if err != nil || !exists || got != higher {
+		t.Fatalf("higher decision slot was not persisted: %+v %v", got, err)
+	}
+	if err := cp.PromoteManagedGraphLocator(ctx, l); !errors.Is(err, ErrStaleCheckpoint) {
+		t.Fatalf("lower decision slot error=%v, want stale", err)
+	}
+	got, exists, err = cp.LoadManagedGraphLocator(ctx)
+	if err != nil || !exists || got != higher {
+		t.Fatalf("lower decision slot rolled CURRENT back: %+v %v", got, err)
+	}
 	bad := l
 	bad.SealDecisionSlot = cut
 	if err := cp.PromoteManagedGraphLocator(ctx, bad); err == nil {
@@ -169,4 +186,59 @@ func TestManagedGraphImmutableCandidateAndLocator(t *testing.T) {
 	if err := cp.uploadManagedGraphImmutable(ctx, key, strings.NewReader("good"), 4, sha256.Sum256([]byte("good"))); err == nil {
 		t.Fatal("conflicting immutable readback accepted")
 	}
+}
+
+func TestManagedAppendOnlyCandidateRejectsWrongSQLitePolicyBeforeUpload(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		policy sqlpolicy.MaterializationPolicy
+		graph  bool
+	}{
+		{name: "request", policy: sqlpolicy.ManagedRequestMaterializationPolicy},
+		{name: "graph", policy: sqlpolicy.ManagedGraphRequestMaterializationPolicy, graph: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+			manager, err := NewAppendOnlyManagerForPolicy(b, "policy", t.TempDir(), tc.policy, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sources := []Source{source(t, RoleSQLite, "wrong-policy")}
+			if tc.graph {
+				sources = append(sources, source(t, RoleGraphData, "graph"))
+			}
+			if _, err := manager.CreateManagedAppendOnlyCandidate(ctx, sources, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+				t.Fatalf("wrong SQLite policy error=%v, want incompatible", err)
+			}
+			if uploads := b.uploads.Load(); uploads != 0 {
+				t.Fatalf("wrong SQLite policy performed %d object uploads", uploads)
+			}
+		})
+	}
+}
+
+func TestManagedGraphLocatorProfilePrecedesValidation(t *testing.T) {
+	ctx := context.Background()
+	check := func(t *testing.T, manager *Manager) {
+		t.Helper()
+		b := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+		manager.bucket = b
+		if err := manager.PromoteManagedGraphLocator(ctx, ManagedGraphLocator{}); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+			t.Fatalf("wrong profile error=%v, want incompatible", err)
+		}
+		if gets, uploads := b.gets.Load(), b.uploads.Load(); gets != 0 || uploads != 0 {
+			t.Fatalf("profile rejection touched object store: gets=%d uploads=%d", gets, uploads)
+		}
+	}
+	t.Run("legacy", func(t *testing.T) {
+		check(t, NewManager(objstore.NewInMemBucket(), "legacy", t.TempDir(), 1))
+	})
+	t.Run("request", func(t *testing.T) {
+		manager, err := NewAppendOnlyManagerForPolicy(objstore.NewInMemBucket(), "request", t.TempDir(), sqlpolicy.ManagedRequestMaterializationPolicy, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, manager)
+	})
 }

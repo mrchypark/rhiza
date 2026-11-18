@@ -331,3 +331,47 @@ func TestManagedGraphPromotionAcceptsReorderedValidCertificate(t *testing.T) {
 		t.Fatal("insufficient archived quorum certificate accepted")
 	}
 }
+
+func TestManagedGraphPromotionRejectsTamperedArchivedCertificate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, core, archive, _ := newManagedAppendOnlySelectorFixture(t)
+	sealed, found, err := core.LatestManagedCheckpointSeal()
+	if err != nil || !found {
+		t.Fatalf("actual certified seal missing: %+v found=%t err=%v", sealed, found, err)
+	}
+	local, found := core.CertifiedValue(sealed.DecisionSlot)
+	if !found || core.ValidateCertifiedValue(ctx, local) != nil {
+		t.Fatal("fixture local certificate is not valid")
+	}
+	bad := local
+	bad.Certificate = bytes.Clone(local.Certificate)
+	bad.Certificate[len(bad.Certificate)-1] ^= 1
+	if err := core.ValidateCertifiedValue(ctx, bad); err == nil {
+		t.Fatal("fixture archive certificate is unexpectedly valid")
+	}
+	if err := archive.SyncThrough(ctx, graphReviewCertificateSource{Core: core, slot: sealed.DecisionSlot, certificate: bad.Certificate}, sealed.DecisionSlot); err != nil {
+		t.Fatal(err)
+	}
+	archived, _, err := archive.ObserveManagedGraphDecision(ctx, sealed.DecisionSlot)
+	if err != nil || !bytes.Equal(archived.Certificate, bad.Certificate) {
+		t.Fatalf("archive did not retain tampered certificate: %v", err)
+	}
+	before, existed, err := n.checkpoints.LoadManagedGraphLocator(ctx)
+	if err != nil || existed {
+		t.Fatalf("fixture CURRENT unexpectedly exists: %+v exists=%t err=%v", before, existed, err)
+	}
+	if n.managedGraphInitialRootComplete() {
+		t.Fatal("runtime started with initial root complete")
+	}
+	if err := n.promoteManagedGraphSeal(ctx, sealed); err == nil {
+		t.Fatal("promotion accepted insufficient archived quorum certificate")
+	}
+	after, existed, err := n.checkpoints.LoadManagedGraphLocator(ctx)
+	if err != nil || existed || after != before {
+		t.Fatalf("failed promotion changed CURRENT: before=%+v after=%+v exists=%t err=%v", before, after, existed, err)
+	}
+	if n.managedGraphInitialRootComplete() {
+		t.Fatal("failed promotion marked initial root complete")
+	}
+}
