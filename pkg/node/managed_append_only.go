@@ -553,18 +553,22 @@ func (n *Node) promoteManagedAppendOnlySeal(ctx context.Context, sealed quepaxa.
 // A promoted QCKP is already durable in object storage and restored locally.
 // Reclaim the WAL prefix it covers without trimming the shared archive.
 func (n *Node) compactManagedLocalCheckpoint(index quepaxa.Slot, root [32]byte) {
-	if n == nil || n.core == nil || n.material == nil || index == 0 || uint64(index) > n.material.Tip() {
+	if n == nil || n.core == nil || n.material == nil || n.wal == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) || index == 0 || uint64(index) > n.material.Tip() {
 		return
 	}
-	var err error
-	if n.managedStartup != nil && isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) {
-		err = n.core.CompactManagedThrough(index, root)
-	} else {
-		err = n.core.CompactThrough(index, root)
+	if !managedLocalWALCompactionDue(n.wal.Bytes(), n.wal.Capacity().Limit) {
+		return
 	}
-	if err != nil {
+	if err := n.core.CompactManagedThrough(index, root); err != nil {
 		log.Printf("managed local WAL compaction deferred through %d: %v", index, err)
 	}
+}
+
+func managedLocalWALCompactionDue(used, limit int64) bool {
+	if used <= 0 || limit <= 0 {
+		return false
+	}
+	return used >= min(int64(256<<20), limit/2)
 }
 
 func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
