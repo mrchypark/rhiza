@@ -70,6 +70,20 @@ func TestManagedPublisherPublishesExactCheckpointWithoutTrimmingArchive(t *testi
 			if floor := n.core.CompactionFloor(); floor != 0 {
 				t.Fatalf("small managed WAL was compacted before the local threshold: floor=%d index=%d", floor, sealed.Index)
 			}
+			limit := n.wal.Capacity().Limit
+			if limit <= 0 {
+				limit = 4 << 30
+			}
+			if err := n.wal.SetMaxBytes(n.wal.Bytes()); err != nil {
+				t.Fatalf("force local WAL threshold: %v", err)
+			}
+			n.compactManagedLocalCheckpoint(sealed.Index, sealed.RootHash)
+			if floor := n.core.CompactionFloor(); floor != sealed.Index {
+				t.Fatalf("local WAL did not compact through the published QCKP: floor=%d index=%d", floor, sealed.Index)
+			}
+			if err := n.wal.SetMaxBytes(limit); err != nil {
+				t.Fatalf("restore WAL capacity: %v", err)
+			}
 			if n.archive.Tip() != sealed.DecisionSlot {
 				t.Fatalf("publisher changed archived tip: got=%d want=%d", n.archive.Tip(), sealed.DecisionSlot)
 			}
