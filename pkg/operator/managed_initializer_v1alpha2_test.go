@@ -78,7 +78,8 @@ func TestManagedInitializationConnected(t *testing.T) {
 					case "token disabled":
 						spec["automountServiceAccountToken"] = false
 					case "token missing":
-						spec["volumes"] = spec["volumes"].([]any)[:2]
+						vols := spec["volumes"].([]any)
+						spec["volumes"] = vols[:len(vols)-1]
 					case "missing readiness":
 						delete(main, "readinessProbe")
 					case "liveness":
@@ -225,6 +226,7 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 			cm := c.(map[string]any)
 			cm["resources"] = V1Alpha2ManagedResources(false)
 			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
+			cm["volumeMounts"] = append(cm["volumeMounts"].([]any), map[string]any{"name": "tmp", "mountPath": "/tmp"})
 		}
 		for _, c := range p["initContainers"].([]any) {
 			cm := c.(map[string]any)
@@ -237,6 +239,7 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 				vm["emptyDir"] = map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}
 			}
 		}
+		p["volumes"] = append(p["volumes"].([]any), map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "64Mi"}})
 		return mustManagedJSON(p)
 	}
 	var depSpec map[string]json.RawMessage

@@ -63,10 +63,10 @@ func V1Alpha2ManagedPodSpec(image, crUID string, containers []V1Alpha2Container,
 	}
 	main := make([]map[string]any, 0, len(containers))
 	for _, c := range containers {
-		main = append(main, map[string]any{"name": c.Name, "image": c.Image, "resources": V1Alpha2ManagedResources(false), "securityContext": V1Alpha2ManagedContainerSecurity(), "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}}})
+		main = append(main, map[string]any{"name": c.Name, "image": c.Image, "resources": V1Alpha2ManagedResources(false), "securityContext": V1Alpha2ManagedContainerSecurity(), "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}, map[string]any{"name": "tmp", "mountPath": "/tmp"}}})
 	}
 	topology := V1Alpha2ManagedTopology(crUID)
-	return map[string]any{"securityContext": V1Alpha2ManagedPodSecurity(), "topologySpreadConstraints": topology, "initContainers": init, "containers": main, "volumes": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "emptyDir": map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}}}}, nil
+	return map[string]any{"securityContext": V1Alpha2ManagedPodSecurity(), "topologySpreadConstraints": topology, "initContainers": init, "containers": main, "volumes": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "emptyDir": map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}}, map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "64Mi"}}}}, nil
 }
 
 // V1Alpha2ManagedSQLPodSpec is the first managed reference profile, not an
@@ -246,7 +246,8 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			return nil, err
 		}
 		expectedMain = pod["containers"].([]map[string]any)[0]
-		expectedProfileVolume, _ = json.Marshal(pod["volumes"].([]any)[1])
+		vols := pod["volumes"].([]any)
+		expectedProfileVolume, _ = json.Marshal(vols[len(vols)-1])
 	}
 	base := "/apis/apps/v1/namespaces/" + ref.Namespace
 	var dep struct {
@@ -397,7 +398,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 		if expectedMain != nil && (p.Spec.ServiceAccountName != V1Alpha2ManagedHostServiceAccount || p.Spec.ServiceAccount != "" && p.Spec.ServiceAccount != V1Alpha2ManagedHostServiceAccount || p.Spec.AutomountServiceAccountToken == nil || !*p.Spec.AutomountServiceAccountToken) {
 			return nil, fmt.Errorf("invalid managed host service account")
 		}
-		dataVolumes, profileVolumes := 0, 0
+		dataVolumes, tmpVolumes, profileVolumes := 0, 0, 0
 		projectionName := ""
 		for _, raw := range p.Spec.Volumes {
 			if expectedMain != nil && sameJSON(raw, expectedProfileVolume) {
@@ -416,6 +417,10 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 				dataVolumes++
 				continue
 			}
+			if v.Name == "tmp" && sameJSON(v.EmptyDir, json.RawMessage(`{"sizeLimit":"64Mi"}`)) && len(v.Projected) == 0 {
+				tmpVolumes++
+				continue
+			}
 			if !strings.HasPrefix(v.Name, "kube-api-access-") || !bootstrapServiceAccountProjection(v.Projected) || len(v.EmptyDir) != 0 {
 				return nil, fmt.Errorf("invalid bootstrap volume")
 			}
@@ -424,7 +429,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			}
 			projectionName = v.Name
 		}
-		if dataVolumes != 1 || expectedMain != nil && profileVolumes != 1 {
+		if dataVolumes != 1 || tmpVolumes > 1 || expectedMain != nil && profileVolumes != 1 {
 			return nil, fmt.Errorf("invalid bootstrap volume")
 		}
 		if expectedMain != nil {
@@ -468,7 +473,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 					}
 				}
 			}
-			data, projected, profileMounts := 0, 0, 0
+			data, tmpMounts, projected, profileMounts := 0, 0, 0, 0
 			for _, m := range c.VolumeMounts {
 				if expectedMain != nil && m.Name == V1Alpha2ManagedRuntimeProfileVolume && m.MountPath == "/etc/rhiza/managed" && m.ReadOnly {
 					profileMounts++
@@ -478,13 +483,17 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 					data++
 					continue
 				}
+				if m.Name == "tmp" && m.MountPath == "/tmp" && !m.ReadOnly {
+					tmpMounts++
+					continue
+				}
 				if projectionName != "" && m.Name == projectionName && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" && m.ReadOnly {
 					projected++
 					continue
 				}
 				return nil, fmt.Errorf("invalid managed main mount")
 			}
-			if data != 1 || projected > 1 || expectedMain != nil && (profileMounts != 1 || projected != 1) {
+			if data != 1 || tmpMounts > 1 || projected > 1 || expectedMain != nil && (profileMounts != 1 || projected != 1) {
 				return nil, fmt.Errorf("invalid managed main mounts")
 			}
 		}
