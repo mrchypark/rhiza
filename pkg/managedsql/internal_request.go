@@ -67,7 +67,7 @@ func (h *Host) localReadNode(ctx context.Context) (context.Context, *node.Node, 
 	operationCtx, release := h.internalRequestContext(ctx)
 	if err := h.ensureInitialRequestAdmission(operationCtx); err != nil {
 		release()
-		return ctx, nil, nil, err
+		return ctx, nil, nil, exhaustedMembershipTransitionError(err)
 	}
 	return operationCtx, h.node, release, nil
 }

@@ -153,6 +153,14 @@ func (h *Host) replaceVoterAddFirst(ctx context.Context, a operator.V1Alpha2Admi
 	if err != nil {
 		return err
 	}
+	if r.AddCompletion == nil && uint64(registration.Current.ConfigID) == plan.ExpectedConfigID {
+		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, plan); err != nil {
+			if errors.Is(err, operator.ErrV1Alpha2RepairPodUnavailable) {
+				return h.abortRepairAddition(ctx, r, err)
+			}
+			return err
+		}
+	}
 	if registration.LearnerWALIdentity == "" {
 		registration.LearnerWALIdentity, err = h.waitRegisteredRepairLearner(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
 		if err != nil {
@@ -311,6 +319,14 @@ func (h *Host) enrollVoter(ctx context.Context, a operator.V1Alpha2AdmissionSnap
 	if err != nil {
 		return err
 	}
+	if r.Completion == nil && uint64(registration.Current.ConfigID) == plan.ExpectedConfigID {
+		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, plan); err != nil {
+			if errors.Is(err, operator.ErrV1Alpha2RepairPodUnavailable) {
+				return h.abortRepairAddition(ctx, r, err)
+			}
+			return err
+		}
+	}
 	if registration.LearnerWALIdentity == "" {
 		registration.LearnerWALIdentity, err = h.waitRegisteredRepairLearner(ctx, plan.Replacement.NodeID, plan.Replacement.PublicKey)
 		if err != nil {
@@ -367,6 +383,44 @@ func (h *Host) enrollVoter(ctx context.Context, a operator.V1Alpha2AdmissionSnap
 	completion, err := managedRepairAdditionCompletion(plan, handoff, proof)
 	if err != nil || !reflect.DeepEqual(completion, *r.Completion) {
 		return errors.Join(fmt.Errorf("enrollment completion differs from actual retained terminal"), err)
+	}
+	return nil
+}
+
+func (h *Host) abortRepairAddition(ctx context.Context, record operator.V1Alpha2RepairRecord, cause error) error {
+	if record.State != "Closed" || record.AddCompletion != nil || record.PreparedHandoff == nil {
+		return cause
+	}
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, record.Plan.Replacement.NodeID, record.Plan.Replacement.PublicKey)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if snapshot.LearnerWALIdentity == "" || uint64(snapshot.Current.ConfigID) != record.Plan.ExpectedConfigID {
+		return cause
+	}
+	request, err := managedRepairAddRequest(record, record.PreparedHandoff, snapshot.LearnerWALIdentity)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	abort, err := h.node.AbortManagedRepairAddition(ctx, request)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	completion := operator.V1Alpha2RepairCompletion{OperationID: record.Plan.OperationID, PlanDigest: record.Plan.Digest(), ExpectedConfigID: record.Plan.ExpectedConfigID, ExpectedAbortSlot: record.Plan.ExpectedAbortSlot, Kind: "Abort", ConfigID: uint64(abort.ConfigID), Slot: uint64(abort.Slot), Hash: abort.Hash}
+	latest, err := h.live(ctx)
+	if err != nil {
+		return repairResumeFailure(repairResumeCompletion, err)
+	}
+	current, ok := latest.Repair()
+	if !ok || current.State != "Closed" || current.AddCompletion != nil || !reflect.DeepEqual(current.Plan, record.Plan) || !reflect.DeepEqual(current.PreparedHandoff, record.PreparedHandoff) {
+		return fmt.Errorf("repair intent changed before ADD abort CAS")
+	}
+	_, observation, err := operator.FinishV1Alpha2Repair(ctx, h.cfg.Store, latest, latest.Authority(), completion)
+	if err != nil {
+		return repairResumeFailure(repairResumeCompletion, err)
+	}
+	if observation != operator.V1Alpha2CASApplied {
+		return fmt.Errorf("ADD abort CAS outcome %s", observation)
 	}
 	return nil
 }

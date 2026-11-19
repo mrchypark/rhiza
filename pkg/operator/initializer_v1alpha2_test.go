@@ -119,6 +119,37 @@ func TestPhase9InitializerListPaginationGuards(t *testing.T) {
 	}
 }
 
+func TestPhase9InitializerIsolatesMalformedListItems(t *testing.T) {
+	currentCluster := phase9CurrentManagedCluster()
+	s, kube := phase9Setup(t, currentCluster)
+	kube = phase2Store(t, func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/rhizaclusters") {
+			return phase2Response(200, `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[{"broken":true},`+currentCluster+`]}`), nil
+		}
+		return s.roundTrip(r)
+	}).Kube
+	if err := phase9ManagedList(context.Background(), kube); err != nil {
+		t.Fatal(err)
+	}
+	if s.posts != 1 || s.puts != 1 {
+		t.Fatalf("malformed sibling blocked healthy CR: posts=%d puts=%d", s.posts, s.puts)
+	}
+}
+
+func TestManagedCandidateSpecUsesExactImagePullDefault(t *testing.T) {
+	for _, image := range []string{"registry.example:5000/team/app:1.2", "registry.example/team/app:latest", "registry.example/team/app@sha256:" + strings.Repeat("a", 64)} {
+		expected := map[string]any{"template": map[string]any{"metadata": map[string]any{}, "spec": map[string]any{"containers": []any{map[string]any{"name": "app", "image": image}}, "initContainers": []any{}}}}
+		actual := map[string]any{"template": map[string]any{"metadata": map[string]any{"creationTimestamp": nil}, "spec": map[string]any{"restartPolicy": "Always", "dnsPolicy": "ClusterFirst", "containers": []any{map[string]any{"name": "app", "image": image, "imagePullPolicy": defaultImagePullPolicy(image), "resources": map[string]any{}}}, "initContainers": []any{}}}}
+		if !managedCandidateSpecMatches(mustManagedJSON(actual), mustManagedJSON(expected)) {
+			t.Fatalf("rejected API default imagePullPolicy for %q", image)
+		}
+		actual["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["imagePullPolicy"] = "Never"
+		if managedCandidateSpecMatches(mustManagedJSON(actual), mustManagedJSON(expected)) {
+			t.Fatalf("accepted injected imagePullPolicy for %q", image)
+		}
+	}
+}
+
 func (s *phase9Server) roundTrip(r *http.Request) (*http.Response, error) {
 	respond := func(v any) (*http.Response, error) {
 		b, err := json.Marshal(v)
@@ -641,7 +672,7 @@ func TestPhase9InitializerListGuards(t *testing.T) {
 		{"duplicate", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + currentCluster + `]}`, true},
 		{"duplicate uid", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + currentCluster + `,` + strings.Replace(currentCluster, `"name":"cluster"`, `"name":"other"`, 1) + `]}`, true},
 		{"missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + missingIntent + `]}`, false},
-		{"current profile missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(currentCluster, `"genesisIntent":"Create",`, "", 1) + `]}`, true},
+		{"current profile missing intent", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1"},"items":[` + strings.Replace(currentCluster, `"genesisIntent":"Create",`, "", 1) + `]}`, false},
 		{"partial page", `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaClusterList","metadata":{"resourceVersion":"1","continue":"next"},"items":[` + currentCluster + `]}`, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

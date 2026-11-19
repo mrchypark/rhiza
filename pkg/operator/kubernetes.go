@@ -156,6 +156,11 @@ func (k *Kubernetes) DeleteSecret(ctx context.Context, namespace, name, uid stri
 	if !validNamespace(namespace) || len(name) == 0 || len(name) > 253 {
 		return fmt.Errorf("Secret deletion requires valid namespace and name")
 	}
+	for _, label := range strings.Split(name, ".") {
+		if !validNamespace(label) {
+			return fmt.Errorf("invalid Secret deletion name")
+		}
+	}
 	if !k.deleteAllNamespaces && !k.deleteNamespaces[namespace] {
 		return fmt.Errorf("Secret deletion namespace is not allowed")
 	}

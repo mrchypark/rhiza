@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -550,5 +553,49 @@ func TestManagedMixedProfileCompletionHeadroom(t *testing.T) {
 	raw, _ = json.Marshal(record)
 	if err := validateMixedRepairBudget(raw); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagedMixedProfileAddFirstCompletionHeadroom(t *testing.T) {
+	voters := make([]types.NodeID, 12)
+	for i := range voters {
+		voters[i] = types.NodeID(strings.Repeat(string(rune('a'+i)), 96))
+	}
+	plan := V1Alpha2RepairPlan{OperationID: "repair", Sequence: V1Alpha2RepairAddThenRemove, OldNodeID: "old", Replacement: V1Alpha2RepairMember{NodeID: "replacement"}, FinalVoterIDs: voters}
+	record := V1Alpha2RepairRecord{Plan: plan, State: "Closed", PreparedHandoff: &V1Alpha2RepairHandoff{Survivors: quepaxa.Cluster{Members: []quepaxa.Member{{ID: "member"}}}}}
+	projected := func(padding int, withAdd bool) ([]byte, []byte) {
+		record.PreparedHandoff.Survivors.Members[0].URL = strings.Repeat("x", padding)
+		current, _ := json.Marshal(record)
+		fields, _ := jsonObject(current)
+		fields["state"] = json.RawMessage(`"Completed"`)
+		if withAdd {
+			intermediate := slices.Clone(plan.FinalVoterIDs)
+			intermediate = append(intermediate, plan.OldNodeID)
+			slices.Sort(intermediate)
+			addition := V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, Kind: "Terminal", ConfigID: plan.ExpectedConfigID + 1, Slot: math.MaxInt64 - 1, Hash: strings.Repeat("a", 64), FinalVoterIDs: intermediate}
+			fields["addCompletion"], _ = json.Marshal(addition)
+		}
+		completion := V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, Kind: "Terminal", ConfigID: math.MaxInt64, Slot: math.MaxInt64, Hash: strings.Repeat("a", 64), FinalVoterIDs: plan.FinalVoterIDs}
+		fields["completion"], _ = json.Marshal(completion)
+		projected, _ := json.Marshal(fields)
+		return current, projected
+	}
+	// Every projection grows with padding. The first padding whose ADD+final
+	// successor exceeds the limit leaves the current record and final-only
+	// completion just below it.
+	padding := sort.Search(V1Alpha2RepairRecordLimit, func(padding int) bool {
+		_, withBoth := projected(padding, true)
+		return len(withBoth) > V1Alpha2RepairRecordLimit
+	})
+	if padding >= V1Alpha2RepairRecordLimit {
+		t.Fatal("could not construct ADD completion headroom fixture")
+	}
+	raw, withBoth := projected(padding, true)
+	_, finalOnly := projected(padding, false)
+	if len(finalOnly) > V1Alpha2RepairRecordLimit || len(withBoth) <= V1Alpha2RepairRecordLimit {
+		t.Fatalf("could not construct ADD completion headroom fixture: padding=%d current=%d final=%d both=%d limit=%d", padding, len(raw), len(finalOnly), len(withBoth), V1Alpha2RepairRecordLimit)
+	}
+	if validateMixedRepairBudget(raw) == nil {
+		t.Fatal("ADD-first record consumed future ADD/final completion headroom")
 	}
 }

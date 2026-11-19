@@ -2,8 +2,10 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
@@ -61,6 +63,7 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 				APIVersion, Kind string
 				Metadata         v1alpha2BootstrapMetadata
 				Status           struct {
+					Phase                 string
 					PodIP                 string
 					InitContainerStatuses []struct {
 						Name  string
@@ -78,16 +81,20 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 				}
 			}
 			if err := store.Kube.Get(ctx, base+"/"+url.PathEscape(item.Metadata.Name), &pod); err != nil {
+				var apiErr *APIError
+				if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+					continue
+				}
 				return nil, err
 			}
 			if pod.APIVersion != "v1" || pod.Kind != "Pod" || pod.Metadata.Name != item.Metadata.Name || pod.Metadata.UID != item.Metadata.UID || pod.Metadata.Namespace != ref.Namespace || pod.Metadata.ResourceVersion == "" {
-				return nil, fmt.Errorf("managed Pod changed during discovery")
+				continue
 			}
-			if pod.Metadata.DeletionTimestamp != nil {
+			if pod.Metadata.DeletionTimestamp != nil || pod.Status.Phase == "Failed" || pod.Status.Phase == "Succeeded" {
 				continue
 			}
 			if net.ParseIP(pod.Status.PodIP) == nil || len(pod.Status.InitContainerStatuses) == 0 || pod.Status.InitContainerStatuses[0].Name != V1Alpha2PrepareIdentityContainer || pod.Status.InitContainerStatuses[0].State.Terminated == nil || pod.Status.InitContainerStatuses[0].State.Terminated.ExitCode != 0 {
-				return nil, fmt.Errorf("managed Pod identity is not available")
+				continue
 			}
 			key, err := DecodeV1Alpha2BootstrapReport(pod.Status.InitContainerStatuses[0].State.Terminated.Message)
 			if err != nil {
@@ -100,6 +107,10 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 			member := V1Alpha2RepairPodRequest{PodName: pod.Metadata.Name, PodUID: pod.Metadata.UID, NodeID: id, PublicKey: key, PeerURL: "quic://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(peerPort))}
 			bindingPlan := V1Alpha2RepairPlan{ClusterUID: ref.UID, Generation: p.Generation, DeploymentUID: p.DeploymentUID, Replacement: member}
 			if _, err := ValidateV1Alpha2RepairPodBinding(ctx, store, ref, bindingPlan); err != nil {
+				var apiErr *APIError
+				if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+					continue
+				}
 				return nil, err
 			}
 			candidate := true

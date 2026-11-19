@@ -14,6 +14,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"gopkg.in/yaml.v3"
 )
 
@@ -168,6 +169,49 @@ func TestRepairV1Alpha2GateAndABA(t *testing.T) {
 		t.Fatalf("stale repair CAS bypassed ABA: %v", err)
 	}
 
+}
+
+func TestRepairV1Alpha2AddAbortAllowsMissingHandoff(t *testing.T) {
+	ctx := context.Background()
+	f, old := repairTestSetup(t)
+	f.plan.Sequence = V1Alpha2RepairAdd
+	f.plan.FinalVoterIDs = nil
+	bootstrap, err := old.status.BootstrapPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range bootstrap.Members {
+		f.plan.FinalVoterIDs = append(f.plan.FinalVoterIDs, types.NodeID(member.Member.ID))
+	}
+	f.plan.FinalVoterIDs = append(f.plan.FinalVoterIDs, f.plan.Replacement.NodeID)
+	slices.Sort(f.plan.FinalVoterIDs)
+	closed, _, err := BeginV1Alpha2Repair(ctx, f.store, old, old.Authority(), f.plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abort := V1Alpha2RepairCompletion{OperationID: f.plan.OperationID, PlanDigest: f.plan.Digest(), ExpectedConfigID: f.plan.ExpectedConfigID, ExpectedAbortSlot: f.plan.ExpectedAbortSlot, Kind: "Abort", ConfigID: f.plan.ExpectedConfigID, Slot: f.plan.ExpectedAbortSlot + 1, Hash: strings.Repeat("a", 64)}
+	finished, _, err := FinishV1Alpha2Repair(ctx, f.store, closed, closed.Authority(), abort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record, ok := finished.Repair(); !ok || record.State != "Aborted" || record.PreparedHandoff != nil {
+		t.Fatalf("missing-handoff ADD abort was not retained: %+v present=%t", record, ok)
+	}
+}
+
+func TestRepairV1Alpha2AccessorDeepCopiesEverySlice(t *testing.T) {
+	prepared := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "prepared"}}}
+	record := &V1Alpha2RepairRecord{Plan: V1Alpha2RepairPlan{FinalVoterIDs: []types.NodeID{"final"}}, State: "Closed", PreparedHandoff: &V1Alpha2RepairHandoff{Head: []byte{1}, Survivors: quepaxa.Cluster{Members: []quepaxa.Member{{ID: "survivor"}}}, PreparedConfig: &prepared}, AddCompletion: &V1Alpha2RepairCompletion{FinalVoterIDs: []types.NodeID{"add"}}, Completion: &V1Alpha2RepairCompletion{FinalVoterIDs: []types.NodeID{"done"}}}
+	snapshot := V1Alpha2AdmissionSnapshot{status: V1Alpha2StatusSnapshot{repair: record}}
+	first, _ := snapshot.Repair()
+	first.PreparedHandoff.Head[0] = 2
+	first.PreparedHandoff.Survivors.Members[0].ID = "changed-survivor"
+	first.PreparedHandoff.PreparedConfig.Members[0].ID = "changed-prepared"
+	first.AddCompletion.FinalVoterIDs[0] = "changed-add"
+	second, _ := snapshot.Repair()
+	if second.PreparedHandoff.Head[0] != 1 || second.PreparedHandoff.Survivors.Members[0].ID != "survivor" || second.PreparedHandoff.PreparedConfig.Members[0].ID != "prepared" || second.AddCompletion.FinalVoterIDs[0] != "add" {
+		t.Fatal("repair accessor aliases nested mutable state")
+	}
 }
 
 func TestRepairV1Alpha2HistoricalPendingPreserved(t *testing.T) {
