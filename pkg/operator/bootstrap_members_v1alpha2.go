@@ -46,7 +46,7 @@ func V1Alpha2ManagedResources(init bool) map[string]any {
 	if init {
 		return map[string]any{"requests": map[string]any{"cpu": "10m", "memory": "16Mi", "ephemeral-storage": "16Mi"}, "limits": map[string]any{"cpu": "100m", "memory": "64Mi", "ephemeral-storage": "64Mi"}}
 	}
-	return map[string]any{"requests": map[string]any{"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi"}, "limits": map[string]any{"cpu": "1", "memory": "2Gi", "ephemeral-storage": V1Alpha2ManagedDataSizeLimit}}
+	return map[string]any{"requests": map[string]any{"cpu": "100m", "memory": "128Mi", "ephemeral-storage": "256Mi"}, "limits": map[string]any{"cpu": "1", "memory": "2Gi", "ephemeral-storage": V1Alpha2ManagedDataSizeLimit}}
 }
 
 func V1Alpha2ManagedTopology(crUID string) []any {
