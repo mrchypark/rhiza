@@ -480,6 +480,7 @@ func TestFenceRequestValidation(t *testing.T) {
 		{"missing sourceClusterID", FenceRequest{OperationID: "o", BindingUID: "b", Scope: ScopeGeneration}, "sourceClusterID"},
 		{"missing bindingUID", FenceRequest{OperationID: "o", SourceClusterID: "s", Scope: ScopeGeneration}, "bindingUID"},
 		{"invalid scope", FenceRequest{OperationID: "o", SourceClusterID: "s", BindingUID: "b", Scope: "Bad"}, "scope"},
+		{"empty target nodeID", FenceRequest{OperationID: "o", SourceClusterID: "s", BindingUID: "b", Scope: ScopeGeneration, Targets: []FenceTarget{{Pod: "pod"}}}, "target nodeID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

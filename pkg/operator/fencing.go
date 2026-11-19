@@ -308,6 +308,11 @@ func validateRequest(req *FenceRequest) error {
 	if req.Scope != ScopeGeneration && req.Scope != ScopeVoter {
 		return fmt.Errorf("fencing: invalid scope %q", req.Scope)
 	}
+	for _, target := range req.Targets {
+		if target.NodeID == "" {
+			return fmt.Errorf("fencing: target nodeID is required")
+		}
+	}
 	return fenceCapacityError(len(req.Targets))
 }
 
