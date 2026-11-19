@@ -50,7 +50,7 @@ func TestValidateManagedStartupFreshUsesOneLiveSnapshot(t *testing.T) {
 	if err := host.ValidateManagedStartup(ctx, host.identity); err != nil {
 		t.Fatal(err)
 	}
-	if got := gets.Load() - before; got != 3 {
-		t.Fatalf("fresh startup CR state reads=%d, want 3 (initialization plus one live snapshot)", got)
+	if got := gets.Load() - before; got != 1 {
+		t.Fatalf("fresh startup CR state reads=%d, want 1 (single atomic snapshot)", got)
 	}
 }

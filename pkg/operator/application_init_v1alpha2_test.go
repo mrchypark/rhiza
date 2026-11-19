@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -335,5 +336,62 @@ func TestApplicationInitHistoricalUnusedCannotActivateRetiredProfile(t *testing.
 				t.Fatal("retired commit changed retained pending/original/evidence/Transition bytes")
 			}
 		})
+	}
+}
+
+type countingOperatorRoundTripper struct {
+	next http.RoundTripper
+	gets int
+}
+
+func (rt *countingOperatorRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodGet {
+		rt.gets++
+	}
+	return rt.next.RoundTrip(r)
+}
+
+func TestApplicationInitAdmissionReusesLoadedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	server, store, name := phase8Setup(t, phase9CurrentManagedCluster(), "")
+	plan := initTestPlan(t)
+	if _, err := InitializeV1Alpha2AuthorityWithBootstrap(ctx, store, phase2Ref, name, plan, initTestBootstrap(t)); err != nil {
+		t.Fatal(err)
+	}
+	server.cluster = strings.Replace(server.cluster, `"resourceVersion":"48"`, `"resourceVersion":"47"`, 1)
+	initial, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := CommitV1Alpha2ApplicationInit(ctx, store, initial, plan, json.RawMessage(`{"schema":"empty"}`)); err != nil {
+		t.Fatal(err)
+	}
+	counter := &countingOperatorRoundTripper{next: store.Kube.Client.Transport}
+	store.Kube.Client.Transport = counter
+
+	loaded, err := LoadV1Alpha2ApplicationInit(ctx, store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := loaded.Admission()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counter.gets != 1 {
+		t.Fatalf("LoadV1Alpha2ApplicationInit+Admission GETs=%d, want 1", counter.gets)
+	}
+
+	want, err := LoadV1Alpha2Admission(ctx, store, phase2Ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion() != want.ResourceVersion() ||
+		got.Authority() != want.Authority() ||
+		!bytes.Equal(got.Evidence(), want.Evidence()) ||
+		!bytes.Equal(got.Transition(), want.Transition()) ||
+		got.EverApplicationReserved() != want.EverApplicationReserved() ||
+		got.SQLReservationsClosed() != want.SQLReservationsClosed() ||
+		!reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot-derived admission %+v differs from LoadV1Alpha2Admission %+v", got, want)
 	}
 }
