@@ -259,8 +259,7 @@ managed_functional_start_load() {
 }
 
 managed_functional_stage() {
-  printf '%s' "$1" > "$private/functional-stage"
-  k -n "$namespace" exec -i "$functional_client_pod" -c client -- sh -c 'cat > /work/stage' < "$private/functional-stage"
+  k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'printf "%s" "$1" > /work/stage.tmp && mv /work/stage.tmp /work/stage' -- "$1"
 }
 
 managed_functional_wait_up3_samples() {

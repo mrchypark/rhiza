@@ -18,6 +18,9 @@ type Coordinator struct {
 }
 
 func validateHex64(s string) bool {
+	if strings.ToLower(s) != s {
+		return false
+	}
 	b, err := hex.DecodeString(s)
 	return err == nil && len(b) == 32
 }
@@ -94,7 +97,7 @@ const maxActivateAttempts = 8
 
 func (c *Coordinator) Activate(ctx context.Context, req Request) (Receipt, error) {
 	if err := c.validateRequest(req); err != nil {
-		return Receipt{}, err
+		return Receipt{}, invalidRequest(err)
 	}
 	rhash, err := RequestHash(req)
 	if err != nil {
@@ -212,13 +215,51 @@ func (c *Coordinator) Activate(ctx context.Context, req Request) (Receipt, error
 			lastErr = fmt.Errorf("CAS commit: %w", err)
 			continue
 		}
-		continue
+		return receipt, nil
 	}
 
 	if lastErr != nil {
 		return Receipt{}, lastErr
 	}
 	return Receipt{}, fmt.Errorf("activate: exceeded max attempts")
+}
+
+// Release aborts exactly the caller's frozen transition. It cannot reverse a
+// committed generation or release another operation's reservation.
+func (c *Coordinator) Release(ctx context.Context, req Request) error {
+	if err := c.validateRequest(req); err != nil {
+		return invalidRequest(err)
+	}
+	rhash, err := RequestHash(req)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxActivateAttempts; attempt++ {
+		existing, version, err := c.Backend.Read(ctx, req.AnchorID)
+		if err != nil {
+			return fmt.Errorf("read anchor: %w", err)
+		}
+		if committed(existing, req, rhash) {
+			return ErrAlreadyCommitted
+		}
+		if existing.Transition == nil {
+			return ErrNoTransition
+		}
+		if err := validateFrozen(existing, req, rhash); err != nil {
+			return err
+		}
+		existing.Transition = nil
+		if err := c.Backend.CAS(ctx, req.AnchorID, version, existing); err != nil {
+			lastErr = fmt.Errorf("CAS release: %w", err)
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("release: exceeded max attempts")
 }
 
 func committed(record Record, req Request, rhash string) bool {
@@ -273,10 +314,10 @@ func (c *Coordinator) Verify(ctx context.Context, req Request, receipt Receipt) 
 		return fmt.Errorf("record schema mismatch")
 	}
 	if !committed(record, req, rhash) {
-		return fmt.Errorf("record is not committed for this request")
+		return fmt.Errorf("%w: record is not committed for this request", ErrReceiptMismatch)
 	}
 	if receipt != *record.LastTransition {
-		return fmt.Errorf("receipt does not match stored state")
+		return fmt.Errorf("%w: receipt does not match stored state", ErrReceiptMismatch)
 	}
 	return nil
 }
