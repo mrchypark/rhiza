@@ -88,7 +88,7 @@ func independentFixture(t *testing.T) (FenceRequest, independentScope) {
 	}}}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "op", Scope: ScopeGeneration, Targets: []FenceTarget{
 		{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"},
-		{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1", NodeName: "node-b", ContainerID: "containerd://c1", ImageID: "sha256:img-1"},
+		{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1", NodeName: "node-b", NodeUID: "node-uid-b", ContainerID: "containerd://c1", ImageID: "sha256:img-1"},
 	}}
 	hash, err := requestHash(&request)
 	if err != nil {
@@ -224,7 +224,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 	state := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source", Runs: map[string]fencing.Run{
 		"run-0": {Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "pod-0", RunID: "run-0", WALIdentity: "wal-0"}},
 	}}}
-	captured := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"}
+	captured := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "op", Scope: ScopeVoter, Targets: []FenceTarget{captured}}
 	storage := AttestationStoreScope{Provider: "gcs", Bucket: "rhiza-archive", Prefix: "root/source"}
 	if _, err := buildIndependentScope(state, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
@@ -237,6 +237,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 		"missing container id": func(t *FenceTarget) { t.ContainerID = "" },
 		"missing image id":     func(t *FenceTarget) { t.ImageID = "" },
 		"missing node name":    func(t *FenceTarget) { t.NodeName = "" },
+		"missing node uid":     func(t *FenceTarget) { t.NodeUID = "" },
 		"missing pod uid":      func(t *FenceTarget) { t.PodUID = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
