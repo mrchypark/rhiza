@@ -226,20 +226,24 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 			cm := c.(map[string]any)
 			cm["resources"] = V1Alpha2ManagedResources(false)
 			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
-			cm["volumeMounts"] = append(cm["volumeMounts"].([]any), map[string]any{"name": "tmp", "mountPath": "/tmp"})
+			mounts := cm["volumeMounts"].([]any)
+			cm["volumeMounts"] = append([]any{mounts[0], map[string]any{"name": "tmp", "mountPath": "/tmp"}}, mounts[1:]...)
 		}
 		for _, c := range p["initContainers"].([]any) {
 			cm := c.(map[string]any)
 			cm["resources"] = V1Alpha2ManagedResources(true)
 			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
 		}
-		for _, v := range p["volumes"].([]any) {
+		vols := p["volumes"].([]any)
+		for _, v := range vols {
 			vm := v.(map[string]any)
 			if vm["name"] == V1Alpha2BootstrapVolume {
 				vm["emptyDir"] = map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}
 			}
 		}
-		p["volumes"] = append(p["volumes"].([]any), map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "64Mi"}})
+		// Match V1Alpha2ManagedSQLPodSpec volume order: rhiza-data, tmp, rhiza-runtime-profile, ...
+		tmpVol := map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "64Mi"}}
+		p["volumes"] = append([]any{vols[0], tmpVol}, vols[1:]...)
 		return mustManagedJSON(p)
 	}
 	var depSpec map[string]json.RawMessage
