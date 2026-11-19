@@ -160,9 +160,6 @@ func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, 
 	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
-	if err := c.verifyMembershipAnchorContext(ctx, seal); err != nil {
-		return err
-	}
 	verifier, err := c.checkpointMembershipForSeal(seal)
 	if err != nil {
 		return err
@@ -226,35 +223,6 @@ type consensusBase struct {
 	GenerationAnchorHash [32]byte          `json:"generation_anchor_hash,omitzero"`
 }
 
-// CompactLocalManagedThrough compacts only the local Core WAL through an
-// already-certified and archive-synced managed append-only checkpoint cut.
-func (c *Core) CompactLocalManagedThrough(ctx context.Context, through Slot, recoveryRoot [32]byte) error {
-	if c.managedAppendOnly == nil {
-		return ErrManagedAppendOnlyUnavailable
-	}
-	c.mu.RLock()
-	seal, sealed := c.sealedRoots[recoveryRoot]
-	var decision DecidedValue
-	var hasDecision bool
-	if sealed && seal.Index == through {
-		decision, hasDecision, _ = c.loadDecidedLocked(seal.DecisionSlot)
-	}
-	c.mu.RUnlock()
-	if !sealed || seal.Index != through || !hasDecision {
-		return fmt.Errorf("managed local compaction root is unavailable at slot %d", through)
-	}
-	if err := c.ValidateManagedCheckpointRoot(ctx, ManagedCheckpointCandidate{
-		Value:        decision.Value,
-		Hash:         decision.Hash,
-		Seal:         seal.CheckpointSeal,
-		DecisionSlot: seal.DecisionSlot,
-		ConfigID:     c.ConfigIDForSlot(seal.DecisionSlot),
-	}); err != nil {
-		return err
-	}
-	return c.compactThroughOwned(through, recoveryRoot)
-}
-
 // CompactThrough installs a certified local recovery floor. Callers must have
 // independently verified and quorum-sealed recoveryRoot before invoking it.
 func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
@@ -264,10 +232,24 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		}
 		defer c.releaseLocalExecution()
 	}
-	return c.compactThroughOwned(through, recoveryRoot)
+	return c.compactThroughOwnedWith(through, recoveryRoot, true)
 }
 
 func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
+	return c.compactThroughOwnedWith(through, recoveryRoot, true)
+}
+
+// CompactManagedThrough reclaims a local managed append-only WAL through a
+// certified QCKP. Append-only promotion verifies the seal without writing the
+// two-phase prepare marker used by vote-bearing checkpoints.
+func (c *Core) CompactManagedThrough(through Slot, recoveryRoot [32]byte) error {
+	if c.managedAppendOnly == nil {
+		return fmt.Errorf("managed append-only compaction is unavailable")
+	}
+	return c.compactThroughOwnedWith(through, recoveryRoot, false)
+}
+
+func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requirePrepared bool) error {
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
@@ -282,8 +264,7 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 	}
 	seal, sealed := c.sealedRoots[recoveryRoot]
 	preparedRoot, prepared := c.preparedCheckpoints[through]
-	managedReady := c.managedAppendOnly != nil && sealed && seal.Index == through && seal.DecisionSlot <= c.tip && c.isDurableLocked(seal.DecisionSlot)
-	if !sealed || seal.Index != through || (!managedReady && (!prepared || preparedRoot != recoveryRoot)) {
+	if !sealed || seal.Index != through || requirePrepared && (!prepared || preparedRoot != recoveryRoot) || prepared && preparedRoot != recoveryRoot {
 		c.mu.Unlock()
 		c.unlockCompactionBarrier()
 		return fmt.Errorf("recovery root is not locally verified and quorum sealed through %d", through)
@@ -312,7 +293,7 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 			return fmt.Errorf("compaction cannot cross active reconfiguration")
 		}
 		membership, membershipErr := c.membershipHistoryLocked(through)
-		if membershipErr != nil || seal.Membership == nil || !membershipRecordMatches(membership, *seal.Membership) {
+		if membershipErr != nil || seal.Membership == nil || !sameMembershipRecord(membership, *seal.Membership) {
 			c.mu.Unlock()
 			c.unlockCompactionBarrier()
 			return fmt.Errorf("compaction seal has stale membership history")
