@@ -26,6 +26,28 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 	verifier := &Core{config: &initial, reconfigEnabled: true, configHistory: []configEpoch{{start: 1, cluster: initial}}, decided: make(map[Slot]DecidedValue), retiredIDs: make(map[NodeID]struct{})}
 	current := initial
 	var previousTerminal Slot
+	if history.Anchor != nil {
+		anchor := history.Anchor
+		if anchor.Through == 0 || anchor.Digest == ([32]byte{}) || len(anchor.Cluster.Members) == 0 || anchor.Cluster.ConfigID == 0 {
+			return nil, fmt.Errorf("invalid membership anchor")
+		}
+		current = cloneCluster(anchor.Cluster)
+		verifier.configHistory = []configEpoch{{start: anchor.Through + 1, cluster: current}}
+		for _, id := range anchor.RetiredIDs {
+			if _, retained := current.MemberSet()[id]; id == "" || retained {
+				return nil, fmt.Errorf("invalid anchored retired member")
+			}
+			verifier.retiredIDs[id] = struct{}{}
+		}
+		previousTerminal = anchor.Through
+		if history.Abort != nil && history.Abort.Terminal.Slot <= anchor.Through {
+			if history.Abort.Freeze.Slot >= history.Abort.Terminal.Slot {
+				return nil, fmt.Errorf("invalid anchored abort")
+			}
+			abort := ConfigTransition{Freeze: cloneDecidedValue(history.Abort.Freeze), Terminal: cloneDecidedValue(history.Abort.Terminal)}
+			verifier.lastAbort = &abort
+		}
+	}
 	for i, transition := range history.Transitions {
 		freeze, err := historyDecision(current.ConfigID, transition.Freeze)
 		if err != nil {
@@ -76,6 +98,9 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 		previousTerminal = terminal.Slot
 	}
 	if history.Abort != nil {
+		if history.Anchor != nil && history.Abort.Terminal.Slot <= history.Anchor.Through {
+			return verifier, nil
+		}
 		abort := *history.Abort
 		freeze, err := historyDecision(current.ConfigID, abort.Freeze)
 		if err != nil {

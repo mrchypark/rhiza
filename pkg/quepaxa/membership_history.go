@@ -2,7 +2,9 @@ package quepaxa
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 // ConfigTransition is one completed freeze→terminal reconfiguration pair
@@ -12,11 +14,22 @@ type ConfigTransition struct {
 	Terminal DecidedValue `json:"terminal"`
 }
 
+// MembershipAnchor commits a checkpointed prefix of the transition chain.
+// The proof object named by Digest contains the bounded suffix that extends
+// the previous proof.
+type MembershipAnchor struct {
+	Through    Slot     `json:"through"`
+	Digest     [32]byte `json:"digest"`
+	Cluster    Cluster  `json:"cluster"`
+	RetiredIDs []NodeID `json:"retired_ids,omitempty"`
+}
+
 // MembershipRecord is the ordered genesis cluster followed by every
 // completed config transition certified by this Core.
 type MembershipRecord struct {
 	Genesis     Cluster            `json:"genesis"`
 	Transitions []ConfigTransition `json:"transitions"`
+	Anchor      *MembershipAnchor  `json:"anchor,omitempty"`
 	// Abort retains the latest certified addition abort. It is evidence for a
 	// management retry round, never authority to activate its target.
 	Abort *ConfigTransition `json:"abort,omitempty"`
@@ -44,7 +57,65 @@ func (c *Core) CheckpointMembership(index Slot) (MembershipRecord, error) {
 	if index == 0 || index > c.tip || c.reconfiguration != nil {
 		return MembershipRecord{}, fmt.Errorf("checkpoint membership is not stable at slot %d", index)
 	}
-	return c.membershipHistoryLocked(index)
+	record, err := c.membershipHistoryLocked(index)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	if len(record.Transitions) == 0 {
+		return record, nil
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil || len(encoded) <= membershipInlineLimit {
+		return record, err
+	}
+	retired := make([]NodeID, 0, len(c.retiredIDs))
+	for id := range c.retiredIDs {
+		retired = append(retired, id)
+	}
+	sort.Slice(retired, func(i, j int) bool { return retired[i] < retired[j] })
+	anchor := &MembershipAnchor{
+		Through: index, Digest: membershipRecordDigest(record),
+		Cluster: cloneCluster(c.clusterForSlotLocked(index + 1)), RetiredIDs: retired,
+	}
+	return MembershipRecord{Genesis: record.Genesis, Abort: record.Abort, Anchor: anchor}, nil
+}
+
+const membershipInlineLimit = 96 << 10
+
+func membershipRecordDigest(record MembershipRecord) [32]byte {
+	var prior [32]byte
+	if record.Anchor != nil {
+		prior = record.Anchor.Digest
+	}
+	payload, _ := json.Marshal(struct {
+		Genesis     Cluster            `json:"genesis"`
+		Prefix      [32]byte           `json:"prefix"`
+		Transitions []ConfigTransition `json:"transitions"`
+		Abort       *ConfigTransition  `json:"abort,omitempty"`
+	}{record.Genesis, prior, record.Transitions, record.Abort})
+	digest := sha256.Sum256(append([]byte("rhiza-membership-chain-v1\x00"), payload...))
+	return digest
+}
+
+func membershipRecordMatches(full, stored MembershipRecord) bool {
+	if stored.Anchor == nil {
+		return sameMembershipRecord(full, stored)
+	}
+	return membershipRecordDigest(full) == stored.Anchor.Digest && sameCluster(fullAnchorCluster(full), stored.Anchor.Cluster)
+}
+
+func fullAnchorCluster(record MembershipRecord) Cluster {
+	if len(record.Transitions) == 0 {
+		if record.Anchor != nil {
+			return record.Anchor.Cluster
+		}
+		return record.Genesis
+	}
+	control, ok, err := decodeReconfiguration(record.Transitions[len(record.Transitions)-1].Terminal.Value)
+	if err != nil || !ok {
+		return Cluster{}
+	}
+	return control.Target
 }
 
 func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
@@ -62,7 +133,15 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 		base := cloneMembershipRecord(*c.baseMembership)
 		transitions = base.Transitions
 		baseTransitions = len(transitions)
-		start += len(transitions)
+		if base.Anchor != nil {
+			for start < len(c.configHistory) && c.configHistory[start].start-1 <= base.Anchor.Through {
+				start++
+			}
+			start += len(transitions)
+			baseTransitions = start - 1
+		} else {
+			start += len(transitions)
+		}
 		if len(c.configHistory)-1 > len(transitions) {
 			base.Abort = nil // a later successful transition starts a new revision.
 		}

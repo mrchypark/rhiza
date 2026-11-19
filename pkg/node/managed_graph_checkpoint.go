@@ -205,11 +205,12 @@ func (n *Node) reconcileManagedGraphCapturedFence(ctx context.Context, captured 
 		return errors.Join(prepareErr, err)
 	}
 	if n.core.Tip() < max(target, fence) {
-		if n.transport == nil {
+		transport := n.currentTransport()
+		if transport == nil {
 			return errors.Join(prepareErr, fmt.Errorf("managed Graph prepared fence requires unavailable certified catch-up"))
 		}
 		cluster := n.core.CurrentCluster()
-		if err := n.catchUpQuorum(ctx, n.transport, &cluster); err != nil {
+		if err := n.catchUpQuorum(ctx, transport, &cluster); err != nil {
 			return errors.Join(prepareErr, err)
 		}
 	}
@@ -487,7 +488,7 @@ func (n *Node) prepareManagedGraphPeerCheckpoint(ctx context.Context, sender que
 	if err != nil || root.Hash != seal.StateHash || root.Generation != uint64(seal.Index) {
 		return fmt.Errorf("managed Graph peer paired root mismatch: %w", err)
 	}
-	dir, err := os.MkdirTemp("", "rhiza-graph-peer-prepare-*")
+	dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-graph-peer-prepare-*")
 	if err != nil {
 		return err
 	}

@@ -69,9 +69,7 @@ func (h *Host) graphExecuteAttempt(ctx context.Context, owned types.GraphCommand
 	result, err := n.ExecuteManagedGraph(ctx, owned)
 	p := applicationOriginal{kind: "graph", graph: owned}
 	err = internalRequestOutcome(p, result.MutationReceipt, err)
-	h.mu.Lock()
 	h.rememberRequestOutcome(p, err, result.MutationReceipt)
-	h.mu.Unlock()
 	return result, err, false
 }
 

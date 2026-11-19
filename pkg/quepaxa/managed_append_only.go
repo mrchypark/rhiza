@@ -134,6 +134,9 @@ func (c *Core) ValidateManagedCheckpointRoot(ctx context.Context, candidate Mana
 	if err := c.validateManagedCheckpointRootLocal(candidate); err != nil {
 		return err
 	}
+	if err := c.verifyMembershipAnchorContext(ctx, seal); err != nil {
+		return err
+	}
 	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
 		return err
 	}
@@ -200,7 +203,7 @@ func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCan
 			if seal.Index <= c.tip {
 				return err
 			}
-		} else if !sameMembershipRecord(localMembership, *seal.Membership) {
+		} else if !membershipRecordMatches(localMembership, *seal.Membership) {
 			return fmt.Errorf("managed checkpoint membership differs from available local history")
 		}
 		if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
@@ -253,6 +256,9 @@ func (c *Core) ValidateManagedCheckpointCandidate(ctx context.Context, candidate
 		return fmt.Errorf("managed checkpoint candidate decision slot or config is invalid")
 	}
 	if err := c.validateManagedCandidateLocal(candidate); err != nil {
+		return err
+	}
+	if err := c.verifyMembershipAnchorContext(ctx, candidate.Seal); err != nil {
 		return err
 	}
 	if _, err := c.checkpointMembershipForSeal(candidate.Seal); err != nil {
@@ -321,7 +327,7 @@ func (c *Core) validateManagedCandidateLocalLocked(candidate ManagedCheckpointCa
 				return err
 			}
 		} else {
-			if !sameMembershipRecord(localMembership, *seal.Membership) {
+			if !membershipRecordMatches(localMembership, *seal.Membership) {
 				return fmt.Errorf("managed checkpoint membership differs from available local history")
 			}
 			if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {

@@ -137,7 +137,7 @@ func (n *Node) verifyManagedAppendOnlyCandidate(ctx context.Context, candidate q
 	if err := n.checkpoints.Verify(ctx, uint64(candidate.Seal.Index), candidate.Seal.RootHash, candidate.Seal.StateHash); err != nil {
 		return fmt.Errorf("managed append-only immutable objects failed content verification: %w", err)
 	}
-	stage, err := os.MkdirTemp("", "rhiza-managed-append-only-candidate-*")
+	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-append-only-candidate-*")
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (n *Node) verifyManagedAppendOnlyArchiveHistory(ctx context.Context, seal q
 	if n == nil || n.archive == nil || n.config == nil || seal.Index == 0 {
 		return fmt.Errorf("managed append-only archive history verifier unavailable")
 	}
-	stage, err := os.MkdirTemp("", "rhiza-managed-append-only-history-*")
+	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-append-only-history-*")
 	if err != nil {
 		return err
 	}
@@ -546,6 +546,17 @@ func (n *Node) promoteManagedAppendOnlySeal(ctx context.Context, sealed quepaxa.
 		}
 	}
 	n.markManagedGraphInitialRootComplete()
+	if n.material != nil && n.material.Tip() < uint64(sealed.Index) {
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return err
+		}
+	}
+	const managedLocalWALRetainSlots quepaxa.Slot = 1024
+	if floor := n.core.CompactionFloor(); sealed.Index > floor && sealed.Index-floor >= managedLocalWALRetainSlots && (n.material == nil || n.material.Tip() >= uint64(sealed.Index)) {
+		if err := n.core.CompactLocalManagedThrough(ctx, sealed.Index, sealed.RootHash); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -274,6 +274,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 		enableReconfiguration = *trustedReconfiguration
 	}
 	coreConfig := quepaxa.Config{NodeID: "rhiza-readonly-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: enableReconfiguration}
+	coreConfig.VerifyMembershipAnchor = MembershipAnchorVerifier(bucket, prefix)
 	if expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		coreConfig.ValidateValue = types.ValidateManagedGraphExecutionPolicy
 	}

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -61,12 +62,13 @@ type Host struct {
 	replicaMu sync.Mutex
 	// Initial admission is the only quorum-dependent setup step. Serialize it
 	// independently so local reads and readiness never queue behind mutations.
-	admissionMu sync.Mutex
-	node        *node.Node
-	cfg         Config
-	identity    node.ManagedStartupIdentity
-	authority   operator.V1Alpha2AuthorityView
-	closed      bool
+	admissionMu     sync.Mutex
+	initialAdmitted atomic.Bool
+	node            *node.Node
+	cfg             Config
+	identity        node.ManagedStartupIdentity
+	authority       operator.V1Alpha2AuthorityView
+	closed          bool
 	// Immutable after Open publishes the Host. Close cancels admission waits
 	// before acquiring mu, then retains the existing serialized Node drain.
 	admissionLifetime context.Context
@@ -74,6 +76,8 @@ type Host struct {
 	// recoveryTargets are caller-local selectors, never execution authority.
 	recoveryTargets        map[network.RequestStatusRequest]requestRecoveryHint
 	recoveryTargetOverflow bool
+	recoveryMu             sync.Mutex
+	recoveryVersion        uint64
 }
 
 // Open returns an owned paused host after initialization, without waiting for
@@ -939,9 +943,7 @@ func (h *Host) executeAttempt(ctx context.Context, req ExecuteRequest) (ExecuteR
 	response, err := n.ExecuteManagedSQL(ctx, req)
 	p := applicationOriginal{kind: "sql", sql: req}
 	err = internalRequestOutcome(p, response.MutationReceipt, err)
-	h.mu.Lock()
 	h.rememberRequestOutcome(p, err, response.MutationReceipt)
-	h.mu.Unlock()
 	return response, err, true
 }
 

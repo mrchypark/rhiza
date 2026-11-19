@@ -535,3 +535,28 @@ func TestRepairErrorsPreserveInnerCause(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupRepairStagingArtifacts(t *testing.T) {
+	parent := t.TempDir()
+	active := filepath.Join(parent, "repair-prepared-active123")
+	stale := filepath.Join(parent, "repair-prepared-old456")
+	staging := filepath.Join(parent, ".repair-data-staging-old456-1")
+	quarantine := filepath.Join(parent, ".repair-prepared-old456-quarantine-1")
+	dataDir := filepath.Join(parent, "data")
+	for _, dir := range []string{active, stale, staging, quarantine, dataDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanupRepairStagingArtifacts(parent, "active123")
+	for _, shouldKeep := range []string{active, dataDir} {
+		if _, err := os.Stat(shouldKeep); err != nil {
+			t.Fatalf("expected %s to remain: %v", shouldKeep, err)
+		}
+	}
+	for _, shouldRemove := range []string{stale, staging, quarantine} {
+		if _, err := os.Stat(shouldRemove); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed, stat err=%v", shouldRemove, err)
+		}
+	}
+}

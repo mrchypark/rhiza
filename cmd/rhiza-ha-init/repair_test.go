@@ -155,12 +155,12 @@ func TestRepairControlUsesActualFixedHEADAndPreparedPrimitives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyRepairControl(ctx, readonly, bootstrap, view, capture); err != nil {
+	if err := verifyRepairControl(ctx, readonly, bootstrap, view, capture, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	bad := capture
 	bad.RemoveTerminalHash = strings.Repeat("f", 64)
-	if err := verifyRepairControl(ctx, readonly, bootstrap, view, bad); err == nil {
+	if err := verifyRepairControl(ctx, readonly, bootstrap, view, bad, t.TempDir()); err == nil {
 		t.Fatal("unrelated terminal accepted")
 	}
 	identity := recovery.PreparedStartupIdentity{ClusterUID: "uid", Generation: 0, DeploymentUID: "deployment", PodUID: "replacement", NodeID: "new", SourceBinding: "source-binding", ConfigDigest: "member-binding"}

@@ -31,10 +31,11 @@ func (n *Node) ProbeManagedReplicaVotersExcept(ctx context.Context, expected que
 	if !n.ready.Load() || !n.core.CanParticipateReadIndex() {
 		return network.ErrNotReady
 	}
-	if n.transport == nil {
+	transport := n.currentTransport()
+	if transport == nil {
 		return network.ErrNotReady
 	}
-	if err := probeManagedReplicaVoters(ctx, n.transport, expected, n.config.NodeID, excluded); err != nil {
+	if err := probeManagedReplicaVoters(ctx, transport, expected, n.config.NodeID, excluded); err != nil {
 		return err
 	}
 	after, err := n.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
@@ -45,6 +46,12 @@ func (n *Node) ProbeManagedReplicaVotersExcept(ctx context.Context, expected que
 		return fmt.Errorf("replica membership changed during voter probes")
 	}
 	return ctx.Err()
+}
+
+func (n *Node) currentTransport() *network.Transport {
+	n.transportMu.RLock()
+	defer n.transportMu.RUnlock()
+	return n.transport
 }
 
 func probeManagedReplicaVoters(ctx context.Context, transport quepaxa.Transport, cluster quepaxa.Cluster, local, excluded quepaxa.NodeID) error {

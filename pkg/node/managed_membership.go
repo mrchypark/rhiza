@@ -70,8 +70,8 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	if n == nil || r.Action != ManagedMembershipAdd || r.Addition != nil || r.HandoffHeadHash != "" || r.RepairOperationID == "" {
 		return ManagedRepairSource{}, network.ErrInvalidRequest
 	}
-	n.shutdownMu.Lock()
-	defer n.shutdownMu.Unlock()
+	n.membershipWorkMu.RLock()
+	defer n.membershipWorkMu.RUnlock()
 	if err := n.managedRepairReady(); err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -198,8 +198,8 @@ func (n *Node) VerifyManagedRepairAddition(ctx context.Context, request ManagedM
 	if n == nil || request.Action != ManagedMembershipAdd || request.Addition == nil || request.Addition.WALIdentity == "" || request.HandoffHeadHash == "" {
 		return ManagedRepairCompletion{}, network.ErrInvalidRequest
 	}
-	n.shutdownMu.Lock()
-	defer n.shutdownMu.Unlock()
+	n.membershipWorkMu.RLock()
+	defer n.membershipWorkMu.RUnlock()
 	if err := n.managedRepairReady(); err != nil {
 		return ManagedRepairCompletion{}, err
 	}
@@ -251,8 +251,8 @@ func (n *Node) VerifyManagedRepairRemoval(ctx context.Context, request ManagedMe
 	if n == nil || request.Action != ManagedMembershipRemove || request.Addition != nil || request.RepairOperationID == "" {
 		return ManagedRepairSource{}, network.ErrInvalidRequest
 	}
-	n.shutdownMu.Lock()
-	defer n.shutdownMu.Unlock()
+	n.membershipWorkMu.RLock()
+	defer n.membershipWorkMu.RUnlock()
 	if err := n.managedRepairReady(); err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -427,8 +427,8 @@ func (n *Node) AbortManagedRepairAddition(ctx context.Context, r ManagedMembersh
 	if n == nil || r.Action != ManagedMembershipAdd || r.Addition == nil {
 		return ManagedRepairAbort{}, network.ErrInvalidRequest
 	}
-	n.shutdownMu.Lock()
-	defer n.shutdownMu.Unlock()
+	n.membershipWorkMu.RLock()
+	defer n.membershipWorkMu.RUnlock()
 	if err := n.managedRepairReady(); err != nil {
 		return ManagedRepairAbort{}, err
 	}
@@ -457,8 +457,8 @@ func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequ
 	if n == nil {
 		return network.ErrNotReady
 	}
-	n.shutdownMu.Lock()
-	defer n.shutdownMu.Unlock()
+	n.membershipWorkMu.RLock()
+	defer n.membershipWorkMu.RUnlock()
 	if r.Action != ManagedMembershipRemove && r.Action != ManagedMembershipAdd {
 		return network.ErrInvalidRequest
 	}

@@ -499,7 +499,8 @@ func FinishV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V
 }
 
 func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, ref V1Alpha2ClusterRef, p V1Alpha2RepairPlan) error {
-	if err := validateV1Alpha2RepairPodIdentity(ctx, store, ref, p); err != nil {
+	cache := newV1Alpha2GetCache(store.Kube)
+	if err := validateV1Alpha2RepairPodIdentityWithCache(ctx, cache, ref, p); err != nil {
 		return err
 	}
 	var pod struct {
@@ -516,7 +517,7 @@ func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, 
 			}
 		}
 	}
-	if err := store.Kube.Get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/pods/"+url.PathEscape(p.Replacement.PodName), &pod); err != nil {
+	if err := cache.get(ctx, "/api/v1/namespaces/"+ref.Namespace+"/pods/"+url.PathEscape(p.Replacement.PodName), &pod); err != nil {
 		return err
 	}
 	u, _ := url.Parse(p.Replacement.PeerURL)
@@ -528,7 +529,7 @@ func validateV1Alpha2RepairPod(ctx context.Context, store *V1Alpha2StatusStore, 
 			return fmt.Errorf("repair candidate main container has already started")
 		}
 	}
-	if _, err := ValidateV1Alpha2RepairPodBinding(ctx, store, ref, p); err != nil {
+	if _, err := validateV1Alpha2RepairPodBinding(ctx, cache, ref, p); err != nil {
 		return err
 	}
 	return nil
