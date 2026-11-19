@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -579,17 +580,20 @@ func TestManagedMixedProfileAddFirstCompletionHeadroom(t *testing.T) {
 		projected, _ := json.Marshal(fields)
 		return current, projected
 	}
-	var raw []byte
-	for padding := 0; padding < V1Alpha2RepairRecordLimit; padding++ {
-		current, withBoth := projected(padding, true)
-		_, finalOnly := projected(padding, false)
-		if len(current) < V1Alpha2RepairRecordLimit && len(finalOnly) <= V1Alpha2RepairRecordLimit && len(withBoth) > V1Alpha2RepairRecordLimit {
-			raw = current
-			break
-		}
-	}
-	if raw == nil {
+	// Every projection grows with padding. The first padding whose ADD+final
+	// successor exceeds the limit leaves the current record and final-only
+	// completion just below it.
+	padding := sort.Search(V1Alpha2RepairRecordLimit, func(padding int) bool {
+		_, withBoth := projected(padding, true)
+		return len(withBoth) > V1Alpha2RepairRecordLimit
+	})
+	if padding >= V1Alpha2RepairRecordLimit {
 		t.Fatal("could not construct ADD completion headroom fixture")
+	}
+	raw, withBoth := projected(padding, true)
+	_, finalOnly := projected(padding, false)
+	if len(finalOnly) > V1Alpha2RepairRecordLimit || len(withBoth) <= V1Alpha2RepairRecordLimit {
+		t.Fatalf("could not construct ADD completion headroom fixture: padding=%d current=%d final=%d both=%d limit=%d", padding, len(raw), len(finalOnly), len(withBoth), V1Alpha2RepairRecordLimit)
 	}
 	if validateMixedRepairBudget(raw) == nil {
 		t.Fatal("ADD-first record consumed future ADD/final completion headroom")
