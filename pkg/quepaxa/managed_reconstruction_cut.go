@@ -50,7 +50,10 @@ func (c *Core) CaptureManagedReconstructionCut(sealed SealedCheckpoint, through 
 	if sealed.Index == 0 || sealed.DecisionSlot <= sealed.Index || sealed.DecisionSlot > through || through > c.tip || sealed.Index < c.floor {
 		return nil, fmt.Errorf("managed reconstruction root lies outside certified cut")
 	}
-	decision, ok := c.decided[sealed.DecisionSlot]
+	decision, ok, err := c.loadDecidedLocked(sealed.DecisionSlot)
+	if err != nil {
+		return nil, err
+	}
 	if !ok || decision.Slot != sealed.DecisionSlot || sha256.Sum256(decision.Value) != decision.Hash {
 		return nil, fmt.Errorf("managed reconstruction producer certificate unavailable")
 	}
@@ -62,8 +65,8 @@ func (c *Core) CaptureManagedReconstructionCut(sealed SealedCheckpoint, through 
 	if err != nil || !isSeal || !sameManagedCheckpointSeal(decoded, sealed.CheckpointSeal) {
 		return nil, fmt.Errorf("managed reconstruction producer differs from selected root")
 	}
-	rootPrefix, rootOK := c.prefixes[sealed.Index]
-	prefix, prefixOK := c.prefixes[through]
+	rootPrefix, rootOK := c.prefixHashLocked(sealed.Index)
+	prefix, prefixOK := c.prefixHashLocked(through)
 	if !rootOK || rootPrefix != sealed.PrefixHash || !prefixOK || (expectedPrefix != ([32]byte{}) && expectedPrefix != prefix) {
 		return nil, fmt.Errorf("managed reconstruction certified prefix unavailable or changed")
 	}
@@ -141,9 +144,12 @@ func (c *Core) RecheckManagedReconstructionCut(ctx context.Context, cut *Managed
 		return 0, err
 	}
 	cluster := c.clusterForSlotLocked(c.tip + 1)
-	decision, ok := c.decided[cut.sealSlot]
-	prefix, prefixOK := c.prefixes[cut.tip]
-	rootPrefix, rootOK := c.prefixes[cut.seal.Index]
+	decision, ok, loadErr := c.loadDecidedLocked(cut.sealSlot)
+	if loadErr != nil {
+		return 0, loadErr
+	}
+	prefix, prefixOK := c.prefixHashLocked(cut.tip)
+	rootPrefix, rootOK := c.prefixHashLocked(cut.seal.Index)
 	decisionConfig, certificate, certErr := decodeCertificate(decision.Certificate)
 	decoded, isSeal, sealErr := DecodeCheckpointSeal(decision.Value)
 	if c.tip < cut.tip || c.floor != cut.floor || c.floorRoot != cut.floorRoot || !prefixOK || prefix != cut.prefix || !rootOK || rootPrefix != cut.seal.PrefixHash || c.managedAppendOnly != cut.config || c.managedAppendOnly != nil && c.managedAppendOnly.Binding != cut.binding || c.walIdentity != cut.walIdentity || c.generationAnchorHash != cut.anchor || c.membershipVersion != cut.membership || c.nodeID != cut.nodeID || c.localMode != cut.localMode || c.observer != cut.observer || c.learner != cut.learner || cluster.ConfigID != cut.configID || !sameCluster(cluster, cut.cluster) || !ok || decision.Hash != cut.sealHash || sha256.Sum256(decision.Value) != decision.Hash || sha256.Sum256(decision.Certificate) != cut.sealCert || certErr != nil || certificate.Slot != cut.sealSlot || certificate.Proposal.Hash != decision.Hash || decisionConfig == 0 || sealErr != nil || !isSeal || !sameManagedCheckpointSeal(decoded, cut.seal) || c.floor > cut.tip {

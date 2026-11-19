@@ -186,7 +186,7 @@ func (c *Core) RecheckManagedControlPrefixAdvance(ctx context.Context, observati
 	if snapshot.core != c || snapshot.committed != expectedCommitted || snapshot.observed != expectedObserved || snapshot.protocol != applicationProtocol || snapshot.generation < 0 || uint64(snapshot.generation) != generation || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.managedAppendOnly.Binding != snapshot.binding || c.managedAppendOnly.Binding.ApplicationProtocol != snapshot.protocol || c.managedAppendOnly.Binding.Generation != snapshot.generation || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip {
 		return false, nil
 	}
-	if _, ok := c.prefixes[snapshot.observed]; !ok {
+	if _, ok := c.prefixHashLocked(snapshot.observed); !ok {
 		return false, nil
 	}
 	return true, nil
@@ -264,7 +264,7 @@ func (c *Core) managedControlPrefixAdvancedLocked(snapshot managedControlSnapsho
 	if snapshot.core != c || snapshot.committed >= snapshot.observed || c.tip < snapshot.observed || c.highestKnownSlotLocked() > c.tip || c.localMode || c.managedAppendOnly == nil || c.managedAppendOnly != snapshot.config || c.managedAppendOnly.Verify == nil || c.observer || c.managedAppendOnly.Binding != snapshot.binding || c.walIdentity != snapshot.walIdentity || c.generationAnchorHash != snapshot.anchor || c.membershipVersion != snapshot.membership || !sameCluster(c.clusterForSlotLocked(snapshot.observed), snapshot.cluster) || !c.voterForClusterLocked(snapshot.cluster) {
 		return false
 	}
-	_, ok := c.prefixes[snapshot.observed]
+	_, ok := c.prefixHashLocked(snapshot.observed)
 	return ok
 }
 
@@ -300,7 +300,7 @@ func (c *Core) managedControlSnapshotLocked(rejectionReason *string) (snapshot m
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable
 	}
 	observed := c.highestKnownSlotLocked()
-	_, isDecided := c.decided[observed]
+	isDecided := c.isDecidedLocked(observed)
 	if observed != committed+1 || isDecided {
 		*rejectionReason = "slot_not_next"
 		return managedControlSnapshot{}, ErrManagedControlObservationUnavailable

@@ -64,7 +64,7 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 		}
 		freezeSchedule := c.isLeaderScheduleSlotLocked(freeze)
 		terminalSchedule := c.isLeaderScheduleSlotLocked(freeze + 16)
-		prefix := c.prefixes[c.tip]
+		prefix, _ := c.prefixHashLocked(c.tip)
 		highest := c.highestKnownSlotLocked()
 		retired := make(map[NodeID]struct{}, len(c.retiredIDs))
 		for id := range c.retiredIDs {
@@ -153,7 +153,7 @@ func (c *Core) abortRevisionLocked() (Slot, error) {
 		}
 		return 0, fmt.Errorf("retained abort revision is not anchored in recovery base")
 	}
-	if !c.durable[freeze.Slot] || !c.durable[terminal.Slot] {
+	if !c.isDurableLocked(freeze.Slot) || !c.isDurableLocked(terminal.Slot) {
 		return 0, fmt.Errorf("abort revision is not durable")
 	}
 	return terminal.Slot, nil
@@ -398,7 +398,8 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 		if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil {
 			return err
 		}
-		if c.reconfiguration != nil || decision.Slot != control.Freeze || c.tip+1 != decision.Slot || c.prefixes[c.tip] != control.PrefixHash {
+		tipPrefix, _ := c.prefixHashLocked(c.tip)
+		if c.reconfiguration != nil || decision.Slot != control.Freeze || c.tip+1 != decision.Slot || tipPrefix != control.PrefixHash {
 			return fmt.Errorf("invalid reconfiguration freeze")
 		}
 		if err := validateReconfigurationTarget(c.clusterForSlotLocked(decision.Slot), control.Target, c.retiredIDs); err != nil {
@@ -412,7 +413,8 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 		return nil
 	}
 	state := c.reconfiguration
-	if state == nil || decision.Slot != state.terminal || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target) || c.tip+1 != decision.Slot {
+	tipPrefix, _ := c.prefixHashLocked(c.tip)
+	if state == nil || decision.Slot != state.terminal || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target) || c.tip+1 != decision.Slot {
 		return fmt.Errorf("invalid reconfiguration terminal")
 	}
 	for _, summary := range decision.Summaries {
@@ -424,11 +426,18 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 		if !reconfigurationAdds(c.clusterForSlotLocked(decision.Slot), state.target) {
 			return fmt.Errorf("only a pending addition may be aborted")
 		}
-		freeze, ok := c.decided[state.freeze]
+		freeze, ok, err := c.loadDecidedLocked(state.freeze)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return fmt.Errorf("abort terminal has no freeze decision")
 		}
-		c.lastAbort = &ConfigTransition{Freeze: cloneDecidedValue(freeze), Terminal: DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: append([]byte(nil), c.decided[decision.Slot].Certificate...)}}
+		terminalDecision, _, err := c.loadDecidedLocked(decision.Slot)
+		if err != nil {
+			return err
+		}
+		c.lastAbort = &ConfigTransition{Freeze: cloneDecidedValue(freeze), Terminal: DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: append([]byte(nil), terminalDecision.Certificate...)}}
 		c.reconfiguration = nil
 		return nil
 	}

@@ -128,6 +128,14 @@ type Core struct {
 	sealedRoots         map[[32]byte]SealedCheckpoint
 	recorders           map[Slot]ISR
 	recordLocks         [64]sync.Mutex
+	maxRetainedBytes    int64
+	maxRetainedSlots    int
+	hotDecisionBytes    int64
+	decisionLocs        map[Slot]qlog.EntryLocation
+	coldBase            Slot
+	cold                []coldDecision
+	evictedThrough      Slot
+	abortTerminalSlots  []Slot
 	commits             *groupCommit
 	listeners           []chan SlotValue
 	now                 func() time.Time
@@ -168,6 +176,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
 		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
+		maxRetainedBytes: DefaultMaxRetainedDecisionBytes, maxRetainedSlots: DefaultMaxRetainedDecisionSlots, decisionLocs: make(map[Slot]qlog.EntryLocation), coldBase: 1,
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(*config)}}
@@ -232,7 +241,7 @@ func (c *Core) voterForClusterLocked(cluster Cluster) bool {
 // a durable marker for an unretained suffix decision.
 func (c *Core) epochTerminalDurableLocked(epoch configEpoch) bool {
 	terminal := epoch.start - 1
-	if c.durable[terminal] {
+	if c.isDurableLocked(terminal) {
 		return true
 	}
 	if terminal > c.floor || c.baseMembership == nil {
@@ -1090,7 +1099,7 @@ func (c *Core) reserveSlot() (Slot, bool) {
 	for len(c.vacant) > 0 {
 		slot := c.vacant[0]
 		if slot > c.floor {
-			if _, decided := c.decided[slot]; !decided {
+			if !c.isDecidedLocked(slot) {
 				c.vacant = c.vacant[1:]
 				return slot, true
 			}
@@ -1177,7 +1186,10 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 			return rotateMembers(cluster.Members, int(epoch%uint64(len(cluster.Members)))), nil
 		}
 		controlSlot := start + Slot(epoch-1)*leaderEpochSize
-		decision, ok := c.decided[controlSlot]
+		decision, ok, err := c.loadDecidedLocked(controlSlot)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			key := c.leaderEpochKeyLocked(slot)
 			if controlSlot <= c.floor && key == c.baseLeaderEpoch && validateLeaderSchedule(cluster, c.baseLeaderOrder) {
@@ -1199,7 +1211,10 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		return rotateMembers(c.config.Members, int(epoch%uint64(len(c.config.Members)))), nil
 	}
 	controlSlot := leaderEpochFirst(epoch - 1)
-	decision, ok := c.decided[controlSlot]
+	decision, ok, err := c.loadDecidedLocked(controlSlot)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		if epoch == c.baseLeaderEpoch && len(c.baseLeaderOrder) != 0 {
 			return append([]NodeID(nil), c.baseLeaderOrder...), nil
@@ -1378,7 +1393,7 @@ func (c *Core) releaseSlot(slot Slot) {
 	defer c.slotMu.Unlock()
 	c.mu.RLock()
 	compacted := slot <= c.floor
-	_, decided := c.decided[slot]
+	decided := c.isDecidedLocked(slot)
 	c.mu.RUnlock()
 	if compacted || decided {
 		return
@@ -1695,8 +1710,13 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 		c.mu.Unlock()
 		return Summary{}, err
 	}
-	if decided, ok := c.decided[request.Slot]; ok {
-		if !c.durable[request.Slot] && !c.logged[request.Slot] {
+	decided, ok, loadErr := c.loadDecidedLocked(request.Slot)
+	if loadErr != nil {
+		c.mu.Unlock()
+		return Summary{}, loadErr
+	}
+	if ok {
+		if !c.isDurableLocked(request.Slot) && !c.isLoggedLocked(request.Slot) {
 			if err := c.appendDecision(decided); err != nil {
 				c.mu.Unlock()
 				return Summary{}, err
@@ -1711,15 +1731,19 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 		decision.Proposal.Value = append([]byte(nil), decided.Value...)
 		step := max(decision.Step, request.Step)
 		summary := Summary{RecorderID: c.nodeID, Step: step, FirstCurrent: cloneProposal(&decision.Proposal), AggregatePrior: cloneProposal(&decision.Proposal)}
-		needsSync := !c.durable[request.Slot]
+		needsSync := !c.isDurableLocked(request.Slot)
 		c.mu.Unlock()
 		if needsSync {
 			if err := c.commits.Sync(ctx); err != nil {
 				return Summary{}, err
 			}
 			c.mu.Lock()
-			c.durable[request.Slot] = true
+			if request.Slot > c.durableThrough {
+				c.durable[request.Slot] = true
+			}
 			c.valueDurable[decided.Hash] = true
+			c.advanceDurableThroughLocked()
+			c.evictColdDecisionsLocked()
 			c.mu.Unlock()
 		}
 		return summary, nil
@@ -1800,10 +1824,10 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		c.mu.RLock()
 		cluster := c.clusterForSlotLocked(request.Slot)
 		tip := c.tip
-		tipPrefix := c.prefixes[tip]
+		tipPrefix, _ := c.prefixHashLocked(tip)
 		state := c.reconfiguration
 		eligible := c.voterForClusterLocked(cluster)
-		_, alreadyDecided := c.decided[request.Slot]
+		alreadyDecided := c.isDecidedLocked(request.Slot)
 		controlValue := request.Proposal.Value
 		if len(controlValue) == 0 {
 			controlValue = c.values[request.Proposal.Hash]
@@ -1877,7 +1901,7 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		}
 		if len(value) == 0 {
 			c.mu.RLock()
-			if decided, exists := c.decided[request.Slot]; exists && decided.Hash == request.Proposal.Hash {
+			if decided, exists, err := c.loadDecidedLocked(request.Slot); err == nil && exists && decided.Hash == request.Proposal.Hash {
 				value = bytes.Clone(decided.Value)
 			}
 			c.mu.RUnlock()
@@ -1925,14 +1949,14 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 			}
 			controlValue := c.values[request.Proposal.Hash]
 			control, isControl, decodeErr := decodeReconfiguration(controlValue)
-			_, alreadyDecided := c.decided[request.Slot]
+			alreadyDecided := c.isDecidedLocked(request.Slot)
 			if decodeErr != nil {
 				c.mu.Unlock()
 				return Summary{}, decodeErr
 			}
 			if isControl && !control.Terminal && (c.reconfiguration == nil || request.Slot == c.reconfiguration.freeze) && c.highestKnownSlotLocked() >= control.TerminalSlot {
 				promised := false
-				if existing, ok := c.decided[request.Slot]; ok && existing.Hash == request.Proposal.Hash {
+				if existing, ok, loadErr := c.loadDecidedLocked(request.Slot); loadErr == nil && ok && existing.Hash == request.Proposal.Hash {
 					if certified, err := decodeDecision(existing.Certificate); err == nil {
 						for _, summary := range certified.Summaries {
 							promised = promised || summary.RecorderID == c.nodeID && summary.ReconfigurationID == existing.Hash
@@ -1957,9 +1981,12 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 					c.mu.Unlock()
 					return Summary{}, err
 				}
-				if c.tip >= request.Slot-1 && c.prefixes[request.Slot-1] != control.PrefixHash {
-					c.mu.Unlock()
-					return Summary{}, fmt.Errorf("freeze prefix mismatch")
+				if c.tip >= request.Slot-1 {
+					prevPrefix, _ := c.prefixHashLocked(request.Slot - 1)
+					if prevPrefix != control.PrefixHash {
+						c.mu.Unlock()
+						return Summary{}, fmt.Errorf("freeze prefix mismatch")
+					}
 				}
 			}
 			if state := c.reconfiguration; state != nil {
@@ -1972,7 +1999,8 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 						}
 					}
 				}
-				if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != c.prefixes[c.tip] || !sameCluster(control.Target, state.target)) {
+				tipPrefix, _ := c.prefixHashLocked(c.tip)
+				if isControl && control.Terminal && !alreadyDecided && (request.Slot != state.terminal || c.tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target)) {
 					c.mu.Unlock()
 					return Summary{}, fmt.Errorf("terminal control changed while request waited")
 				}
@@ -1996,7 +2024,11 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		// Only an explicit, exact redelivery of this immutable certified value
 		// may avoid today's preparation eligibility. Keep the actual slot lock
 		// and repeat mutable guards after releasing mu for fallback validation.
-		decided, exists := c.decided[request.Slot]
+		decided, exists, loadErr := c.loadDecidedLocked(request.Slot)
+		if loadErr != nil {
+			c.mu.Unlock()
+			return Summary{}, loadErr
+		}
 		exactCertified := exists && len(request.Proposal.Value) != 0 && decided.Hash == request.Proposal.Hash && bytes.Equal(decided.Value, request.Proposal.Value)
 		if managedCandidate != nil {
 			if err := c.checkManagedCheckpointRecordEligibilityLocked(*managedCandidate); err != nil {
@@ -2022,10 +2054,15 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 		checkpointValidated = true
 		localtesthooks.Hit("core:after-checkpoint-record-validation")
 	}
-	if decided, ok := c.decided[request.Slot]; ok {
-		needsSync := !c.durable[request.Slot]
-		if !c.durable[request.Slot] {
-			if !c.logged[request.Slot] {
+	decided, ok, loadErr := c.loadDecidedLocked(request.Slot)
+	if loadErr != nil {
+		c.mu.Unlock()
+		return Summary{}, loadErr
+	}
+	if ok {
+		needsSync := !c.isDurableLocked(request.Slot)
+		if !c.isDurableLocked(request.Slot) {
+			if !c.isLoggedLocked(request.Slot) {
 				if err := c.appendDecision(decided); err != nil {
 					c.mu.Unlock()
 					return Summary{}, err
@@ -2062,8 +2099,12 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 				return Summary{}, err
 			}
 			c.mu.Lock()
-			c.durable[request.Slot] = true
+			if request.Slot > c.durableThrough {
+				c.durable[request.Slot] = true
+			}
 			c.valueDurable[decided.Hash] = true
+			c.advanceDurableThroughLocked()
+			c.evictColdDecisionsLocked()
 			c.mu.Unlock()
 		}
 		return summary, nil
@@ -2143,7 +2184,7 @@ func (c *Core) WaitCheckpointPrefixIfLagging(ctx context.Context, seal Checkpoin
 
 func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(context.Context, CheckpointSeal) error, bool, error) {
 	c.mu.RLock()
-	prefix, prefixOK := c.prefixes[seal.Index]
+	prefix, prefixOK := c.prefixHashLocked(seal.Index)
 	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
 	validator := c.checkpointValidator
 	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
@@ -2255,7 +2296,7 @@ func (c *Core) checkCheckpointIdentityLocked(seal CheckpointSeal) error {
 	} else if seal.Membership != nil {
 		return fmt.Errorf("fixed-membership checkpoint includes membership history")
 	}
-	prefix, prefixOK := c.prefixes[seal.Index]
+	prefix, prefixOK := c.prefixHashLocked(seal.Index)
 	if seal.GenerationAnchorHash != c.generationAnchorHash || seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID || !prefixOK || prefix != seal.PrefixHash || c.tip < seal.Index {
 		return fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
@@ -2288,7 +2329,7 @@ func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValu
 	}
 	candidateHash := ValueHash(sha256.Sum256(candidateValue))
 	for slot, state := range c.recorders {
-		if _, decided := c.decided[slot]; decided {
+		if c.isDecidedLocked(slot) {
 			continue
 		}
 		for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
@@ -2310,7 +2351,7 @@ func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValu
 	}
 	var pendingDurability []SlotValue
 	for slot, decision := range c.decided {
-		if c.durable[slot] {
+		if c.isDurableLocked(slot) {
 			continue
 		}
 		pending, checkpoint, err := DecodeCheckpointSeal(decision.Value)
@@ -2321,7 +2362,7 @@ func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValu
 			return nil, fmt.Errorf("%w: a conflicting certified checkpoint exists at the candidate cut", ErrCheckpointPreparePending)
 		}
 		if checkpoint && (pending.Index < candidate.Index || pending.Index == candidate.Index && decision.Hash == candidateHash) {
-			if !c.logged[slot] {
+			if !c.isLoggedLocked(slot) {
 				if err := c.appendDecision(decision); err != nil {
 					return nil, err
 				}
@@ -2339,7 +2380,7 @@ func (c *Core) pendingCheckpointSealLocked(candidate CheckpointSeal) ([]SlotValu
 // before the marker's cut or make the marker current authority.
 func (c *Core) validateRecoveredPreparedCheckpoint(seal CheckpointSeal) error {
 	c.mu.RLock()
-	prefix, prefixOK := c.prefixes[seal.Index]
+	prefix, prefixOK := c.prefixHashLocked(seal.Index)
 	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
 	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
 	tip := c.tip
@@ -2536,14 +2577,18 @@ func (c *Core) finishPendingCheckpointPrepare(ctx context.Context, seal Checkpoi
 		return fmt.Errorf("%w: prepared candidate identity changed before durable acknowledgement", ErrCheckpointPreparePending)
 	}
 	for _, value := range durable {
-		if decided, exists := c.decided[value.Slot]; exists && decided.Hash == value.Hash {
-			c.durable[value.Slot] = true
+		if hash, exists := c.decisionHashLocked(value.Slot); exists && hash == value.Hash {
+			if value.Slot > c.durableThrough {
+				c.durable[value.Slot] = true
+			}
 			c.valueDurable[value.Hash] = true
 		}
 	}
 	clear(c.preparedCheckpoints)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	delete(c.pendingPrepares, seal.Index)
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
 	c.mu.Unlock()
 	return nil
 }
@@ -2573,13 +2618,18 @@ func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotV
 			}
 			continue
 		}
-		decided, ok := c.decided[slot]
+		decided, ok, err := c.loadDecidedLocked(slot)
+		if err != nil {
+			c.mu.Unlock()
+			lock.Unlock()
+			return nil, err
+		}
 		if !ok {
 			c.mu.Unlock()
 			lock.Unlock()
 			return nil, fmt.Errorf("slot %d is not decided", slot)
 		}
-		if !c.logged[slot] {
+		if !c.isLoggedLocked(slot) {
 			if err := c.appendDecision(decided); err != nil {
 				c.mu.Unlock()
 				lock.Unlock()
@@ -2587,7 +2637,7 @@ func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotV
 			}
 			c.markDecisionLoggedLocked(slot)
 		}
-		if !c.durable[slot] {
+		if !c.isDurableLocked(slot) {
 			pending = append(pending, SlotValue{Slot: slot, Hash: decided.Hash})
 		}
 		c.mu.Unlock()
@@ -2724,8 +2774,10 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, value := range pending {
-		if decided, ok := c.decided[value.Slot]; ok && decided.Hash == value.Hash {
-			c.durable[value.Slot] = true
+		if hash, ok := c.decisionHashLocked(value.Slot); ok && hash == value.Hash {
+			if value.Slot > c.durableThrough {
+				c.durable[value.Slot] = true
+			}
 			c.valueDurable[value.Hash] = true
 		}
 	}
@@ -2734,11 +2786,13 @@ func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) erro
 	if c.floor == floor && c.floorRoot == root {
 		for c.durableThrough < through {
 			next := c.durableThrough + 1
-			if _, ok := c.decided[next]; !ok || !c.logged[next] || !c.durable[next] {
+			if !c.isDecidedLocked(next) || !c.isLoggedLocked(next) || !c.isDurableLocked(next) {
 				break
 			}
 			c.durableThrough = next
 		}
+		c.advanceDurableThroughLocked()
+		c.evictColdDecisionsLocked()
 	}
 	if len(pending) == 0 {
 		return ctx.Err()
@@ -2756,12 +2810,16 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 		c.mu.Unlock()
 		return nil
 	}
-	decided, ok := c.decided[slot]
+	decided, ok, err := c.loadDecidedLocked(slot)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
 	if !ok {
 		c.mu.Unlock()
 		return fmt.Errorf("slot %d is not decided", slot)
 	}
-	if c.durable[slot] {
+	if c.isDurableLocked(slot) {
 		c.mu.Unlock()
 		return nil
 	}
@@ -2782,10 +2840,14 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 		first = c.floor + 1
 	}
 	for index := first; index <= slot; index++ {
-		if c.logged[index] {
+		if c.isLoggedLocked(index) {
 			continue
 		}
-		value, ok := c.decided[index]
+		value, ok, err := c.loadDecidedLocked(index)
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
 		if !ok {
 			c.mu.Unlock()
 			return fmt.Errorf("slot %d is not decided", index)
@@ -2802,11 +2864,15 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 	}
 	c.mu.Lock()
 	for index := first; index <= slot; index++ {
-		c.durable[index] = true
-		if decided, ok := c.decided[index]; ok {
-			c.valueDurable[decided.Hash] = true
+		if index > c.durableThrough {
+			c.durable[index] = true
+		}
+		if hash, ok := c.decisionHashLocked(index); ok {
+			c.valueDurable[hash] = true
 		}
 	}
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
 	c.mu.Unlock()
 	return nil
 }
@@ -2860,13 +2926,18 @@ func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) 
 		}
 	} else {
 		c.mu.Lock()
-		value, ok := c.decided[slot]
+		value, ok, loadErr := c.loadDecidedLocked(slot)
+		if loadErr != nil {
+			c.mu.Unlock()
+			lock.Unlock()
+			return DecidedValue{}, loadErr
+		}
 		if !ok {
 			c.mu.Unlock()
 			lock.Unlock()
 			return DecidedValue{}, fmt.Errorf("slot %d is not decided", slot)
 		}
-		if !c.logged[slot] {
+		if !c.isLoggedLocked(slot) {
 			if err := c.appendDecision(value); err != nil {
 				c.mu.Unlock()
 				lock.Unlock()
@@ -2877,7 +2948,7 @@ func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) 
 		c.mu.Unlock()
 	}
 	c.mu.RLock()
-	value, ok := c.decided[slot]
+	value, ok, loadErr := c.loadDecidedLocked(slot)
 	compacted := slot <= c.floor
 	value.Value = append([]byte(nil), value.Value...)
 	value.Certificate = append([]byte(nil), value.Certificate...)
@@ -2885,6 +2956,9 @@ func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) 
 	lock.Unlock()
 	if compacted {
 		return DecidedValue{}, fmt.Errorf("%w: slot %d is covered by the recovery floor", ErrCompacted, slot)
+	}
+	if loadErr != nil {
+		return DecidedValue{}, loadErr
 	}
 	if !ok {
 		return DecidedValue{}, fmt.Errorf("slot %d is not decided", slot)
@@ -2933,7 +3007,10 @@ func (c *Core) acceptDecision(decision Decision) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if existing, ok := c.decided[decision.Slot]; ok {
+	if existing, ok, err := c.loadDecidedLocked(decision.Slot); err != nil {
+		c.mu.Unlock()
+		return err
+	} else if ok {
 		if existing.Hash != decision.Proposal.Hash || !bytes.Equal(existing.Value, decision.Proposal.Value) {
 			c.mu.Unlock()
 			return fmt.Errorf("slot %d already decided with another value", decision.Slot)
@@ -2951,7 +3028,7 @@ func (c *Core) acceptDecision(decision Decision) error {
 	if seal, checkpoint, _ := DecodeCheckpointSeal(decision.Proposal.Value); checkpoint {
 		c.sealedRoots[seal.RootHash] = SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: decision.Slot}
 	}
-	c.decided[decision.Slot] = value
+	c.putDecidedLocked(decision.Slot, value)
 	c.durable[decision.Slot] = false
 	c.logged[decision.Slot] = false
 	if c.localMode {
@@ -3025,7 +3102,8 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 			}
 		}
 		c.tip++
-		c.prefixes[c.tip] = AdvancePrefixHash(c.prefixes[c.tip-1], c.tip, decision.Hash)
+		prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
+		c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Hash)
 		c.observeLeaderEpochLocked(c.tip)
 	}
 	return nil
@@ -3037,13 +3115,21 @@ func (c *Core) appendDecision(value DecidedValue) error {
 	if err != nil {
 		return err
 	}
-	return c.wal.Append(entry)
+	loc, err := c.wal.AppendAt(entry)
+	if err != nil {
+		return err
+	}
+	if c.decisionLocs == nil {
+		c.decisionLocs = make(map[Slot]qlog.EntryLocation)
+	}
+	c.decisionLocs[value.Slot] = loc
+	return nil
 }
 
 // markDecisionLoggedLocked updates the small Local debt indicator while the
 // caller holds c.mu. It lets the clean foreground path skip retained history.
 func (c *Core) markDecisionLoggedLocked(slot Slot) {
-	if c.logged[slot] {
+	if c.isLoggedLocked(slot) {
 		return
 	}
 	c.logged[slot] = true
@@ -3385,11 +3471,11 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 			}
 		} else {
 			c.mu.RLock()
-			freeze, known := c.decided[control.Freeze]
+			freezeHash, known := c.decisionHashLocked(control.Freeze)
 			c.mu.RUnlock()
 			if known {
 				for _, summary := range decision.Summaries {
-					if summary.ReconfigurationID != freeze.Hash {
+					if summary.ReconfigurationID != freezeHash {
 						return fmt.Errorf("terminal quorum does not bind its freeze")
 					}
 				}
@@ -3407,7 +3493,7 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 			if epoch > 0 {
 				controlSlot += Slot(epoch-1) * leaderEpochSize
 			}
-			_, knownControl := c.decided[controlSlot]
+			knownControl := c.isDecidedLocked(controlSlot)
 			missingControl := epoch >= exploration && !knownControl
 			c.mu.RUnlock()
 			if !allowMissingLeader || !missingControl {
@@ -3435,7 +3521,10 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 func (c *Core) decision(slot Slot) (DecidedValue, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	decision, ok := c.decided[slot]
+	decision, ok, err := c.loadDecidedLocked(slot)
+	if err != nil {
+		return DecidedValue{}, false
+	}
 	return decision, ok
 }
 
@@ -3535,7 +3624,7 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 				c.mu.Unlock()
 				return err
 			}
-			if !c.logged[decision.Slot] {
+			if !c.isLoggedLocked(decision.Slot) {
 				if err := c.appendDecision(value); err != nil {
 					c.mu.Unlock()
 					return err
@@ -3554,11 +3643,15 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 	}
 	c.mu.Lock()
 	for _, slot := range slots {
-		c.durable[slot] = true
-		if decided, ok := c.decided[slot]; ok {
-			c.valueDurable[decided.Hash] = true
+		if slot > c.durableThrough {
+			c.durable[slot] = true
+		}
+		if hash, ok := c.decisionHashLocked(slot); ok {
+			c.valueDurable[hash] = true
 		}
 	}
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
 	c.mu.Unlock()
 	return nil
 }
@@ -3590,7 +3683,7 @@ func (c *Core) acceptReconfigurationValues(values []DecidedValue, durable bool) 
 				c.mu.Unlock()
 				return err
 			}
-			if !c.logged[decision.Slot] {
+			if !c.isLoggedLocked(decision.Slot) {
 				if err := c.appendDecision(value); err != nil {
 					c.mu.Unlock()
 					return err
@@ -3614,11 +3707,15 @@ func (c *Core) acceptReconfigurationValues(values []DecidedValue, durable bool) 
 	}
 	c.mu.Lock()
 	for _, slot := range slots {
-		c.durable[slot] = true
-		if decided, ok := c.decided[slot]; ok {
-			c.valueDurable[decided.Hash] = true
+		if slot > c.durableThrough {
+			c.durable[slot] = true
+		}
+		if hash, ok := c.decisionHashLocked(slot); ok {
+			c.valueDurable[hash] = true
 		}
 	}
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
 	c.mu.Unlock()
 	return nil
 }
@@ -3692,10 +3789,13 @@ func (c *Core) certifiedDecision(value DecidedValue) (Decision, error) {
 func (c *Core) CertifiedValue(slot Slot) (DecidedValue, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	value, ok := c.decided[slot]
+	value, ok, err := c.loadDecidedLocked(slot)
+	if err != nil || !ok {
+		return DecidedValue{}, false
+	}
 	value.Value = append([]byte(nil), value.Value...)
 	value.Certificate = append([]byte(nil), value.Certificate...)
-	return value, ok
+	return value, true
 }
 
 func (c *Core) DecidedSlot(value []byte) (Slot, bool) {
@@ -3707,6 +3807,22 @@ func (c *Core) Learn(ctx context.Context, from Slot) (<-chan SlotValue, error) {
 	ch := make(chan SlotValue, 100)
 	c.mu.Lock()
 	c.listeners = append(c.listeners, ch)
+	if from <= c.evictedThrough && len(c.cold) > 0 {
+		start := 0
+		if from > c.coldBase {
+			start = int(from - c.coldBase)
+		}
+		for i := start; i < len(c.cold); i++ {
+			entry := c.cold[i]
+			if entry.loc.Length <= 0 {
+				continue
+			}
+			select {
+			case ch <- SlotValue{Slot: c.coldBase + Slot(i), Hash: entry.hash}:
+			default:
+			}
+		}
+	}
 	for slot, value := range c.decided {
 		if slot >= from {
 			select {
@@ -3768,7 +3884,10 @@ func (c *Core) decisionsFromBounded(from Slot, itemLimit, payloadByteLimit int) 
 	page := make([]DecidedValue, 0, capacity)
 	usedBytes := 0
 	for slot := from; slot <= c.tip && len(page) < itemLimit; {
-		decision, ok := c.decided[slot]
+		decision, ok, err := c.loadDecidedLocked(slot)
+		if err != nil {
+			return nil, c.tip, err
+		}
 		if !ok {
 			return nil, 0, fmt.Errorf("decision gap at slot %d", slot)
 		}
@@ -3801,8 +3920,7 @@ func (c *Core) Tip() Slot {
 func (c *Core) PrefixHash(slot Slot) ([32]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	hash, ok := c.prefixes[slot]
-	return hash, ok
+	return c.prefixHashLocked(slot)
 }
 
 // DurablePrefix synchronizes every retained decision through through and
@@ -3906,7 +4024,7 @@ func (c *Core) IsQuorum(receipts []Receipt) bool {
 func (c *Core) recover() error {
 	var prepared []CheckpointSeal
 	var previousManagedMarker *CheckpointSeal
-	if err := c.wal.Scan(func(entry qlog.Entry) error {
+	if err := c.wal.ScanWithLocation(func(entry qlog.Entry, loc qlog.EntryLocation) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
 			base, decodeErr := decodeConsensusBase(entry.Payload)
@@ -3983,7 +4101,7 @@ func (c *Core) recover() error {
 				return nil
 			}
 			c.mu.Lock()
-			if _, decided := c.decided[persisted.Slot]; !decided {
+			if !c.isDecidedLocked(persisted.Slot) {
 				c.recorders[persisted.Slot] = persisted.State
 			}
 			c.mu.Unlock()
@@ -4014,7 +4132,11 @@ func (c *Core) recover() error {
 				c.mu.Unlock()
 				return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
 			}
-			c.decided[decision.Slot] = DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: value, Certificate: certificate}
+			c.putDecidedLocked(decision.Slot, DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: value, Certificate: certificate})
+			if c.decisionLocs == nil {
+				c.decisionLocs = make(map[Slot]qlog.EntryLocation)
+			}
+			c.decisionLocs[decision.Slot] = loc
 			c.values[decision.Proposal.Hash] = value
 			c.valueDurable[decision.Proposal.Hash] = true
 			if seal, checkpoint, _ := DecodeCheckpointSeal(value); checkpoint {
@@ -4067,7 +4189,8 @@ func (c *Core) recover() error {
 				return fmt.Errorf("recover reconfiguration: %w", err)
 			}
 			c.tip = decision.Slot
-			c.prefixes[c.tip] = AdvancePrefixHash(c.prefixes[c.tip-1], c.tip, decision.Proposal.Hash)
+			prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
+			c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Proposal.Hash)
 			c.mu.Unlock()
 		}
 	} else {
@@ -4099,6 +4222,10 @@ func (c *Core) recover() error {
 		c.membershipVersion = uint64(len(c.configHistory) - 1)
 		c.mu.Unlock()
 	}
+	c.mu.Lock()
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -4143,7 +4270,8 @@ func (c *Core) advanceTipLocked() {
 			break
 		}
 		c.tip++
-		c.prefixes[c.tip] = AdvancePrefixHash(c.prefixes[c.tip-1], c.tip, decision.Hash)
+		prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
+		c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Hash)
 		c.observeLeaderEpochLocked(c.tip)
 	}
 	if c.tip != before {

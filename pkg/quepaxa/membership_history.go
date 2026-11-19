@@ -83,19 +83,25 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 			return MembershipRecord{}, fmt.Errorf("checkpoint membership crosses configuration boundary at slot %d", terminalSlot)
 		}
 
-		freezeDecision, frozen := c.decided[freezeSlot]
+		freezeDecision, frozen, err := c.loadDecidedLocked(freezeSlot)
+		if err != nil {
+			return MembershipRecord{}, fmt.Errorf("membership history: load freeze slot %d: %w", freezeSlot, err)
+		}
 		if !frozen {
 			return MembershipRecord{}, fmt.Errorf("membership history: freeze slot %d not decided", freezeSlot)
 		}
-		if !c.durable[freezeSlot] {
+		if !c.isDurableLocked(freezeSlot) {
 			return MembershipRecord{}, fmt.Errorf("membership history: freeze slot %d not durable", freezeSlot)
 		}
 
-		terminalDecision, terminated := c.decided[terminalSlot]
+		terminalDecision, terminated, err := c.loadDecidedLocked(terminalSlot)
+		if err != nil {
+			return MembershipRecord{}, fmt.Errorf("membership history: load terminal slot %d: %w", terminalSlot, err)
+		}
 		if !terminated {
 			return MembershipRecord{}, fmt.Errorf("membership history: terminal slot %d not decided", terminalSlot)
 		}
-		if !c.durable[terminalSlot] {
+		if !c.isDurableLocked(terminalSlot) {
 			return MembershipRecord{}, fmt.Errorf("membership history: terminal slot %d not durable", terminalSlot)
 		}
 
@@ -181,23 +187,52 @@ func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, err
 		copy := cloneMembershipRecord(MembershipRecord{Abort: record.Abort}).Abort
 		abort = copy
 	}
-	for slot, decision := range c.decided {
-		if slot <= lastSuccess || slot > through || !c.durable[slot] {
-			continue
+	inspectAbortSlot := func(slot Slot) error {
+		if slot <= lastSuccess || slot > through || !c.isDurableLocked(slot) {
+			return nil
+		}
+		decision, ok, err := c.loadDecidedLocked(slot)
+		if err != nil {
+			return fmt.Errorf("membership history: load abort slot %d: %w", slot, err)
+		}
+		if !ok {
+			return nil
 		}
 		control, ok, err := decodeReconfiguration(decision.Value)
 		if err != nil || !ok || !control.Terminal || !control.Abort {
-			continue
+			return nil
 		}
-		freeze, found := c.decided[control.Freeze]
-		if !found || !c.durable[control.Freeze] {
-			return MembershipRecord{}, fmt.Errorf("membership history: abort freeze slot %d is not durable", control.Freeze)
+		freeze, found, err := c.loadDecidedLocked(control.Freeze)
+		if err != nil {
+			return fmt.Errorf("membership history: load abort freeze slot %d: %w", control.Freeze, err)
+		}
+		if !found || !c.isDurableLocked(control.Freeze) {
+			return fmt.Errorf("membership history: abort freeze slot %d is not durable", control.Freeze)
 		}
 		if abort == nil || abort.Terminal.Slot < slot {
 			abort = &ConfigTransition{
 				Freeze:   cloneDecidedValue(freeze),
 				Terminal: cloneDecidedValue(decision),
 			}
+		}
+		return nil
+	}
+	seenAbort := make(map[Slot]struct{}, len(c.abortTerminalSlots))
+	for _, slot := range c.abortTerminalSlots {
+		if _, done := seenAbort[slot]; done {
+			continue
+		}
+		seenAbort[slot] = struct{}{}
+		if err := inspectAbortSlot(slot); err != nil {
+			return MembershipRecord{}, err
+		}
+	}
+	for slot := range c.decided {
+		if _, done := seenAbort[slot]; done {
+			continue
+		}
+		if err := inspectAbortSlot(slot); err != nil {
+			return MembershipRecord{}, err
 		}
 	}
 	record.Abort = abort
