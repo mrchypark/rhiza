@@ -40,6 +40,26 @@ if [ "$tag_version" != "$manifest_version" ]; then
     exit 1
 fi
 
+operator_refs=$(grep -R -l 'ghcr.io/mrchypark/rhiza-operator:v[0-9]' deploy/operator deploy/operator-managed || true)
+if [ -z "$operator_refs" ]; then
+    echo "FAIL no versioned rhiza-operator deployment refs found" >&2
+    exit 1
+fi
+for file in $operator_refs; do
+    versions=$(sed -n 's/.*ghcr\.io\/mrchypark\/rhiza-operator:v\([0-9][^"[:space:]]*\).*/\1/p' "$file")
+    for version in $versions; do
+        if [ "$version" != "$tag_version" ]; then
+            echo "FAIL $file references rhiza-operator:v$version, expected v$tag_version" >&2
+            exit 1
+        fi
+    done
+done
+managed_tag=$(sed -n 's/^[[:space:]]*newTag:[[:space:]]*v\(.*\)$/\1/p' deploy/operator-managed/kustomization.yaml | head -n 1)
+if [ "$managed_tag" != "$tag_version" ]; then
+    echo "FAIL deploy/operator-managed kustomization image tag is ${managed_tag:-missing}, expected $tag_version" >&2
+    exit 1
+fi
+
 if ! body=$(curl -fsS -H 'User-Agent: rhiza-release-sync' "https://crates.io/api/v1/crates/$crate/$tag_version"); then
     echo "FAIL $crate $tag_version is not visible on crates.io; publish the crate before tagging it" >&2
     exit 1
@@ -53,4 +73,4 @@ case $body in
         ;;
 esac
 
-echo "OK $tag == $crate $tag_version, published and not yanked"
+echo "OK $tag == $crate $tag_version, published and not yanked; operator manifests synchronized"

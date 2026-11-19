@@ -29,12 +29,28 @@ const (
 	V1Alpha2BootstrapHandoffPath        = "/var/lib/rhiza/bootstrap.json"
 	V1Alpha2BootstrapHandoffLimit       = 1 << 20
 	V1Alpha2ManagedHostServiceAccount   = "rhiza-managed-host"
+	V1Alpha2ManagedDataSizeLimit        = "8Gi"
 )
 
 // V1Alpha2ManagedPodSecurity is the initial managed profile. Application
 // images must support UID and GID 65532 and the shared data mount.
 func V1Alpha2ManagedPodSecurity() map[string]any {
-	return map[string]any{"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532, "runAsNonRoot": true}
+	return map[string]any{"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532, "runAsNonRoot": true, "seccompProfile": map[string]any{"type": "RuntimeDefault"}}
+}
+
+func V1Alpha2ManagedContainerSecurity() map[string]any {
+	return map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}, "readOnlyRootFilesystem": true}
+}
+
+func V1Alpha2ManagedResources(init bool) map[string]any {
+	if init {
+		return map[string]any{"requests": map[string]any{"cpu": "10m", "memory": "16Mi", "ephemeral-storage": "16Mi"}, "limits": map[string]any{"cpu": "100m", "memory": "64Mi", "ephemeral-storage": "64Mi"}}
+	}
+	return map[string]any{"requests": map[string]any{"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi"}, "limits": map[string]any{"cpu": "1", "memory": "2Gi", "ephemeral-storage": V1Alpha2ManagedDataSizeLimit}}
+}
+
+func V1Alpha2ManagedTopology(crUID string) []any {
+	return []any{map[string]any{"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "ScheduleAnyway", "labelSelector": map[string]any{"matchLabels": map[string]string{"rhiza.mrchypark.dev/cluster-uid": crUID}}}}
 }
 
 func V1Alpha2ManagedPodSpec(image, crUID string, containers []V1Alpha2Container, clusterName ...string) (map[string]any, error) {
@@ -47,9 +63,10 @@ func V1Alpha2ManagedPodSpec(image, crUID string, containers []V1Alpha2Container,
 	}
 	main := make([]map[string]any, 0, len(containers))
 	for _, c := range containers {
-		main = append(main, map[string]any{"name": c.Name, "image": c.Image, "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}}})
+		main = append(main, map[string]any{"name": c.Name, "image": c.Image, "resources": V1Alpha2ManagedResources(false), "securityContext": V1Alpha2ManagedContainerSecurity(), "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}}})
 	}
-	return map[string]any{"securityContext": V1Alpha2ManagedPodSecurity(), "initContainers": init, "containers": main, "volumes": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "emptyDir": map[string]any{}}}}, nil
+	topology := V1Alpha2ManagedTopology(crUID)
+	return map[string]any{"securityContext": V1Alpha2ManagedPodSecurity(), "topologySpreadConstraints": topology, "initContainers": init, "containers": main, "volumes": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "emptyDir": map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}}}}, nil
 }
 
 // V1Alpha2ManagedSQLPodSpec is the first managed reference profile, not an
@@ -70,7 +87,7 @@ func V1Alpha2ManagedSQLPodSpec(ref V1Alpha2ClusterRef, profile V1Alpha2RuntimePr
 	main["args"] = []string{"serve-managed-sql", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath, "--identity-file", V1Alpha2BootstrapIdentityPath, "--handoff-file", V1Alpha2BootstrapHandoffPath, "--listen", "0.0.0.0:8080"}
 	main["readinessProbe"] = map[string]any{"exec": map[string]any{"command": []string{"/usr/local/bin/rhiza-ha-init", "check-ready", "--runtime-profile", V1Alpha2ManagedRuntimeProfilePath}}, "periodSeconds": 5, "timeoutSeconds": 2, "successThreshold": 1, "failureThreshold": 3}
 	main["env"] = append(append([]any{}, init[0]["env"].([]any)...), map[string]any{"name": "RHIZA_CLUSTER_UID", "value": ref.UID})
-	main["securityContext"] = map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}
+	main["securityContext"] = V1Alpha2ManagedContainerSecurity()
 	main["volumeMounts"] = append(main["volumeMounts"].([]any), map[string]any{"name": V1Alpha2ManagedRuntimeProfileVolume, "mountPath": "/etc/rhiza/managed", "readOnly": true})
 	pod["volumes"] = append(pod["volumes"].([]any), map[string]any{"name": V1Alpha2ManagedRuntimeProfileVolume, "secret": map[string]any{"secretName": profile.ProfileSecretName, "defaultMode": 0440, "items": []any{map[string]any{"key": V1Alpha2ManagedRuntimeProfileKey, "path": V1Alpha2ManagedRuntimeProfileKey}}}})
 	return pod, nil
@@ -87,7 +104,7 @@ func V1Alpha2BootstrapInitContainers(image, crUID string, clusterName ...string)
 	}
 	mount := []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}}
 	init := func(name string, args []string) map[string]any {
-		return map[string]any{"name": name, "image": image, "command": []string{"/usr/local/bin/rhiza-ha-init"}, "args": args, "env": env, "volumeMounts": mount, "terminationMessagePath": "/dev/termination-log", "terminationMessagePolicy": "File", "securityContext": map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}}
+		return map[string]any{"name": name, "image": image, "command": []string{"/usr/local/bin/rhiza-ha-init"}, "args": args, "env": env, "resources": V1Alpha2ManagedResources(true), "volumeMounts": mount, "terminationMessagePath": "/dev/termination-log", "terminationMessagePolicy": "File", "securityContext": V1Alpha2ManagedContainerSecurity()}
 	}
 	return []map[string]any{
 		init(V1Alpha2PrepareIdentityContainer, []string{"prepare-identity", "--cr-uid", crUID, "--generation", "0", "--pod-uid", "$(POD_UID)", "--identity-file", V1Alpha2BootstrapIdentityPath, "--termination-message", "/dev/termination-log"}),
@@ -101,6 +118,7 @@ type v1alpha2BootstrapOwner struct {
 }
 type v1alpha2BootstrapMetadata struct {
 	Name, Namespace, UID, ResourceVersion string
+	Generation                            int64
 	DeletionTimestamp                     *string
 	OwnerReferences                       []v1alpha2BootstrapOwner
 }
@@ -123,12 +141,11 @@ func bootstrapInitMatches(raw, expected json.RawMessage) bool {
 	if json.Unmarshal(raw, &actual) != nil || len(actual) != 2 {
 		return false
 	}
+	var want []map[string]json.RawMessage
+	if json.Unmarshal(expected, &want) != nil || !normalizeManagedResourceContainers(actual, want) {
+		return false
+	}
 	for _, c := range actual {
-		for key, value := range map[string]string{"terminationMessagePath": `"/dev/termination-log"`, "terminationMessagePolicy": `"File"`, "resources": `{}`} {
-			if raw, ok := c[key]; ok && sameJSON(raw, json.RawMessage(value)) && key == "resources" {
-				delete(c, key)
-			}
-		}
 		if raw, ok := c["imagePullPolicy"]; ok {
 			var policy, image string
 			if json.Unmarshal(raw, &policy) != nil || json.Unmarshal(c["image"], &image) != nil || policy != defaultImagePullPolicy(image) {
@@ -250,6 +267,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			ServiceAccount                string
 			AutomountServiceAccountToken  *bool
 			HostNetwork, HostPID, HostIPC bool
+			TopologySpreadConstraints     json.RawMessage
 			InitContainers                json.RawMessage
 			SecurityContext               json.RawMessage
 			Containers                    []struct {
@@ -372,7 +390,8 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			return nil, fmt.Errorf("unexpected bootstrap init template")
 		}
 		security, _ := json.Marshal(V1Alpha2ManagedPodSecurity())
-		if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC || !sameJSON(p.Spec.SecurityContext, security) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
+		topology, _ := json.Marshal(V1Alpha2ManagedTopology(ref.UID))
+		if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC || !sameJSON(p.Spec.SecurityContext, security) || !sameJSON(p.Spec.TopologySpreadConstraints, topology) || len(p.Spec.Containers) != len(cluster.Spec.Workload.PodTemplate.Spec.Containers) {
 			return nil, fmt.Errorf("invalid managed pod security")
 		}
 		if expectedMain != nil && (p.Spec.ServiceAccountName != V1Alpha2ManagedHostServiceAccount || p.Spec.ServiceAccount != "" && p.Spec.ServiceAccount != V1Alpha2ManagedHostServiceAccount || p.Spec.AutomountServiceAccountToken == nil || !*p.Spec.AutomountServiceAccountToken) {
@@ -393,7 +412,7 @@ func CollectV1Alpha2BootstrapMembers(ctx context.Context, kube *Kubernetes, ref 
 			if decodeV1Alpha2(raw, &v) != nil {
 				return nil, fmt.Errorf("invalid bootstrap volume")
 			}
-			if v.Name == V1Alpha2BootstrapVolume && sameJSON(v.EmptyDir, json.RawMessage(`{}`)) && len(v.Projected) == 0 {
+			if v.Name == V1Alpha2BootstrapVolume && sameJSON(v.EmptyDir, json.RawMessage(`{"sizeLimit":"`+V1Alpha2ManagedDataSizeLimit+`"}`)) && len(v.Projected) == 0 {
 				dataVolumes++
 				continue
 			}

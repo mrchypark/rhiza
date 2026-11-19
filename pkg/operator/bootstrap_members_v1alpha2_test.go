@@ -20,19 +20,19 @@ func TestCollectBootstrapValidOwnedPods(t *testing.T) {
 	for _, c := range init {
 		c["env"].([]any)[0].(map[string]any)["valueFrom"].(map[string]any)["fieldRef"].(map[string]any)["apiVersion"] = "v1"
 		c["imagePullPolicy"] = "IfNotPresent"
-		c["resources"] = map[string]any{}
 		c["volumeMounts"] = append(c["volumeMounts"].([]any), map[string]any{"name": "kube-api-access-abc", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true})
 	}
 	projected := map[string]any{"defaultMode": 420, "sources": []any{map[string]any{"serviceAccountToken": map[string]any{"expirationSeconds": 3607, "path": "token"}}, map[string]any{"configMap": map[string]any{"name": "kube-root-ca.crt", "items": []any{map[string]any{"key": "ca.crt", "path": "ca.crt"}}}}, map[string]any{"downwardAPI": map[string]any{"items": []any{map[string]any{"path": "namespace", "fieldRef": map[string]any{"apiVersion": "v1", "fieldPath": "metadata.namespace"}}}}}}}
 	pods := make([]any, 0, 3)
 	for i := 1; i <= 3; i++ {
 		key := base64.StdEncoding.EncodeToString([]byte(strings.Repeat(string(rune('a'+i)), 32)))
-		pods = append(pods, map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": fmt.Sprintf("pod-%d", i), "namespace": "ns", "uid": fmt.Sprintf("poduid-%d", i), "resourceVersion": "4", "ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "rs", "uid": "rsuid", "controller": true}}}, "spec": map[string]any{"initContainers": init, "volumes": []any{map[string]any{"name": "rhiza-data", "emptyDir": map[string]any{}}, map[string]any{"name": "kube-api-access-abc", "projected": projected}}}, "status": map[string]any{"podIP": fmt.Sprintf("10.0.0.%d", i), "initContainerStatuses": []any{map[string]any{"name": V1Alpha2PrepareIdentityContainer, "state": map[string]any{"terminated": map[string]any{"exitCode": 0, "message": fmt.Sprintf(`{"version":1,"publicKey":%q}`, key)}}}, map[string]any{"name": V1Alpha2AwaitBootstrapContainer, "state": map[string]any{"running": map[string]any{"startedAt": "2026-01-01T00:00:00Z"}}}}, "containerStatuses": []any{map[string]any{"state": map[string]any{"waiting": map[string]any{}}, "restartCount": 0, "lastState": map[string]any{}}}}})
+		pods = append(pods, map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": fmt.Sprintf("pod-%d", i), "namespace": "ns", "uid": fmt.Sprintf("poduid-%d", i), "resourceVersion": "4", "ownerReferences": []any{map[string]any{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "rs", "uid": "rsuid", "controller": true}}}, "spec": map[string]any{"initContainers": init, "volumes": []any{map[string]any{"name": "rhiza-data", "emptyDir": map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}}, map[string]any{"name": "kube-api-access-abc", "projected": projected}}}, "status": map[string]any{"podIP": fmt.Sprintf("10.0.0.%d", i), "initContainerStatuses": []any{map[string]any{"name": V1Alpha2PrepareIdentityContainer, "state": map[string]any{"terminated": map[string]any{"exitCode": 0, "message": fmt.Sprintf(`{"version":1,"publicKey":%q}`, key)}}}, map[string]any{"name": V1Alpha2AwaitBootstrapContainer, "state": map[string]any{"running": map[string]any{"startedAt": "2026-01-01T00:00:00Z"}}}}, "containerStatuses": []any{map[string]any{"state": map[string]any{"waiting": map[string]any{}}, "restartCount": 0, "lastState": map[string]any{}}}}})
 	}
 	for _, raw := range pods {
 		spec := raw.(map[string]any)["spec"].(map[string]any)
 		spec["securityContext"] = V1Alpha2ManagedPodSecurity()
-		spec["containers"] = []any{map[string]any{"name": "app", "image": "image", "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}, map[string]any{"name": "kube-api-access-abc", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}}}}
+		spec["topologySpreadConstraints"] = V1Alpha2ManagedTopology("uid")
+		spec["containers"] = []any{map[string]any{"name": "app", "image": "image", "resources": V1Alpha2ManagedResources(false), "volumeMounts": []any{map[string]any{"name": V1Alpha2BootstrapVolume, "mountPath": V1Alpha2BootstrapDataDir}, map[string]any{"name": "kube-api-access-abc", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}}}}
 	}
 	depName, _ := V1Alpha2GenesisDeploymentName("uid")
 	dep := phase8Deployment(depName)
@@ -146,7 +146,6 @@ func TestBootstrapInitTemplateDefaults(t *testing.T) {
 	expected, _ := json.Marshal(init)
 	for _, c := range init {
 		c["imagePullPolicy"] = "IfNotPresent"
-		c["resources"] = map[string]any{}
 		c["volumeMounts"] = append(c["volumeMounts"].([]any), map[string]any{"name": "kube-api-access-abc", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true})
 	}
 	actual, _ := json.Marshal(init)

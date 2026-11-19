@@ -51,7 +51,6 @@ func TestManagedInitializationConnected(t *testing.T) {
 			spec := deployment["spec"].(map[string]any)
 			spec["progressDeadlineSeconds"] = 600
 			spec["revisionHistoryLimit"] = 10
-			spec["strategy"] = map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": "25%", "maxUnavailable": "25%"}}
 			template := spec["template"].(map[string]any)
 			template["metadata"].(map[string]any)["creationTimestamp"] = nil
 			pod := template["spec"].(map[string]any)
@@ -217,6 +216,40 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	}
 	var meta struct{ Name, Namespace, UID string }
 	_ = json.Unmarshal(cluster["metadata"], &meta)
+	upgradeCapturedPodSpec := func(rawPod json.RawMessage) json.RawMessage {
+		var p map[string]any
+		_ = json.Unmarshal(rawPod, &p)
+		p["securityContext"] = V1Alpha2ManagedPodSecurity()
+		p["topologySpreadConstraints"] = V1Alpha2ManagedTopology(meta.UID)
+		for _, c := range p["containers"].([]any) {
+			cm := c.(map[string]any)
+			cm["resources"] = V1Alpha2ManagedResources(false)
+			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
+		}
+		for _, c := range p["initContainers"].([]any) {
+			cm := c.(map[string]any)
+			cm["resources"] = V1Alpha2ManagedResources(true)
+			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
+		}
+		for _, v := range p["volumes"].([]any) {
+			vm := v.(map[string]any)
+			if vm["name"] == V1Alpha2BootstrapVolume {
+				vm["emptyDir"] = map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}
+			}
+		}
+		return mustManagedJSON(p)
+	}
+	var depSpec map[string]json.RawMessage
+	_ = json.Unmarshal(deployment["spec"], &depSpec)
+	depSpec["strategy"] = mustManagedJSON(map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": 1, "maxUnavailable": 0}})
+	var tpl map[string]json.RawMessage
+	_ = json.Unmarshal(depSpec["template"], &tpl)
+	tpl["spec"] = upgradeCapturedPodSpec(tpl["spec"])
+	depSpec["template"] = mustManagedJSON(tpl)
+	deployment["spec"] = mustManagedJSON(depSpec)
+	for i := range pods {
+		pods[i]["spec"] = upgradeCapturedPodSpec(pods[i]["spec"])
+	}
 	ref := V1Alpha2ClusterRef{Name: meta.Name, Namespace: meta.Namespace, UID: meta.UID}
 	var spec struct {
 		Workload struct {

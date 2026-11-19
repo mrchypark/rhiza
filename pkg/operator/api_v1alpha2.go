@@ -160,10 +160,23 @@ func ValidateV1Alpha2ClusterUpdate(old, next V1Alpha2Cluster) error {
 	if err := validateV1Alpha2MetadataUpdate(old.Metadata, next.Metadata); err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || old.Spec.ApplicationProtocol != next.Spec.ApplicationProtocol || next.Spec.VoterCount < old.Spec.VoterCount-1 || !reflect.DeepEqual(old.Spec.Workload, next.Spec.Workload) || (old.Spec.Replicas != nil) != (next.Spec.Replicas != nil) {
+	if !reflect.DeepEqual(old.Spec.GenesisIntent, next.Spec.GenesisIntent) || old.Spec.LogicalID != next.Spec.LogicalID || old.Spec.ApplicationProtocol != next.Spec.ApplicationProtocol || next.Spec.VoterCount < old.Spec.VoterCount-1 || !managedImageOnlyUpdate(old.Spec.Workload, next.Spec.Workload) || (old.Spec.Replicas != nil) != (next.Spec.Replicas != nil) {
 		return fmt.Errorf("unsupported cluster identity or workload update")
 	}
 	return nil
+}
+
+func managedImageOnlyUpdate(old, next V1Alpha2Workload) bool {
+	a, b := old.PodTemplate.Spec.Containers, next.PodTemplate.Spec.Containers
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 func effectiveBackoff(v *int32) int32 {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -97,8 +96,15 @@ func runServe(args []string) error {
 	identity := flags.String("identity-file", operator.V1Alpha2BootstrapIdentityPath, "")
 	handoff := flags.String("handoff-file", operator.V1Alpha2BootstrapHandoffPath, "")
 	repairHandoff := flags.String("repair-handoff-file", repairHandoffPath, "")
+	tlsCert := flags.String("tls-cert-file", "", "")
+	tlsKey := flags.String("tls-key-file", "", "")
+	clientCA := flags.String("tls-client-ca-file", "", "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("invalid serve-managed-sql arguments")
+	}
+	tlsPaths := managedTLSPaths{CertFile: *tlsCert, KeyFile: *tlsKey, ClientCAFile: *clientCA}
+	if err := tlsPaths.validate(); err != nil {
+		return err
 	}
 	if host, port, err := net.SplitHostPort(*listen); err != nil || net.ParseIP(host) == nil || port != "8080" {
 		return errors.New("invalid managed SQL listen address")
@@ -127,13 +133,18 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(serveManaged(ctx, cfg, *listen), cleanup())
+	return errors.Join(serveManagedWithTLS(ctx, cfg, *listen, tlsPaths), cleanup())
 }
 
 func runCheckReady(args []string) error {
 	flags := flag.NewFlagSet("check-ready", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	profilePath := flags.String("runtime-profile", operator.V1Alpha2ManagedRuntimeProfilePath, "")
+	listen := flags.String("listen", "http://127.0.0.1:8080/readyz", "")
+	tlsCert := flags.String("tls-cert-file", "", "")
+	tlsKey := flags.String("tls-key-file", "", "")
+	caFile := flags.String("tls-ca-file", "", "")
+	serverName := flags.String("tls-server-name", "127.0.0.1", "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("invalid check-ready arguments")
 	}
@@ -148,8 +159,11 @@ func runCheckReady(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return checkReady(ctx, client, "http://127.0.0.1:8080/readyz", profile.Storage.AdminToken)
+	client, err := managedReadyClient(managedTLSPaths{CertFile: *tlsCert, KeyFile: *tlsKey, ClientCAFile: *caFile}, *caFile, *serverName)
+	if err != nil {
+		return err
+	}
+	return checkReady(ctx, client, *listen, profile.Storage.AdminToken)
 }
 
 func runAwait(args []string) error {

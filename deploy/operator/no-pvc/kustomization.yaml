@@ -13,6 +13,7 @@ patches:
         path: /spec/template/spec/volumes
         value:
           - name: data
-            emptyDir: {}
+            emptyDir:
+              sizeLimit: 8Gi
       - op: remove
         path: /spec/volumeClaimTemplates
