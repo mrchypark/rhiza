@@ -29,21 +29,21 @@ func (h *Host) graphReadNode(ctx context.Context, consistency string) (context.C
 
 func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (network.GraphExecuteResponse, error) {
 	if !sqlpolicy.IsManagedGraphRequestApplicationProtocol(h.cfg.Plan.ApplicationProtocol) {
-		return network.GraphExecuteResponse{}, network.ErrNotReady
+		return network.GraphExecuteResponse{}, &GraphNotSubmittedError{Stage: SQLStageAuthority, Cause: network.ErrNotReady}
 	}
 	frame, err := network.PrepareManagedGraphExecution(request)
 	if err != nil {
-		return network.GraphExecuteResponse{}, err
+		return network.GraphExecuteResponse{}, &GraphNotSubmittedError{Stage: SQLStageValidation, Cause: err}
 	}
 	owned, recognized, err := types.DecodeManagedGraphExecution(frame)
 	if err != nil || !recognized {
-		return network.GraphExecuteResponse{}, network.ErrInvalidRequest
+		return network.GraphExecuteResponse{}, &GraphNotSubmittedError{Stage: SQLStageValidation, Cause: network.ErrInvalidRequest}
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
 	for attempt := 0; ; attempt++ {
 		if err := h.waitForMembershipTransition(operationCtx); err != nil {
-			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_transition", err)
+			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_transition", &GraphNotSubmittedError{Stage: SQLStageAdmission, Cause: err})
 		}
 		result, err, admissionFail := h.graphExecuteAttempt(operationCtx, owned)
 		if shouldRetryMembershipTransition(err, attempt) {
@@ -51,7 +51,7 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 		}
 		err = exhaustedMembershipTransitionError(err)
 		if admissionFail && err != nil {
-			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_initial_admission", err)
+			return network.GraphExecuteResponse{}, managedGraphExecuteFailure("host_initial_admission", &GraphNotSubmittedError{Stage: SQLStageAdmission, Cause: err})
 		}
 		return result, err
 	}
@@ -60,7 +60,7 @@ func (h *Host) GraphExecute(ctx context.Context, request types.GraphCommand) (ne
 func (h *Host) graphExecuteAttempt(ctx context.Context, owned types.GraphCommand) (network.GraphExecuteResponse, error, bool) {
 	n, release, ok := h.openNodeForWrite()
 	if !ok {
-		return network.GraphExecuteResponse{}, network.ErrNotReady, false
+		return network.GraphExecuteResponse{}, network.ErrNotReady, true
 	}
 	defer release()
 	if err := h.ensureInitialRequestAdmission(ctx); err != nil {

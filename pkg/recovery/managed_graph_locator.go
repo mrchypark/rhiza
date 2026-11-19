@@ -20,6 +20,60 @@ func VerifyManagedGraphLocator(ctx context.Context, snapshot *RecoverySnapshot, 
 	return verifyManagedAppendOnlyLocator(ctx, snapshot, cp, verifier, checkpoint.ManagedAppendOnlyLocator(l), sqlpolicy.ManagedGraphRequestMaterializationPolicy)
 }
 
+// discoverManagedAppendOnlyLocator prefers a CURRENT hint that is still inside
+// the captured history. When CURRENT has advanced past that history, immutable
+// roots at or below the captured tip are candidates until an exact archived
+// seal authenticates one.
+func discoverManagedAppendOnlyLocator(ctx context.Context, snapshot *RecoverySnapshot, cp *checkpoint.Manager, policy sqlpolicy.MaterializationPolicy, tip quepaxa.Slot) (checkpoint.ManagedAppendOnlyLocator, bool, error) {
+	if snapshot == nil || cp == nil || tip == 0 {
+		return checkpoint.ManagedAppendOnlyLocator{}, false, nil
+	}
+	locator, found, err := cp.LoadManagedAppendOnlyLocator(ctx, policy)
+	if err != nil {
+		return checkpoint.ManagedAppendOnlyLocator{}, false, err
+	}
+	if found && quepaxa.Slot(locator.SealDecisionSlot) <= tip {
+		return locator, true, nil
+	}
+	roots, err := cp.ManagedAppendOnlyRootsThrough(ctx, policy, uint64(tip))
+	if err != nil {
+		return checkpoint.ManagedAppendOnlyLocator{}, false, err
+	}
+	for _, root := range roots {
+		if root.Index >= uint64(tip) {
+			continue
+		}
+		from := quepaxa.Slot(root.Index + 1)
+		for from <= tip {
+			values, _, err := snapshot.DecisionsFrom(ctx, from, 256)
+			if err != nil {
+				return checkpoint.ManagedAppendOnlyLocator{}, false, err
+			}
+			if len(values) == 0 {
+				break
+			}
+			for _, value := range values {
+				if value.Slot > tip {
+					break
+				}
+				seal, sealOK, decodeErr := quepaxa.DecodeCheckpointSeal(value.Value)
+				if decodeErr == nil && sealOK && uint64(seal.Index) == root.Index && seal.RootHash == root.RootHash {
+					return checkpoint.ManagedAppendOnlyLocator{
+						Policy: int(policy), Index: root.Index, RootHash: root.RootHash,
+						SealDecisionSlot: uint64(value.Slot), SealDecisionHash: value.Hash,
+					}, true, nil
+				}
+			}
+			last := values[len(values)-1].Slot
+			if last < from || last >= tip {
+				break
+			}
+			from = last + 1
+		}
+	}
+	return checkpoint.ManagedAppendOnlyLocator{}, false, nil
+}
+
 // The expected policy is trusted configuration; CURRENT cannot select it.
 func verifyManagedAppendOnlyLocator(ctx context.Context, snapshot *RecoverySnapshot, cp *checkpoint.Manager, verifier *quepaxa.Core, l checkpoint.ManagedAppendOnlyLocator, expected sqlpolicy.MaterializationPolicy) (quepaxa.CheckpointSeal, quepaxa.DecidedValue, error) {
 	var zero quepaxa.CheckpointSeal

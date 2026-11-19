@@ -63,11 +63,23 @@ func (n *Node) beginManagedGraphRead(ctx context.Context, consistency string) (c
 		release()
 		return ctx, nil, network.ErrInvalidRequest
 	}
+	if err := n.ensureManagedGraphInitialRoot(scoped); err != nil {
+		release()
+		return ctx, nil, err
+	}
 	if consistency == "linearizable" {
 		// Certified replay must be able to finish a known native/SQLite gap.
 		// Check runtime/fatal health and membership here, not write admission's
 		// unresolved-recorder predicate. The Server owns the actual ReadIndex,
 		// certified catch-up/replay and clean backend snapshot boundary.
+		if err := n.waitForManagedVoterAdmission(scoped); err != nil {
+			release()
+			return ctx, nil, err
+		}
+		if err := n.ensureInitialManagedAdmission(scoped); err != nil {
+			release()
+			return ctx, nil, err
+		}
 		if _, err := n.checkInternalApplicationRuntime(scoped); err != nil {
 			release()
 			return ctx, nil, err

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -136,6 +137,9 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	if err := n.archive.SyncThrough(ctx, n.core, tip); err != nil {
 		return ManagedRepairSource{}, fmt.Errorf("sync fixed ADD-first source: %w", err)
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-repair:after-fixed-source-sync")
+	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
 	var view *recovery.ReadOnlyView
@@ -150,8 +154,9 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	if err := checker.ValidateManagedRepairPreparation(ctx, n.managedStartup.Identity, r, current, abortSlot); err != nil {
 		return ManagedRepairSource{}, err
 	}
-	corePrefix, prefixOK := n.core.PrefixHash(tip)
-	if view.Tip() != tip || !prefixOK || view.PrefixHash() != corePrefix {
+	viewTip := view.Tip()
+	corePrefix, prefixOK := n.core.PrefixHash(viewTip)
+	if viewTip < tip || !prefixOK || view.PrefixHash() != corePrefix {
 		return ManagedRepairSource{}, fmt.Errorf("prepared repair source prefix differs from live source: %w", network.ErrRequestConflict)
 	}
 	currentAfterArchive := n.core.CurrentCluster()
@@ -166,7 +171,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 		return ManagedRepairSource{}, fmt.Errorf("prepared repair source changed after archive sync: %w", network.ErrRequestConflict)
 	}
 	preparedConfig := current
-	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: tip, PreparedHash: view.PrefixHash()}, nil
+	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: viewTip, PreparedHash: view.PrefixHash()}, nil
 }
 
 // CaptureManagedRepairSource requires the exact completed REMOVE journal and
@@ -207,7 +212,7 @@ func (n *Node) VerifyManagedRepairAddition(ctx context.Context, request ManagedM
 	if operation.Target.ConfigID != request.ExpectedConfigID+1 {
 		return ManagedRepairCompletion{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairCompletion{}, err
 	}
@@ -260,7 +265,7 @@ func (n *Node) VerifyManagedRepairRemoval(ctx context.Context, request ManagedMe
 	if operation.Target.ConfigID != request.ExpectedConfigID+1 || !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 		return ManagedRepairSource{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -314,7 +319,7 @@ func (n *Node) captureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Remove != r.OldNodeID || operation.Request.Add != nil || !operation.ManagedExcludedRead || !reflect.DeepEqual(operation.Target, n.core.CurrentCluster()) {
 		return ManagedRepairSource{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}

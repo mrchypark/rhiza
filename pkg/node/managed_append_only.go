@@ -21,6 +21,16 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+const managedGraphInitialRootRetry = 3 * time.Second
+
+func (n *Node) managedCheckpointPublisherDelay(interval time.Duration) time.Duration {
+	delay := min(interval, time.Minute)
+	if !n.managedGraphInitialRootComplete() {
+		delay = min(delay, managedGraphInitialRootRetry)
+	}
+	return delay
+}
+
 func isManagedAppendOnlyProtocol(protocol string) bool {
 	return protocol == sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol || protocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
 }
@@ -544,7 +554,6 @@ func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
 	if interval <= 0 {
 		interval = 15 * time.Minute
 	}
-	period := min(interval, time.Minute)
 	tail := n.config.CheckpointTailBytes
 	if tail <= 0 {
 		tail = 512 << 20
@@ -555,8 +564,6 @@ func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
 		if err := localtesthooks.HitBackgroundPublication(ctx, "checkpoint"); err != nil {
 			return
 		}
-		ticker := time.NewTicker(period)
-		defer ticker.Stop()
 		var last time.Time
 		for {
 			if last.IsZero() || time.Since(last) >= interval || n.wal.Bytes() >= tail {
@@ -568,10 +575,17 @@ func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {
 					last = time.Now()
 				}
 			}
+			timer := time.NewTimer(n.managedCheckpointPublisherDelay(interval))
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()

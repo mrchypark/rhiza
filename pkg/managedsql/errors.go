@@ -52,3 +52,17 @@ func (e *KVNotSubmittedError) Error() string {
 	return fmt.Sprintf("%v: stage=%s recovery_required=%t: %v", ErrKVNotSubmitted, e.Stage, e.RecoveryRequired, e.Cause)
 }
 func (e *KVNotSubmittedError) Unwrap() []error { return []error{ErrKVNotSubmitted, e.Cause} }
+
+// ErrGraphNotSubmitted reports only this call's pre-proposal boundary.
+var ErrGraphNotSubmitted = errors.New("managed Graph not submitted")
+
+type GraphNotSubmittedError struct {
+	Stage            SQLSubmissionStage
+	RecoveryRequired bool
+	Cause            error
+}
+
+func (e *GraphNotSubmittedError) Error() string {
+	return fmt.Sprintf("%v: stage=%s recovery_required=%t: %v", ErrGraphNotSubmitted, e.Stage, e.RecoveryRequired, e.Cause)
+}
+func (e *GraphNotSubmittedError) Unwrap() []error { return []error{ErrGraphNotSubmitted, e.Cause} }
