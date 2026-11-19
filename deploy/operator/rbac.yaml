@@ -106,3 +106,27 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: rhiza-managed-host
+---
+# Independent fencing evidence binds the captured Pod to its Node UID. This is
+# read-only; the operator still cannot list or mutate Nodes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rhiza-operator-node-identity
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rhiza-operator-node-identity
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-operator
+    namespace: rhiza
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rhiza-operator-node-identity

@@ -37,17 +37,27 @@ type FenceTarget struct {
 	ImageID     string `json:"imageID,omitempty"`
 }
 
-// capturedFenceIdentity adds the immutable runtime identity observed in a Pod to
-// an already authenticated target. A Pod that never reported its container
-// identity keeps empty fields and stays ineligible for independent evidence.
-func capturedFenceIdentity(target FenceTarget, pod object) FenceTarget {
+// capturedFenceIdentity adds the immutable runtime identity observed in a Pod
+// and its Node to an already authenticated target. A Pod that never reported
+// its container identity keeps empty fields and stays ineligible for
+// independent evidence. A failed Node read also leaves the target ineligible;
+// callers must not substitute a later observation.
+func capturedFenceIdentity(ctx context.Context, kube *Kubernetes, target FenceTarget, pod object) (FenceTarget, error) {
 	target.NodeName = str(nested(pod, "spec", "nodeName"))
 	if statuses := list(nested(pod, "status", "containerStatuses")); len(statuses) == 1 {
 		status := asObject(statuses[0])
 		target.ContainerID = str(status["containerID"])
 		target.ImageID = str(status["imageID"])
 	}
-	return target
+	if target.NodeName == "" || kube == nil {
+		return target, nil
+	}
+	var node object
+	if err := kube.Get(ctx, "/api/v1/nodes/"+url.PathEscape(target.NodeName), &node); err != nil {
+		return target, fmt.Errorf("capture Node identity: %w", err)
+	}
+	target.NodeUID = str(nested(node, "metadata", "uid"))
+	return target, nil
 }
 
 // Scope is "Generation" or "Voter".
