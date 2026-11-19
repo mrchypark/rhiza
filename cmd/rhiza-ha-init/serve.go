@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,10 @@ func managedRuntimeConfig(ctx context.Context, kube *operator.Kubernetes, ref op
 }
 
 func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (resultErr error) {
+	return serveManagedWithTLS(ctx, cfg, listen, managedTLSPaths{})
+}
+
+func serveManagedWithTLS(ctx context.Context, cfg managedsql.Config, listen string, paths managedTLSPaths) (resultErr error) {
 	host, err := managedsql.Open(ctx, cfg)
 	if host != nil {
 		defer func() { resultErr = errors.Join(resultErr, host.Close()) }()
@@ -46,6 +51,14 @@ func serveManaged(ctx context.Context, cfg managedsql.Config, listen string) (re
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
+	}
+	if paths.enabled() {
+		config, err := newManagedServerTLSConfig(paths)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		listener = tls.NewListener(listener, config)
 	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
 	serveCtx, cancelServe := context.WithCancel(ctx)

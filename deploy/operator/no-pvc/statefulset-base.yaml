@@ -24,6 +24,8 @@ spec:
       securityContext:
         fsGroup: 65532
         runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -81,8 +83,16 @@ spec:
             requests:
               cpu: 500m
               memory: 512Mi
+              ephemeral-storage: 1Gi
             limits:
+              cpu: "1"
               memory: 2Gi
+              ephemeral-storage: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
   volumeClaimTemplates:
     - metadata:
         name: data

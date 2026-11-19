@@ -77,6 +77,15 @@ func (s *phase8Server) roundTrip(r *http.Request) (*http.Response, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strings.Contains(r.URL.Path, "/poddisruptionbudgets") {
+		if r.Method == http.MethodPost {
+			return phase2Response(201, "{}"), nil
+		}
+		depName, _ := V1Alpha2GenesisDeploymentName("uid")
+		labels := map[string]string{"rhiza.mrchypark.dev/cluster-uid": "uid", "rhiza.mrchypark.dev/generation": "0"}
+		b, _ := json.Marshal(map[string]any{"apiVersion": "policy/v1", "kind": "PodDisruptionBudget", "metadata": map[string]any{"name": depName + "-pdb", "namespace": "ns", "uid": "pdb", "labels": labels}, "spec": map[string]any{"maxUnavailable": 1, "selector": map[string]any{"matchLabels": labels}}})
+		return phase2Response(200, string(b)), nil
+	}
 	if strings.Contains(r.URL.Path, "/deployments/") {
 		if r.Method != http.MethodGet {
 			s.t.Fatalf("deployment request: %s", r.Method)

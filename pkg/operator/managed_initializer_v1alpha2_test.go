@@ -51,7 +51,6 @@ func TestManagedInitializationConnected(t *testing.T) {
 			spec := deployment["spec"].(map[string]any)
 			spec["progressDeadlineSeconds"] = 600
 			spec["revisionHistoryLimit"] = 10
-			spec["strategy"] = map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": "25%", "maxUnavailable": "25%"}}
 			template := spec["template"].(map[string]any)
 			template["metadata"].(map[string]any)["creationTimestamp"] = nil
 			pod := template["spec"].(map[string]any)
@@ -79,7 +78,8 @@ func TestManagedInitializationConnected(t *testing.T) {
 					case "token disabled":
 						spec["automountServiceAccountToken"] = false
 					case "token missing":
-						spec["volumes"] = spec["volumes"].([]any)[:2]
+						vols := spec["volumes"].([]any)
+						spec["volumes"] = vols[:len(vols)-1]
 					case "missing readiness":
 						delete(main, "readinessProbe")
 					case "liveness":
@@ -217,6 +217,46 @@ func testManagedCapturedKubeletObjectsReconcile(t *testing.T, nativeList bool, f
 	}
 	var meta struct{ Name, Namespace, UID string }
 	_ = json.Unmarshal(cluster["metadata"], &meta)
+	upgradeCapturedPodSpec := func(rawPod json.RawMessage) json.RawMessage {
+		var p map[string]any
+		_ = json.Unmarshal(rawPod, &p)
+		p["securityContext"] = V1Alpha2ManagedPodSecurity()
+		p["topologySpreadConstraints"] = V1Alpha2ManagedTopology(meta.UID)
+		for _, c := range p["containers"].([]any) {
+			cm := c.(map[string]any)
+			cm["resources"] = V1Alpha2ManagedResources(false)
+			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
+			mounts := cm["volumeMounts"].([]any)
+			cm["volumeMounts"] = append([]any{mounts[0], map[string]any{"name": "tmp", "mountPath": "/tmp"}}, mounts[1:]...)
+		}
+		for _, c := range p["initContainers"].([]any) {
+			cm := c.(map[string]any)
+			cm["resources"] = V1Alpha2ManagedResources(true)
+			cm["securityContext"] = V1Alpha2ManagedContainerSecurity()
+		}
+		vols := p["volumes"].([]any)
+		for _, v := range vols {
+			vm := v.(map[string]any)
+			if vm["name"] == V1Alpha2BootstrapVolume {
+				vm["emptyDir"] = map[string]any{"sizeLimit": V1Alpha2ManagedDataSizeLimit}
+			}
+		}
+		// Match V1Alpha2ManagedSQLPodSpec volume order: rhiza-data, tmp, rhiza-runtime-profile, ...
+		tmpVol := map[string]any{"name": "tmp", "emptyDir": map[string]any{"sizeLimit": "64Mi"}}
+		p["volumes"] = append([]any{vols[0], tmpVol}, vols[1:]...)
+		return mustManagedJSON(p)
+	}
+	var depSpec map[string]json.RawMessage
+	_ = json.Unmarshal(deployment["spec"], &depSpec)
+	depSpec["strategy"] = mustManagedJSON(map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": 1, "maxUnavailable": 0}})
+	var tpl map[string]json.RawMessage
+	_ = json.Unmarshal(depSpec["template"], &tpl)
+	tpl["spec"] = upgradeCapturedPodSpec(tpl["spec"])
+	depSpec["template"] = mustManagedJSON(tpl)
+	deployment["spec"] = mustManagedJSON(depSpec)
+	for i := range pods {
+		pods[i]["spec"] = upgradeCapturedPodSpec(pods[i]["spec"])
+	}
 	ref := V1Alpha2ClusterRef{Name: meta.Name, Namespace: meta.Namespace, UID: meta.UID}
 	var spec struct {
 		Workload struct {

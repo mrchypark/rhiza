@@ -6,6 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: rhiza-operator
 spec:
+  # Scale to 2+ for active-standby HA; leader election is enabled by default.
   replicas: 1
   selector:
     matchLabels:
@@ -25,12 +26,19 @@ spec:
         - name: operator
           image: rhiza-operator:latest
           imagePullPolicy: IfNotPresent
-          args: ["--namespace=$(POD_NAMESPACE)"]
+          args: ["--namespace=$(POD_NAMESPACE)", "--identity=$(POD_NAME)"]
+          ports:
+            - name: health
+              containerPort: 8081
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           envFrom:
             - configMapRef:
                 name: rhiza-config
@@ -51,7 +59,22 @@ spec:
               cpu: 100m
               memory: 128Mi
             limits:
+              cpu: 500m
               memory: 256Mi
+              ephemeral-storage: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
       volumes:
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi

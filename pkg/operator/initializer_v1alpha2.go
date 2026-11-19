@@ -208,7 +208,7 @@ func ReconcileV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernete
 		return V1Alpha2StatusSnapshot{}, err
 	}
 	labels := map[string]string{"rhiza.mrchypark.dev/cluster-uid": ref.UID, "rhiza.mrchypark.dev/generation": "0"}
-	desired := map[string]any{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": map[string]any{"name": name, "namespace": ref.Namespace, "labels": labels, "ownerReferences": []any{map[string]any{"apiVersion": V1Alpha2APIVersion, "kind": "RhizaCluster", "name": ref.Name, "uid": ref.UID, "controller": true}}}, "spec": map[string]any{"replicas": c.Spec.VoterCount, "selector": map[string]any{"matchLabels": labels}, "template": map[string]any{"metadata": map[string]any{"labels": labels}, "spec": podSpec}}}
+	desired := map[string]any{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": map[string]any{"name": name, "namespace": ref.Namespace, "labels": labels, "ownerReferences": []any{map[string]any{"apiVersion": V1Alpha2APIVersion, "kind": "RhizaCluster", "name": ref.Name, "uid": ref.UID, "controller": true}}}, "spec": map[string]any{"replicas": c.Spec.VoterCount, "strategy": map[string]any{"type": "RollingUpdate", "rollingUpdate": map[string]any{"maxSurge": 1, "maxUnavailable": 0}}, "selector": map[string]any{"matchLabels": labels}, "template": map[string]any{"metadata": map[string]any{"labels": labels}, "spec": podSpec}}}
 	base := "/apis/apps/v1/namespaces/" + ref.Namespace + "/deployments"
 	var created map[string]json.RawMessage
 	postErr := kube.Post(ctx, base, desired, &created)
@@ -310,9 +310,25 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 	}
 	strip(pod, map[string]string{"restartPolicy": `"Always"`, "dnsPolicy": `"ClusterFirst"`, "schedulerName": `"default-scheduler"`, "terminationGracePeriodSeconds": "30"})
 	strip(pod, map[string]string{"serviceAccount": `"rhiza-managed-host"`})
+	var expectedSpec map[string]json.RawMessage
+	if json.Unmarshal(expected, &expectedSpec) != nil {
+		return false
+	}
+	var expectedTemplate map[string]json.RawMessage
+	if json.Unmarshal(expectedSpec["template"], &expectedTemplate) != nil {
+		return false
+	}
+	var expectedPod map[string]json.RawMessage
+	if json.Unmarshal(expectedTemplate["spec"], &expectedPod) != nil {
+		return false
+	}
 	for _, key := range []string{"containers", "initContainers"} {
 		var containers []map[string]json.RawMessage
 		if json.Unmarshal(pod[key], &containers) != nil {
+			return false
+		}
+		var want []map[string]json.RawMessage
+		if json.Unmarshal(expectedPod[key], &want) != nil || !normalizeManagedResourceContainers(containers, want) {
 			return false
 		}
 		for _, c := range containers {
@@ -560,6 +576,10 @@ func validateInertCandidate(live map[string]json.RawMessage, desired map[string]
 	if json.Unmarshal(d.Spec.Template.Spec["containers"], &containers) != nil {
 		return fmt.Errorf("invalid candidate containers")
 	}
+	var expectedContainers []map[string]json.RawMessage
+	if json.Unmarshal(mustMarshal(desired["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"]), &expectedContainers) != nil || !normalizeManagedResourceContainers(containers, expectedContainers) {
+		return fmt.Errorf("candidate resources exceed operator guardrails")
+	}
 	for _, c := range containers {
 		for key, value := range map[string]string{"terminationMessagePath": "\"/dev/termination-log\"", "terminationMessagePolicy": "\"File\"", "resources": "{}"} {
 			if raw, ok := c[key]; ok && sameJSON(raw, json.RawMessage(value)) {
@@ -582,6 +602,11 @@ func validateInertCandidate(live map[string]json.RawMessage, desired map[string]
 		return fmt.Errorf("candidate template mismatch")
 	}
 	return nil
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func defaultImagePullPolicy(image string) string {
@@ -612,6 +637,12 @@ func RunV1Alpha2ManagedInitialization(ctx context.Context, kube *Kubernetes, int
 	return runV1Alpha2Initialization(ctx, kube, interval, func() error {
 		return initializeV1Alpha2ListWith(ctx, kube, func(ref V1Alpha2ClusterRef) error {
 			if _, err := ReconcileV1Alpha2ManagedInitialization(ctx, kube, ref, profile); err != nil {
+				return err
+			}
+			if err := ReconcileV1Alpha2ManagedProduction(ctx, kube, ref); err != nil {
+				return err
+			}
+			if err := ReconcileV1Alpha2ManagedImageUpgrade(ctx, kube, ref, profile); err != nil {
 				return err
 			}
 			return ReconcileV1Alpha2ReplicaScale(ctx, &V1Alpha2StatusStore{Kube: kube}, ref)
