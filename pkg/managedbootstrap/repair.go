@@ -786,7 +786,11 @@ func repairGateCompatible(saved, live RepairGateFile) bool {
 // Reuse the actual consensus replay and checkpoint verifier to bind the fixed
 // source to its REMOVE terminal/target, rather than parsing control wire data.
 func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff, dataDir string) (resultErr error) {
-	dir, err := os.MkdirTemp(dataDir, ".rhiza-repair-control-*")
+	stageParent := ""
+	if dataDir != "" {
+		stageParent = filepath.Dir(dataDir)
+	}
+	dir, err := os.MkdirTemp(stageParent, ".rhiza-repair-control-*")
 	if err != nil {
 		return err
 	}
