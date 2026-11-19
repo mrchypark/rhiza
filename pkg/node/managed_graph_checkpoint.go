@@ -487,7 +487,7 @@ func (n *Node) prepareManagedGraphPeerCheckpoint(ctx context.Context, sender que
 	if err != nil || root.Hash != seal.StateHash || root.Generation != uint64(seal.Index) {
 		return fmt.Errorf("managed Graph peer paired root mismatch: %w", err)
 	}
-	dir, err := os.MkdirTemp("", "rhiza-graph-peer-prepare-*")
+	dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-graph-peer-prepare-*")
 	if err != nil {
 		return err
 	}
@@ -537,6 +537,7 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 	}
 	err = n.checkpoints.PromoteManagedGraphLocator(ctx, checkpoint.ManagedGraphLocator{Policy: int(sqlpolicy.ManagedGraphRequestMaterializationPolicy), Index: uint64(seal.Index), RootHash: seal.RootHash, SealDecisionSlot: uint64(d.Slot), SealDecisionHash: d.Hash})
 	if err == nil {
+		n.compactManagedLocalCheckpoint(seal.Index, seal.RootHash)
 		n.markManagedGraphInitialRootComplete()
 		return nil
 	}
@@ -574,6 +575,7 @@ func (n *Node) promoteManagedGraphSeal(ctx context.Context, seal quepaxa.SealedC
 	if proofErr := n.validateManagedGraphArchivedSeal(ctx, newSealed, local, newer, tip); proofErr != nil {
 		return errors.Join(err, proofErr)
 	}
+	n.compactManagedLocalCheckpoint(seal.Index, seal.RootHash)
 	n.markManagedGraphInitialRootComplete()
 	return nil
 }

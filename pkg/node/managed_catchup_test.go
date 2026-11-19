@@ -67,6 +67,9 @@ func TestManagedPublisherPublishesExactCheckpointWithoutTrimmingArchive(t *testi
 			if err != nil || !exists || !certified || locator.Policy != int(test.policy) || locator.Index != uint64(sealed.Index) || locator.RootHash != sealed.RootHash || locator.SealDecisionSlot != uint64(sealed.DecisionSlot) || locator.SealDecisionHash != decision.Hash {
 				t.Fatalf("CURRENT does not identify the exact published QCKP: locator=%+v exists=%t decision=%+v certified=%t seal=%+v err=%v", locator, exists, decision, certified, sealed, err)
 			}
+			if floor := n.core.CompactionFloor(); floor != sealed.Index {
+				t.Fatalf("local WAL was not compacted through the published QCKP: floor=%d index=%d", floor, sealed.Index)
+			}
 			if n.archive.Tip() != sealed.DecisionSlot {
 				t.Fatalf("publisher changed archived tip: got=%d want=%d", n.archive.Tip(), sealed.DecisionSlot)
 			}

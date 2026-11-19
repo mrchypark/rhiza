@@ -232,10 +232,24 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		}
 		defer c.releaseLocalExecution()
 	}
-	return c.compactThroughOwned(through, recoveryRoot)
+	return c.compactThroughOwnedWith(through, recoveryRoot, true)
 }
 
 func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
+	return c.compactThroughOwnedWith(through, recoveryRoot, true)
+}
+
+// CompactManagedThrough reclaims a local managed append-only WAL through a
+// certified QCKP. Append-only promotion verifies the seal without writing the
+// two-phase prepare marker used by vote-bearing checkpoints.
+func (c *Core) CompactManagedThrough(through Slot, recoveryRoot [32]byte) error {
+	if c.managedAppendOnly == nil {
+		return fmt.Errorf("managed append-only compaction is unavailable")
+	}
+	return c.compactThroughOwnedWith(through, recoveryRoot, false)
+}
+
+func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requirePrepared bool) error {
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
@@ -249,7 +263,8 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 		return fmt.Errorf("compaction floor %d is outside retained range (%d,%d]", through, c.floor, c.tip)
 	}
 	seal, sealed := c.sealedRoots[recoveryRoot]
-	if preparedRoot, prepared := c.preparedCheckpoints[through]; !sealed || seal.Index != through || !prepared || preparedRoot != recoveryRoot {
+	preparedRoot, prepared := c.preparedCheckpoints[through]
+	if !sealed || seal.Index != through || requirePrepared && (!prepared || preparedRoot != recoveryRoot) || prepared && preparedRoot != recoveryRoot {
 		c.mu.Unlock()
 		c.unlockCompactionBarrier()
 		return fmt.Errorf("recovery root is not locally verified and quorum sealed through %d", through)
