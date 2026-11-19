@@ -477,3 +477,10 @@ func (s *stubAttestor) count() int {
 	defer s.mu.Unlock()
 	return s.calls
 }
+
+func TestHTTPSAttestorRejectsNegativeTimeout(t *testing.T) {
+	a := &HTTPSAttestor{Client: &http.Client{Timeout: -time.Second}}
+	if _, err := a.Attest(t.Context(), AttestationRequest{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative timeout accepted: %v", err)
+	}
+}

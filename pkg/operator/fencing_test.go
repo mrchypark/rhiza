@@ -506,6 +506,12 @@ func TestCloneClientTimeout(t *testing.T) {
 	}
 }
 
+func TestFencingClientRejectsNegativeTimeout(t *testing.T) {
+	if _, err := (&FencingClient{Client: &http.Client{Timeout: -time.Second}}).Fence(t.Context(), FenceRequest{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative timeout accepted: %v", err)
+	}
+}
+
 // Backend replacement cannot weaken the Operator's recovery barrier.
 type resultFencer struct{ proof *FenceProof }
 

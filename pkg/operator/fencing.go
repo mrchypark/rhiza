@@ -332,6 +332,9 @@ func readToken(path string) (string, error) {
 }
 
 func (fc *FencingClient) Fence(ctx context.Context, req FenceRequest) (*FenceProof, error) {
+	if fc.Client != nil && fc.Client.Timeout < 0 {
+		return nil, fmt.Errorf("fencing: negative client timeout")
+	}
 	if err := validateURL(fc.URL); err != nil {
 		return nil, err
 	}

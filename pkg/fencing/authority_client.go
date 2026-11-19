@@ -29,6 +29,9 @@ type AuthorityClient struct {
 }
 
 func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, result any) error {
+	if a.Client != nil && a.Client.Timeout < 0 {
+		return fmt.Errorf("fencing: negative authority timeout")
+	}
 	u, err := url.Parse(a.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("fencing: HTTPS authority required")

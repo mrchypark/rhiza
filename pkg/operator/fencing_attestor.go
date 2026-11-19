@@ -90,6 +90,9 @@ func (a *HTTPSAttestor) Attest(ctx context.Context, req AttestationRequest) (*At
 	if a == nil {
 		return nil, fmt.Errorf("fencing: attestor is not configured")
 	}
+	if a.Client != nil && a.Client.Timeout < 0 {
+		return nil, fmt.Errorf("fencing: negative attestor timeout")
+	}
 	if err := validateURL(a.URL); err != nil {
 		return nil, err
 	}
@@ -306,7 +309,7 @@ func validateEvidenceStorage(want AttestationStoreScope, got *EvidenceStorage) e
 	if got.scope() != want {
 		return fmt.Errorf("fencing: storage evidence is bound to another location")
 	}
-	if got.QuietWindowSeconds < minIndependentQuietWindowSeconds {
+	if got.QuietWindowSeconds < minIndependentQuietWindowSeconds || int64(got.QuietWindowSeconds) > maxPolicySeconds {
 		return fmt.Errorf("fencing: storage quiet window is too short")
 	}
 	for _, snapshot := range []StorageSnapshot{got.Before, got.After} {
