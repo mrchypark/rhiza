@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 )
 
 const (
-	operatorLeaseDuration = 15 * time.Second
-	operatorRenewDeadline = 10 * time.Second
-	operatorRetryPeriod   = 2 * time.Second
+	operatorLeaseDuration  = 15 * time.Second
+	operatorRenewDeadline  = 10 * time.Second
+	operatorRetryPeriod    = 2 * time.Second
+	kubernetesMicroTimeFmt = "2006-01-02T15:04:05.000000Z"
 )
 
 type operatorLease struct {
@@ -49,6 +51,9 @@ func RunLeaderElection(ctx context.Context, kube *Kubernetes, identity, leaseNam
 	lastRenew := time.Time{}
 	for {
 		acquired, err := renewOperatorLease(ctx, kube, base, path, leaseName, identity)
+		if err != nil && leaderCancel == nil {
+			log.Printf("operator leader election retry: %v", err)
+		}
 		if err == nil && acquired {
 			lastRenew = time.Now()
 			if leaderCancel == nil {
@@ -92,7 +97,7 @@ func renewOperatorLease(ctx context.Context, kube *Kubernetes, base, path, name,
 	err := kube.Get(ctx, path, &lease)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		now := time.Now().UTC().Format(kubernetesMicroTimeFmt)
 		want := operatorLease{APIVersion: "coordination.k8s.io/v1", Kind: "Lease"}
 		want.Metadata.Name, want.Metadata.Namespace = name, kube.Namespace
 		want.Spec.HolderIdentity, want.Spec.LeaseDurationSeconds = identity, int32(operatorLeaseDuration/time.Second)
@@ -120,10 +125,10 @@ func renewOperatorLease(ctx context.Context, kube *Kubernetes, base, path, name,
 		return false, nil
 	}
 	if held {
-		lease.Spec.RenewTime = now.Format(time.RFC3339Nano)
+		lease.Spec.RenewTime = now.Format(kubernetesMicroTimeFmt)
 	} else {
 		lease.Spec.HolderIdentity = identity
-		lease.Spec.AcquireTime = now.Format(time.RFC3339Nano)
+		lease.Spec.AcquireTime = now.Format(kubernetesMicroTimeFmt)
 		lease.Spec.RenewTime = lease.Spec.AcquireTime
 	}
 	lease.Spec.LeaseDurationSeconds = int32(operatorLeaseDuration / time.Second)

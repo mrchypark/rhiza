@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestManagedResourcesAcceptable(t *testing.T) {
@@ -193,6 +194,12 @@ func TestRunLeaderElectionAcquireAndCancel(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/leases") && r.Method == http.MethodPost:
 			if err := json.NewDecoder(r.Body).Decode(&lease); err != nil {
 				return phase2Response(400, err.Error()), nil
+			}
+			if _, err := time.Parse(kubernetesMicroTimeFmt, lease.Spec.AcquireTime); err != nil || len(lease.Spec.AcquireTime) != len("2006-01-02T15:04:05.000000Z") {
+				return phase2Response(422, "acquireTime must be MicroTime"), nil
+			}
+			if _, err := time.Parse(kubernetesMicroTimeFmt, lease.Spec.RenewTime); err != nil || len(lease.Spec.RenewTime) != len("2006-01-02T15:04:05.000000Z") {
+				return phase2Response(422, "renewTime must be MicroTime"), nil
 			}
 			lease.Metadata.ResourceVersion = "1"
 			hasLease = true
