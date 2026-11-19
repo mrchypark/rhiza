@@ -84,6 +84,8 @@ type Core struct {
 	reconfigEnabled         bool
 	reconfigWAL             bool
 	reconfigAdmission       func(context.Context, Cluster, Slot, [32]byte) error
+	verifyMembershipAnchor  func(context.Context, Cluster, MembershipAnchor) error
+	storeMembershipAnchor   func(context.Context, [32]byte, MembershipRecord) error
 	configHistory           []configEpoch
 	retiredIDs              map[NodeID]struct{}
 	baseMembership          *MembershipRecord
@@ -2228,7 +2230,7 @@ func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(contex
 				lagging = false
 			}
 		}
-		if lagging && c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+		if lagging && c.reconfigEnabled && (seal.Membership == nil || !membershipRecordMatches(expected, *seal.Membership)) {
 			lagging = false
 		}
 		if lagging {
@@ -2240,7 +2242,7 @@ func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(contex
 		}
 		return false, nil, lagging, fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
-	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+	if c.reconfigEnabled && (seal.Membership == nil || !membershipRecordMatches(expected, *seal.Membership)) {
 		return false, nil, false, fmt.Errorf("checkpoint seal has stale membership history")
 	}
 	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
@@ -2314,7 +2316,7 @@ func (c *Core) checkCheckpointIdentityLocked(seal CheckpointSeal) error {
 		if err != nil {
 			return fmt.Errorf("checkpoint membership is not stable during reconfiguration")
 		}
-		if seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership) {
+		if seal.Membership == nil || !membershipRecordMatches(expected, *seal.Membership) {
 			return fmt.Errorf("checkpoint seal has stale membership history")
 		}
 	}
@@ -2403,7 +2405,7 @@ func (c *Core) validateRecoveredPreparedCheckpoint(seal CheckpointSeal) error {
 	if seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || tip < seal.Index || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
 		return fmt.Errorf("checkpoint marker does not match recovered historical cut")
 	}
-	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+	if c.reconfigEnabled && (seal.Membership == nil || !membershipRecordMatches(expected, *seal.Membership)) {
 		return fmt.Errorf("checkpoint marker membership differs from recovered historical cut")
 	}
 	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
@@ -2439,6 +2441,9 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 			return err
 		}
 		defer c.releaseLocalExecution()
+	}
+	if err := c.verifyMembershipAnchorContext(ctx, seal); err != nil {
+		return err
 	}
 	return c.prepareCheckpointOwned(ctx, seal)
 }

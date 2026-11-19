@@ -41,8 +41,14 @@ func (h *Host) internalRequestContext(ctx context.Context) (context.Context, fun
 // Once admitted, Node returns without repeating quorum or Kubernetes checks;
 // each operation then uses its own actual runtime/read/write gate.
 func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
+	if h.initialAdmitted.Load() {
+		return nil
+	}
 	h.admissionMu.Lock()
 	defer h.admissionMu.Unlock()
+	if h.initialAdmitted.Load() {
+		return nil
+	}
 	if h.internalRequests() {
 		if h.admissionLifetime == nil {
 			return h.node.EnsureInitialManagedAdmission(ctx)
@@ -53,7 +59,11 @@ func (h *Host) ensureInitialRequestAdmission(ctx context.Context) error {
 			return network.ErrNotReady
 		}
 		err := h.node.EnsureInitialManagedAdmission(scope)
-		return errors.Join(err, scope.Err(), h.admissionLifetime.Err())
+		err = errors.Join(err, scope.Err(), h.admissionLifetime.Err())
+		if err == nil {
+			h.initialAdmitted.Store(true)
+		}
+		return err
 	}
 	return nil
 }
@@ -105,9 +115,15 @@ func internalRequestOutcome(p applicationOriginal, receipt types.MutationReceipt
 	return err
 }
 
-// Called with h.mu held. The owned fingerprint identifies attempted intent;
-// it is not original storage or execution authority.
+// The owned fingerprint identifies attempted intent; it is not original
+// storage or execution authority.
 func (h *Host) rememberRequestOutcome(p applicationOriginal, err error, actualReceipt types.MutationReceipt) {
+	h.recoveryMu.Lock()
+	defer h.recoveryMu.Unlock()
+	h.rememberRequestOutcomeLocked(p, err, actualReceipt)
+}
+
+func (h *Host) rememberRequestOutcomeLocked(p applicationOriginal, err error, actualReceipt types.MutationReceipt) {
 	var unknown *network.CommitUnknownError
 	isUnknown := errors.As(err, &unknown)
 	if err != nil && !isUnknown {
@@ -117,6 +133,7 @@ func (h *Host) rememberRequestOutcome(p applicationOriginal, err error, actualRe
 	fingerprint, fingerprintErr := originalFingerprint(p)
 	if fingerprintErr != nil {
 		h.recoveryTargetOverflow = true // never guess an unrepresentable hint
+		h.recoveryVersion++
 		return
 	}
 	if isUnknown {
@@ -127,6 +144,7 @@ func (h *Host) rememberRequestOutcome(p applicationOriginal, err error, actualRe
 			// Two already prove ambiguity. Do not grow a RAM history with
 			// every uncertain request; overflow permanently requires a selector.
 			h.recoveryTargetOverflow = true
+			h.recoveryVersion++
 			return
 		}
 		hint, known := h.recoveryTargets[selector]
@@ -140,14 +158,22 @@ func (h *Host) rememberRequestOutcome(p applicationOriginal, err error, actualRe
 			hint.knownAttemptSlot = uint64(unknown.Slot)
 		}
 		h.recoveryTargets[selector] = hint
+		h.recoveryVersion++
 	} else if err == nil {
-		h.clearRequestHint(selector, fingerprint, actualReceipt.Slot)
+		h.clearRequestHintLocked(selector, fingerprint, actualReceipt.Slot)
 	}
 }
 
 func (h *Host) clearRequestHint(selector network.RequestStatusRequest, fingerprint [32]byte, canonicalSlot uint64) {
+	h.recoveryMu.Lock()
+	defer h.recoveryMu.Unlock()
+	h.clearRequestHintLocked(selector, fingerprint, canonicalSlot)
+}
+
+func (h *Host) clearRequestHintLocked(selector network.RequestStatusRequest, fingerprint [32]byte, canonicalSlot uint64) {
 	if hint, ok := h.recoveryTargets[selector]; ok && hint.matches(fingerprint, canonicalSlot) {
 		delete(h.recoveryTargets, selector)
+		h.recoveryVersion++
 	}
 }
 
@@ -155,16 +181,20 @@ func (h *Host) clearRequestHint(selector network.RequestStatusRequest, fingerpri
 // It never accepts a replacement payload or submits an application proposal.
 func (h *Host) RecoverRequest(ctx context.Context, selector network.RequestStatusRequest) (RecoveryResult, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed || !h.internalRequests() {
+	closed := h.closed
+	h.mu.Unlock()
+	if closed || !h.internalRequests() {
 		return RecoveryResult{}, fmt.Errorf("internal-request managed Host required")
 	}
 	scope, release := h.internalRequestContext(ctx)
 	defer release()
-	return h.recoverRequestLocked(scope, selector, nil)
+	return h.recoverRequest(scope, selector, nil)
 }
 
-func (h *Host) recoverRequestLocked(ctx context.Context, selector network.RequestStatusRequest, expected *[32]byte) (RecoveryResult, error) {
+func (h *Host) recoverRequest(ctx context.Context, selector network.RequestStatusRequest, expected *[32]byte) (RecoveryResult, error) {
+	h.recoveryMu.Lock()
+	version := h.recoveryVersion
+	h.recoveryMu.Unlock()
 	kind := types.MutationSQL
 	if selector.Kind == "kv" {
 		kind = types.MutationKV
@@ -185,7 +215,11 @@ func (h *Host) recoverRequestLocked(ctx context.Context, selector network.Reques
 	// and post-barrier binding/original checks in one fixed-target invocation.
 	resolved, err := h.node.ResolveRequest(ctx, selector.Kind, selector.RequestID)
 	result := RecoveryResult{Kind: selector.Kind, RequestID: []byte(selector.RequestID)}
-	if expected != nil && resolved.Original.Slot != 0 && (resolved.Original.Fingerprint != *expected || !h.recoveryTargets[selector].matches(resolved.Original.Fingerprint, resolved.Original.Slot)) {
+	h.recoveryMu.Lock()
+	hint, known := h.recoveryTargets[selector]
+	intentMatches := version == h.recoveryVersion && known && hint.matches(resolved.Original.Fingerprint, resolved.Original.Slot)
+	h.recoveryMu.Unlock()
+	if expected != nil && resolved.Original.Slot != 0 && (resolved.Original.Fingerprint != *expected || !intentMatches) {
 		return result, applicationOutcomeUnknown(p, types.MutationReceipt{}, errors.Join(fmt.Errorf("retained original differs from attempted recovery intent"), err))
 	}
 	if resolved.Receipt.Slot != 0 {

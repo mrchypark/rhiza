@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/mrchypark/rhiza/internal/atomicdir"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
@@ -698,7 +699,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	if err != nil {
 		return fail(errors.New("fixed repair source verification failed"))
 	}
-	if err := VerifyRepairControl(ctx, readonly, trusted, view, *capture); err != nil {
+	if err := VerifyRepairControl(ctx, readonly, trusted, view, *capture, cfg.Runtime.DataDir); err != nil {
 		return fail(err)
 	}
 	expected := recovery.PreparedStartupIdentity{ClusterUID: ref.UID, Generation: cfg.Plan.Generation, DeploymentUID: cfg.Plan.DeploymentUID, PodUID: podUID, NodeID: string(cfg.Runtime.NodeID), SourceBinding: physical, ConfigDigest: member}
@@ -727,6 +728,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 			return fail(repairPreparedVerificationFailed(err))
 		}
 		cfg.Prepared = prepared
+		cleanupRepairStagingArtifacts(filepath.Dir(cfg.Runtime.DataDir), capture.PlanDigest)
 		return cfg, closeBucket, nil
 	}
 	if err := ensureUnadoptedRepairDataDirAbsent(cfg.Runtime.DataDir); err != nil {
@@ -748,7 +750,27 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 		return fail(repairPreparedVerificationFailed(fmt.Errorf("write repair readiness marker: %w", err)))
 	}
 	cfg.Prepared = prepared
+	cleanupRepairStagingArtifacts(filepath.Dir(cfg.Runtime.DataDir), capture.PlanDigest)
 	return cfg, closeBucket, nil
+}
+
+func cleanupRepairStagingArtifacts(parentDir, activePlanDigest string) {
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		return
+	}
+	activePrepared := "repair-prepared-" + activePlanDigest
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() {
+			continue
+		}
+		if (strings.HasPrefix(name, "repair-prepared-") && name != activePrepared) ||
+			strings.HasPrefix(name, ".repair-data-staging-") ||
+			(strings.HasPrefix(name, ".repair-prepared-") && strings.Contains(name, "-quarantine-")) {
+			_ = os.RemoveAll(filepath.Join(parentDir, name))
+		}
+	}
 }
 
 func repairGateCompatible(saved, live RepairGateFile) bool {
@@ -763,8 +785,12 @@ func repairGateCompatible(saved, live RepairGateFile) bool {
 
 // Reuse the actual consensus replay and checkpoint verifier to bind the fixed
 // source to its REMOVE terminal/target, rather than parsing control wire data.
-func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff) (resultErr error) {
-	dir, err := os.MkdirTemp("", "rhiza-repair-control-*")
+func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff, dataDir string) (resultErr error) {
+	stageParent := ""
+	if dataDir != "" {
+		stageParent = filepath.Dir(dataDir)
+	}
+	dir, err := os.MkdirTemp(stageParent, ".rhiza-repair-control-*")
 	if err != nil {
 		return err
 	}
@@ -780,7 +806,7 @@ func VerifyRepairControl(ctx context.Context, bucket thanosobjstore.Bucket, boot
 	if view.MaterializationPolicy() == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		validateValue = types.ValidateManagedGraphExecutionPolicy
 	}
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "repair-control-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: true, ValidateValue: validateValue})
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "repair-control-verifier", Cluster: bootstrap, WAL: wal, EnableReconfiguration: true, ValidateValue: validateValue, VerifyMembershipAnchor: recovery.MembershipAnchorVerifier(bucket, capture.SourcePrefix)})
 	if err != nil {
 		return err
 	}

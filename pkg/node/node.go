@@ -36,6 +36,7 @@ type Node struct {
 	peerControl                  *network.Server
 	peer                         *network.PeerServer
 	transport                    *network.Transport
+	transportMu                  sync.RWMutex
 	catchUp                      *network.Transport
 	wal                          *qlog.WAL
 	lock                         *qlog.LockFile
@@ -59,12 +60,14 @@ type Node struct {
 	membershipMu                 sync.Mutex
 	opened                       atomic.Bool
 	cancel                       context.CancelFunc
+	lifetime                     context.Context
 	wg                           sync.WaitGroup
 	recoveryMu                   sync.Mutex
 	replayMu                     sync.Mutex
 	compactionMu                 sync.Mutex
 	catchUpWake                  chan struct{}
 	shutdownMu                   sync.Mutex
+	membershipWorkMu             sync.RWMutex
 	terminalMu                   sync.Mutex
 	terminalIdentity             network.TerminalDrainRequest
 	terminalRequested            atomic.Bool
@@ -76,6 +79,8 @@ type Node struct {
 	managedStartup               *ManagedStartupConfig
 	managedAdmitted              atomic.Bool
 	managedInitiallyAdmitted     atomic.Bool
+	managedApplicationStartMu    sync.Mutex
+	managedApplicationStartDone  atomic.Bool
 	managedGraphPublisherStarted atomic.Bool
 	managedGraphPublisherBinding atomic.Pointer[internalApplicationBinding]
 	managedGraphInitialRootDone  chan struct{}
@@ -347,6 +352,16 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 	}()
 	ctx, n.cancel = context.WithCancel(ctx)
+	n.lifetime = ctx
+	var stagedCheckpointDir string
+	var stagedCheckpointFiles []checkpoint.File
+	var stagedCheckpointIndex uint64
+	var stagedCheckpointRoot [32]byte
+	defer func() {
+		if stagedCheckpointDir != "" {
+			err = errors.Join(err, os.RemoveAll(stagedCheckpointDir))
+		}
+	}()
 	defer func() {
 		if pins := n.localBackupRestorePins; pins != nil {
 			err = errors.Join(err, context.Cause(pins.ctx), pins.close())
@@ -689,7 +704,9 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		}
 		coreTransport = transport
 	}
+	n.transportMu.Lock()
 	n.transport = transport
+	n.transportMu.Unlock()
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
 		if managedPeerProfile != nil {
@@ -731,6 +748,8 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
+		VerifyMembershipAnchor:   n.verifyMembershipAnchor,
+		StoreMembershipAnchor:    n.storeMembershipAnchor,
 		ValidateValue:            validateValue,
 	}
 	if managedPeerProfile != nil {
@@ -845,14 +864,16 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 					if err != nil {
 						return err
 					}
+					stagedCheckpointDir = dir
 					files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), uint64(seal.Index), seal.RootHash, dir)
 					if readErr == nil {
 						readErr = n.validateCheckpointFiles(startupRecovery.Context(), files, uint64(seal.Index))
 					}
-					cleanupErr := os.RemoveAll(dir)
-					if err := errors.Join(readErr, cleanupErr); err != nil {
-						return err
+					if readErr != nil {
+						return readErr
 					}
+					stagedCheckpointDir, stagedCheckpointFiles = dir, files
+					stagedCheckpointIndex, stagedCheckpointRoot = uint64(seal.Index), seal.RootHash
 				}
 				if err := core.RestoreCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
 					return fmt.Errorf("restore checkpoint recovery base: %w", startupRecovery.Check(err))
@@ -1272,18 +1293,30 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			n.recoveryPhases.selectedCheckpoint = true
 			n.recoveryPhases.checkpointIndex = restoreCheckpoint.Index
 			n.recoveryPhases.checkpointRootHash = restoreCheckpoint.RootHash
-			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
-			if fileErr != nil {
-				return fileErr
-			}
-			defer os.RemoveAll(dir)
-			n.recoveryPhases.checkpointDownloadVerifyStarted = true
-			downloadStarted := time.Now()
-			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), restoreCheckpoint.Index, restoreCheckpoint.RootHash, dir)
-			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
-			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
-			if readErr != nil {
-				return readErr
+			files := stagedCheckpointFiles
+			if stagedCheckpointIndex != restoreCheckpoint.Index || stagedCheckpointRoot != restoreCheckpoint.RootHash {
+				if stagedCheckpointDir != "" {
+					if cleanupErr := os.RemoveAll(stagedCheckpointDir); cleanupErr != nil {
+						return cleanupErr
+					}
+					stagedCheckpointDir, stagedCheckpointFiles = "", nil
+				}
+				dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
+				if fileErr != nil {
+					return fileErr
+				}
+				stagedCheckpointDir = dir
+				n.recoveryPhases.checkpointDownloadVerifyStarted = true
+				downloadStarted := time.Now()
+				var readErr error
+				files, readErr = n.checkpoints.DownloadRootFiles(startupRecovery.Context(), restoreCheckpoint.Index, restoreCheckpoint.RootHash, dir)
+				n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
+				n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
+				if readErr != nil {
+					return readErr
+				}
+				stagedCheckpointFiles = files
+				stagedCheckpointIndex, stagedCheckpointRoot = restoreCheckpoint.Index, restoreCheckpoint.RootHash
 			}
 			materialFiles := make([]materializer.CheckpointFile, 0, len(files))
 			for _, file := range files {
@@ -1714,6 +1747,8 @@ func (n *Node) StartupCaughtUp() bool {
 }
 
 func (n *Node) Shutdown() error {
+	n.membershipWorkMu.Lock()
+	defer n.membershipWorkMu.Unlock()
 	n.shutdownMu.Lock()
 	defer n.shutdownMu.Unlock()
 	return n.shutdown()
@@ -1730,6 +1765,8 @@ func (n *Node) shutdownEngine(closeBucket bool) error {
 // abortOpen closes a failed append-only startup without publishing local
 // decisions that its read-only archive selection rejected.
 func (n *Node) abortOpen() error {
+	n.membershipWorkMu.Lock()
+	defer n.membershipWorkMu.Unlock()
 	n.shutdownMu.Lock()
 	defer n.shutdownMu.Unlock()
 	syncArchive := n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedApplicationProtocol())
@@ -1776,9 +1813,12 @@ func (n *Node) shutdownEngineWithArchiveSync(closeBucket, syncArchive bool) erro
 		shutdownErr = errors.Join(shutdownErr, n.peer.Close())
 		n.peer = nil
 	}
-	if n.transport != nil {
-		shutdownErr = errors.Join(shutdownErr, n.transport.Close())
-		n.transport = nil
+	n.transportMu.Lock()
+	transport := n.transport
+	n.transport = nil
+	n.transportMu.Unlock()
+	if transport != nil {
+		shutdownErr = errors.Join(shutdownErr, transport.Close())
 	}
 	if n.catchUp != nil {
 		shutdownErr = errors.Join(shutdownErr, n.catchUp.Close())

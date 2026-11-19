@@ -215,8 +215,9 @@ func (h *Host) KVGet(ctx context.Context, req network.KVGetRequest) (network.KVG
 // permission. It does not resolve or finalize pending requests.
 func (h *Host) RequestStatus(ctx context.Context, req network.RequestStatusRequest) (network.RequestStatusResponse, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed || !h.mixed() {
+	closed, n := h.closed, h.node
+	h.mu.Unlock()
+	if closed || n == nil || !h.mixed() {
 		return network.RequestStatusResponse{}, fmt.Errorf("mixed managed Host required")
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
@@ -225,9 +226,9 @@ func (h *Host) RequestStatus(ctx context.Context, req network.RequestStatusReque
 		return network.RequestStatusResponse{}, err
 	}
 	if req.Kind == "graph" {
-		return h.node.GraphRequestStatusManaged(operationCtx, req)
+		return n.GraphRequestStatusManaged(operationCtx, req)
 	}
-	return h.node.RequestStatusManaged(operationCtx, req)
+	return n.RequestStatusManaged(operationCtx, req)
 }
 
 func applicationOutcomeUnknown(p applicationOriginal, receipt types.MutationReceipt, cause error) error {
@@ -249,20 +250,25 @@ func applicationOutcomeUnknown(p applicationOriginal, receipt types.MutationRece
 // are captured once for this invocation, including when finalization fails.
 func (h *Host) RecoverPendingDetailed(ctx context.Context) (RecoveryResult, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
 		return RecoveryResult{}, fmt.Errorf("SQL host closed")
 	}
 	operationCtx, release := h.internalRequestContext(ctx)
 	defer release()
-	if h.recoveryTargetOverflow || len(h.recoveryTargets) != 1 {
+	h.recoveryMu.Lock()
+	overflow, count := h.recoveryTargetOverflow, len(h.recoveryTargets)
+	var selector network.RequestStatusRequest
+	var hint requestRecoveryHint
+	for selector, hint = range h.recoveryTargets {
+	}
+	h.recoveryMu.Unlock()
+	if overflow || count != 1 {
 		return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required or ambiguous")}
 	}
-	for selector, hint := range h.recoveryTargets {
-		if hint.ambiguous {
-			return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("recovery target intent is ambiguous")}
-		}
-		return h.recoverRequestLocked(operationCtx, selector, &hint.fingerprint)
+	if hint.ambiguous {
+		return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("recovery target intent is ambiguous")}
 	}
-	return RecoveryResult{}, &network.CommitUnknownError{Cause: fmt.Errorf("exact recovery target required")}
+	return h.recoverRequest(operationCtx, selector, &hint.fingerprint)
 }

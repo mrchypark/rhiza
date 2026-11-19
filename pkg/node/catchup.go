@@ -786,6 +786,33 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 		cancel()
 		if err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
+				if n.managedStartup != nil && n.archive != nil {
+					stage = "archive-catchup"
+					page, observedTip, archErr := n.archive.DecisionsFrom(ctx, from, 128)
+					if archErr == nil {
+						if observedTip < from {
+							return nil
+						}
+						if len(page) == 0 || page[0].Slot != from {
+							return fmt.Errorf("archive catch-up omitted slot %d", from)
+						}
+						for _, d := range page {
+							if err := n.validateExecutionPolicy(d.Value); err != nil {
+								return err
+							}
+						}
+						if err := n.core.AcceptCertifiedValues(page); err != nil {
+							return err
+						}
+						if err := n.replayLocalDecisions(ctx); err != nil {
+							return err
+						}
+						continue
+					}
+					if !errors.Is(archErr, quepaxa.ErrCompacted) {
+						return archErr
+					}
+				}
 				stage = "restore-archive"
 				if err := n.restoreArchiveCatchUp(ctx); err != nil {
 					return err

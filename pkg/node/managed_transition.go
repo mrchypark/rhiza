@@ -82,6 +82,13 @@ func (n *Node) WaitForManagedMembershipTransition(ctx context.Context) error {
 		return network.ErrNotReady
 	}
 
+	if n.lifetime != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		stop := context.AfterFunc(n.lifetime, cancel)
+		defer stop()
+	}
 	recoveryCtx, cancel := context.WithTimeout(ctx, managedMembershipTransitionWait)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -95,6 +102,9 @@ func (n *Node) WaitForManagedMembershipTransition(ctx context.Context) error {
 		}
 		select {
 		case <-recoveryCtx.Done():
+			if n.lifetime != nil && n.lifetime.Err() != nil {
+				return network.ErrNotReady
+			}
 			if err := ctx.Err(); err != nil {
 				return err
 			}

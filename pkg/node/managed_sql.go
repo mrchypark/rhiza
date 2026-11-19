@@ -642,6 +642,14 @@ func (n *Node) ExecuteManagedSQL(ctx context.Context, req network.ExecuteRequest
 }
 
 func (n *Node) recordManagedApplicationStart(ctx context.Context) error {
+	if n.managedApplicationStartDone.Load() {
+		return nil
+	}
+	n.managedApplicationStartMu.Lock()
+	defer n.managedApplicationStartMu.Unlock()
+	if n.managedApplicationStartDone.Load() {
+		return nil
+	}
 	want, prefix, err := n.managedSQLScope(n.managedStartup.Identity)
 	if err != nil {
 		return err
@@ -653,6 +661,7 @@ func (n *Node) recordManagedApplicationStart(ctx context.Context) error {
 	if err := matchVoterRegistration(ctx, n.bucket, path.Join(prefix, "voters/managed-sql-application-start.json"), want, nil); err != nil {
 		return fmt.Errorf("record irreversible SQL application start: %w", err)
 	}
+	n.managedApplicationStartDone.Store(true)
 	return nil
 }
 

@@ -205,11 +205,12 @@ func (n *Node) reconcileManagedGraphCapturedFence(ctx context.Context, captured 
 		return errors.Join(prepareErr, err)
 	}
 	if n.core.Tip() < max(target, fence) {
-		if n.transport == nil {
+		transport := n.currentTransport()
+		if transport == nil {
 			return errors.Join(prepareErr, fmt.Errorf("managed Graph prepared fence requires unavailable certified catch-up"))
 		}
 		cluster := n.core.CurrentCluster()
-		if err := n.catchUpQuorum(ctx, n.transport, &cluster); err != nil {
+		if err := n.catchUpQuorum(ctx, transport, &cluster); err != nil {
 			return errors.Join(prepareErr, err)
 		}
 	}

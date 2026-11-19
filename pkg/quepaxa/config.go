@@ -38,6 +38,12 @@ type Config struct {
 	// ReconfigurationAdmission must approve every added voter after it has
 	// caught up durably. A nil callback rejects additions.
 	ReconfigurationAdmission func(context.Context, Cluster, Slot, [32]byte) error
+	// VerifyMembershipAnchor authenticates a checkpointed transition-chain
+	// prefix from immutable archive proof before a cold Core installs it.
+	VerifyMembershipAnchor func(context.Context, Cluster, MembershipAnchor) error
+	// StoreMembershipAnchor persists the bounded proof record before peers are
+	// asked to prepare a checkpoint that references it.
+	StoreMembershipAnchor func(context.Context, [32]byte, MembershipRecord) error
 	// ManagedAppendOnly fixes the V1 managed checkpoint policy at construction.
 	// Nil preserves the legacy and Local checkpoint protocols.
 	ManagedAppendOnly *ManagedAppendOnlyConfig
@@ -181,6 +187,8 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	}
 	core.reconfigEnabled = config.EnableReconfiguration
 	core.reconfigAdmission = config.ReconfigurationAdmission
+	core.verifyMembershipAnchor = config.VerifyMembershipAnchor
+	core.storeMembershipAnchor = config.StoreMembershipAnchor
 	if config.MaxRetainedDecisionBytes != 0 {
 		core.maxRetainedBytes = config.MaxRetainedDecisionBytes
 	}

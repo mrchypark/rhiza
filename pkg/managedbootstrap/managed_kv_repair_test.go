@@ -121,7 +121,7 @@ func TestManagedKVRepairControlUsesVerifiedProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture := operator.V1Alpha2RepairHandoff{SourcePrefix: "repair", HeadHash: fmt.Sprintf("%x", view.HeadHash()), Survivors: cluster}
-	err = VerifyRepairControl(ctx, bucket, cluster, view, capture)
+	err = VerifyRepairControl(ctx, bucket, cluster, view, capture, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "fixed source does not prove captured REMOVE target") {
 		t.Fatalf("mixed checkpoint did not reach independent REMOVE check: %v", err)
 	}

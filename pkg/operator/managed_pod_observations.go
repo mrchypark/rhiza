@@ -36,6 +36,7 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 	query := url.Values{"labelSelector": {"rhiza.mrchypark.dev/cluster-uid=" + ref.UID}, "limit": {"128"}}
 	version := ""
 	seen := map[string]bool{}
+	cache := newV1Alpha2GetCache(store.Kube)
 	var result []V1Alpha2ManagedPodObservation
 	for pages := 0; ; pages++ {
 		if pages >= 16 {
@@ -46,7 +47,7 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 			Metadata         struct{ ResourceVersion, Continue string }
 			Items            []struct{ Metadata v1alpha2BootstrapMetadata }
 		}
-		if err := store.Kube.Get(ctx, base+"?"+query.Encode(), &page); err != nil {
+		if err := cache.get(ctx, base+"?"+query.Encode(), &page); err != nil {
 			return nil, err
 		}
 		if page.APIVersion != "v1" || page.Kind != "PodList" || page.Metadata.ResourceVersion == "" || version != "" && version != page.Metadata.ResourceVersion || page.Items == nil {
@@ -80,7 +81,7 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 					}
 				}
 			}
-			if err := store.Kube.Get(ctx, base+"/"+url.PathEscape(item.Metadata.Name), &pod); err != nil {
+			if err := cache.get(ctx, base+"/"+url.PathEscape(item.Metadata.Name), &pod); err != nil {
 				var apiErr *APIError
 				if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 					continue
@@ -106,7 +107,7 @@ func ObserveV1Alpha2ManagedPods(ctx context.Context, store *V1Alpha2StatusStore,
 			}
 			member := V1Alpha2RepairPodRequest{PodName: pod.Metadata.Name, PodUID: pod.Metadata.UID, NodeID: id, PublicKey: key, PeerURL: "quic://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(peerPort))}
 			bindingPlan := V1Alpha2RepairPlan{ClusterUID: ref.UID, Generation: p.Generation, DeploymentUID: p.DeploymentUID, Replacement: member}
-			if _, err := ValidateV1Alpha2RepairPodBinding(ctx, store, ref, bindingPlan); err != nil {
+			if _, err := validateV1Alpha2RepairPodBinding(ctx, cache, ref, bindingPlan); err != nil {
 				var apiErr *APIError
 				if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 					continue

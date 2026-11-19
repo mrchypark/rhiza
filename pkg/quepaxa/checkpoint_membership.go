@@ -1,12 +1,19 @@
 package quepaxa
 
 import (
+	"context"
 	"fmt"
 	"slices"
 )
 
 func cloneMembershipRecord(record MembershipRecord) MembershipRecord {
 	copy := MembershipRecord{Genesis: cloneCluster(record.Genesis), Transitions: make([]ConfigTransition, len(record.Transitions))}
+	if record.Anchor != nil {
+		anchor := *record.Anchor
+		anchor.Cluster = cloneCluster(record.Anchor.Cluster)
+		anchor.RetiredIDs = append([]NodeID(nil), record.Anchor.RetiredIDs...)
+		copy.Anchor = &anchor
+	}
 	for i, transition := range record.Transitions {
 		copy.Transitions[i] = ConfigTransition{Freeze: cloneDecidedValue(transition.Freeze), Terminal: cloneDecidedValue(transition.Terminal)}
 	}
@@ -24,7 +31,10 @@ func cloneDecidedValue(value DecidedValue) DecidedValue {
 }
 
 func sameMembershipRecord(left, right MembershipRecord) bool {
-	if !sameCluster(left.Genesis, right.Genesis) || len(left.Transitions) != len(right.Transitions) || (left.Abort == nil) != (right.Abort == nil) {
+	if !sameCluster(left.Genesis, right.Genesis) || len(left.Transitions) != len(right.Transitions) || (left.Abort == nil) != (right.Abort == nil) || (left.Anchor == nil) != (right.Anchor == nil) {
+		return false
+	}
+	if left.Anchor != nil && (left.Anchor.Through != right.Anchor.Through || left.Anchor.Digest != right.Anchor.Digest || !sameCluster(left.Anchor.Cluster, right.Anchor.Cluster) || !slices.Equal(left.Anchor.RetiredIDs, right.Anchor.RetiredIDs)) {
 		return false
 	}
 	for i := range left.Transitions {
@@ -74,4 +84,23 @@ func (c *Core) checkpointMembershipForSeal(seal CheckpointSeal) (*Core, error) {
 		}
 	}
 	return verifier, nil
+}
+
+func (c *Core) verifyMembershipAnchorContext(ctx context.Context, seal CheckpointSeal) error {
+	if !c.reconfigEnabled || seal.Membership == nil || seal.Membership.Anchor == nil {
+		return nil
+	}
+	c.mu.RLock()
+	local, err := c.membershipHistoryLocked(seal.Index)
+	c.mu.RUnlock()
+	if err == nil && membershipRecordMatches(local, *seal.Membership) {
+		if c.storeMembershipAnchor != nil {
+			return c.storeMembershipAnchor(ctx, seal.Membership.Anchor.Digest, local)
+		}
+		return nil
+	}
+	if c.verifyMembershipAnchor == nil {
+		return fmt.Errorf("checkpoint membership anchor verifier is unavailable")
+	}
+	return c.verifyMembershipAnchor(ctx, cloneCluster(*c.config), *seal.Membership.Anchor)
 }

@@ -43,6 +43,6 @@ func managedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 	return managedbootstrap.ManagedRepairConfig(ctx, kube, ref, podName, podUID, identity, bootstrapPath, repairPath, profile)
 }
 
-func verifyRepairControl(ctx context.Context, bucket objstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff) (resultErr error) {
-	return managedbootstrap.VerifyRepairControl(ctx, bucket, bootstrap, view, capture)
+func verifyRepairControl(ctx context.Context, bucket objstore.Bucket, bootstrap quepaxa.Cluster, view *recovery.ReadOnlyView, capture operator.V1Alpha2RepairHandoff, dataDir string) (resultErr error) {
+	return managedbootstrap.VerifyRepairControl(ctx, bucket, bootstrap, view, capture, dataDir)
 }

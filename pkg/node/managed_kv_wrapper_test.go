@@ -237,6 +237,14 @@ func TestManagedKVWrappersExactAuthorityAndObservation(t *testing.T) {
 	if err != nil || !bytes.Equal(start, wantStart) {
 		t.Fatal("actual application start was not conditionally recorded", err)
 	}
+	statsBefore := n.bucket.Stats()
+	if err := n.recordManagedApplicationStart(ctx); err != nil {
+		t.Fatal(err)
+	}
+	statsAfter := n.bucket.Stats()
+	if statsAfter.Gets != statsBefore.Gets || statsAfter.Uploads != statsBefore.Uploads {
+		t.Fatalf("confirmed application start repeated object I/O: gets %d->%d uploads %d->%d", statsBefore.Gets, statsAfter.Gets, statsBefore.Uploads, statsAfter.Uploads)
+	}
 	original, found, err := n.RetainedRequest(ctx, "kv", req.RequestID)
 	if err != nil || !found || original.Slot != response.Slot {
 		t.Fatal("actual retained original missing", found, err)
