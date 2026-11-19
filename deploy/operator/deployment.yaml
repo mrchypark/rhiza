@@ -6,7 +6,8 @@ metadata:
   labels:
     app.kubernetes.io/name: rhiza-operator
 spec:
-  replicas: 2
+  # Scale to 2+ for active-standby HA; leader election is enabled by default.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: rhiza-operator
