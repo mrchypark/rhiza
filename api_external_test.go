@@ -40,6 +40,7 @@ func TestEmbeddedLifecycle(t *testing.T) {
 	_ = rhiza.RequestStatusRequest{Kind: rhiza.RequestKindSQL, RequestID: "request"}
 	_ = rhiza.MutationCommitted
 	_ = rhiza.MutationErrorCodePreconditionFailed
+	_ = rhiza.MutationErrorCodeResourceLimit
 	_ = rhiza.RequestStateUnknownOrExpired
 	_ = rhiza.HTTPErrorResponse{Code: "invalid_request", Error: "invalid request"}
 	_ = rhiza.HTTPErrorCodeInvalidRequest

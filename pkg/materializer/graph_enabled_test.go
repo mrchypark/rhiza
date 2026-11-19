@@ -1357,7 +1357,7 @@ func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testin
 	}
 }
 
-func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
+func TestGraphQueryWorkLimitRecordsRejectedReceiptAndAdvancesReplay(t *testing.T) {
 	if options := graphQueryOptions(); options.MaxWork != MaxGraphQueryWork {
 		t.Fatalf("graph query work limit=%d, want fixed limit %d", options.MaxWork, MaxGraphQueryWork)
 	}
@@ -1396,16 +1396,28 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertRejectedReceipt := func(label string, target *Materializer) {
+		t.Helper()
+		if target.Tip() != 2 {
+			t.Fatalf("tip after %s=%d, want 2", label, target.Tip())
+		}
+		receipt, found, err := target.GraphMutationReceipt(ctx, command.RequestID)
+		if err != nil || !found {
+			t.Fatalf("receipt after %s found=%v err=%v", label, found, err)
+		}
+		if receipt.Status != types.MutationRejected || receipt.ErrorCode != types.MutationErrorCodeResourceLimit || receipt.Slot != 2 || receipt.Applied {
+			t.Fatalf("receipt after %s=%+v, want rejected resource_limit at slot 2", label, receipt)
+		}
+		matches, err := target.GraphRequestMatches(ctx, command)
+		if err != nil || !matches {
+			t.Fatalf("request match after %s matches=%v err=%v", label, matches, err)
+		}
+	}
 	for _, attempt := range []string{"first", "same-instance retry"} {
-		if err := m.Apply(ctx, 2, value); !errors.Is(err, latticedb.ErrResourceLimit) {
-			t.Fatalf("%s apply error=%v, want resource limit", attempt, err)
+		if err := m.Apply(ctx, 2, value); err != nil {
+			t.Fatalf("%s apply error=%v, want nil with durable rejection receipt", attempt, err)
 		}
-		if m.Tip() != 1 {
-			t.Fatalf("tip after %s=%d, want 1", attempt, m.Tip())
-		}
-		if _, found, err := m.graph.request(command.RequestID); err != nil || found {
-			t.Fatalf("receipt after %s found=%v err=%v, want no rejection receipt", attempt, found, err)
-		}
+		assertRejectedReceipt(attempt, m)
 	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
@@ -1415,9 +1427,10 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Apply(ctx, 2, value); !errors.Is(err, latticedb.ErrResourceLimit) {
-		t.Fatalf("replay after reopen error=%v, want repeatable resource-limit failure", err)
+	if err := m.Apply(ctx, 2, value); err != nil {
+		t.Fatalf("replay after reopen error=%v, want idempotent nil", err)
 	}
+	assertRejectedReceipt("reopen replay", m)
 	const unchangedQuery = `MATCH (n:WorkItem {value: 0}) RETURN count(n) AS total`
 	if _, err := m.GraphQuery(ctx, unchangedQuery, nil); !errors.Is(err, ErrGraphResourceLimit) {
 		t.Fatalf("production-budget verification query error=%v, want Rhiza resource limit", err)
@@ -1426,8 +1439,8 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 		t.Fatalf("production-budget verification query error=%v, want retained LatticeDB cause", err)
 	}
 	boundedResult, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {id: 0}) RETURN n.value`, nil)
-	if err != nil || boundedResult.AppliedSlot != 1 || len(boundedResult.Rows) != 1 || boundedResult.Rows[0][0] != int64(0) {
-		t.Fatalf("bounded public query slot=%d rows=%v err=%v, want original value at slot 1", boundedResult.AppliedSlot, boundedResult.Rows, err)
+	if err != nil || boundedResult.AppliedSlot != 2 || len(boundedResult.Rows) != 1 || boundedResult.Rows[0][0] != int64(0) {
+		t.Fatalf("bounded public query slot=%d rows=%v err=%v, want original value at slot 2", boundedResult.AppliedSlot, boundedResult.Rows, err)
 	}
 	// A full 10,000-node scan exceeds the public 16 MiB query byte budget
 	// under LatticeDB's source-read accounting. Inspect rollback state in a
@@ -1440,14 +1453,27 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bounded rollback inspection: %v", err)
 	}
-	if m.Tip() != 1 || len(inspection.Rows) != 1 || inspection.Rows[0]["total"] != int64(10_000) {
-		t.Fatalf("graph after failed mutation tip=%d rows=%v, want unchanged data at slot 1", m.Tip(), inspection.Rows)
-	}
-	if _, found, err := m.graph.request(command.RequestID); err != nil || found {
-		t.Fatalf("receipt after reopened failure found=%v err=%v, want none", found, err)
+	if m.Tip() != 2 || len(inspection.Rows) != 1 || inspection.Rows[0]["total"] != int64(10_000) {
+		t.Fatalf("graph after failed mutation tip=%d rows=%v, want unchanged data at slot 2", m.Tip(), inspection.Rows)
 	}
 	if records, _, err := m.GraphReadStream(ctx, "work-limit", 0, 10, 0); err != nil || len(records) != 0 {
 		t.Fatalf("stream after failed mutation records=%+v err=%v, want no publication", records, err)
+	}
+	// Prove subsequent valid mutations continue cleanly past the rejected slot.
+	nextCmd := types.GraphCommand{RequestID: "after-budget-limit", Cypher: `CREATE (:WorkItem {id: 10000, value: 1})`}
+	nextValue, err := types.EncodeGraphCommand(nextCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 3, nextValue); err != nil {
+		t.Fatalf("apply after rejected slot: %v", err)
+	}
+	if m.Tip() != 3 {
+		t.Fatalf("tip after follow-up=%d, want 3", m.Tip())
+	}
+	followUp, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {id: 10000}) RETURN n.value`, nil)
+	if err != nil || followUp.AppliedSlot != 3 || len(followUp.Rows) != 1 || followUp.Rows[0][0] != int64(1) {
+		t.Fatalf("follow-up query slot=%d rows=%v err=%v", followUp.AppliedSlot, followUp.Rows, err)
 	}
 }
 
@@ -2260,5 +2286,92 @@ func TestGraphReachableDirectionValidationPrecedesGraphAccess(t *testing.T) {
 	request.Direction = "INCOMING"
 	if _, err := m.GraphReachable(context.Background(), request); err == nil || !strings.Contains(err.Error(), "invalid graph reachability direction") {
 		t.Fatalf("invalid direction error=%v, want validation before graph access", err)
+	}
+}
+
+func TestDeterministicGraphQueryBudgetClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "work budget", err: fmt.Errorf("%w: query work exceeds %d", latticedb.ErrResourceLimit, MaxGraphQueryWork), want: true},
+		{name: "row budget", err: fmt.Errorf("%w: query rows exceed %d", latticedb.ErrResourceLimit, MaxReturningRows), want: true},
+		{name: "temporary bytes budget", err: fmt.Errorf("%w: query temporary bytes exceed %d", latticedb.ErrResourceLimit, MaxResultBytes), want: true},
+		{name: "result bytes budget", err: fmt.Errorf("%w: query result bytes exceed %d", latticedb.ErrResourceLimit, MaxResultBytes), want: true},
+		{name: "source byte admission", err: fmt.Errorf("%w: source byte admission", latticedb.ErrResourceLimit), want: true},
+		{name: "bare resource limit", err: latticedb.ErrResourceLimit, want: false},
+		{name: "snapshot generation backpressure", err: fmt.Errorf("%w: retained generation bytes would exceed 123", latticedb.ErrResourceLimit), want: false},
+		{name: "derived index budget", err: fmt.Errorf("%w: derived-index budget exceeded", latticedb.ErrResourceLimit), want: false},
+		{name: "wal checkpoint in progress", err: fmt.Errorf("%w: WAL checkpoint is in progress", latticedb.ErrResourceLimit), want: false},
+		{name: "non-matching threshold", err: fmt.Errorf("%w: query work exceeds 50", latticedb.ErrResourceLimit), want: false},
+		{name: "joined with io", err: errors.Join(fmt.Errorf("%w: query work exceeds %d", latticedb.ErrResourceLimit, MaxGraphQueryWork), &latticedb.Error{Code: latticedb.ErrorIO, Message: "io"}), want: false},
+		{name: "joined with cancellation", err: errors.Join(fmt.Errorf("%w: query work exceeds %d", latticedb.ErrResourceLimit, MaxGraphQueryWork), context.Canceled), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDeterministicGraphQueryBudgetError(tc.err); got != tc.want {
+				t.Fatalf("isDeterministicGraphQueryBudgetError(%v)=%v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGraphRequestEncodingResourceLimitRoundTrip(t *testing.T) {
+	req := graphRequest{
+		Fingerprint: sha256.Sum256([]byte("fp")),
+		Receipt: types.MutationReceipt{
+			Slot:      42,
+			Status:    types.MutationRejected,
+			ErrorCode: types.MutationErrorCodeResourceLimit,
+		},
+	}
+	encoded := encodeGraphRequest(req)
+	decoded, found, err := decodeGraphRequest(encoded)
+	if err != nil || !found {
+		t.Fatalf("decodeGraphRequest found=%v err=%v", found, err)
+	}
+	if decoded.Fingerprint != req.Fingerprint || decoded.Receipt.Slot != req.Receipt.Slot ||
+		decoded.Receipt.Status != types.MutationRejected || decoded.Receipt.ErrorCode != types.MutationErrorCodeResourceLimit || decoded.Receipt.Applied {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", decoded, req)
+	}
+
+	command := types.GraphCommand{RequestID: "limit-original", Cypher: "CREATE (:Item)"}
+	execution, err := types.EncodeManagedGraphExecution(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, err := types.ManagedGraphIntentFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalOriginal, err := types.EncodeManagedGraphOriginal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origReq := graphRequest{
+		Fingerprint: fp,
+		Receipt:     req.Receipt,
+		Original: &RequestOriginal{
+			Kind:              types.MutationGraph,
+			RequestID:         command.RequestID,
+			Slot:              req.Receipt.Slot,
+			BatchIndex:        0,
+			Fingerprint:       fp,
+			DecisionHash:      sha256.Sum256(execution),
+			CanonicalOriginal: canonicalOriginal,
+			ExecutionItem:     execution,
+			Receipt:           req.Receipt,
+		},
+	}
+	rawOrig, err := encodeGraphOriginalRequest(command.RequestID, origReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedOrig, found, err := decodeGraphRequest(rawOrig)
+	if err != nil || !found || decodedOrig.Original == nil {
+		t.Fatalf("decodeGraphOriginalRequest found=%v orig=%v err=%v", found, decodedOrig.Original, err)
+	}
+	if decodedOrig.Receipt.Status != types.MutationRejected || decodedOrig.Receipt.ErrorCode != types.MutationErrorCodeResourceLimit || decodedOrig.Original.Receipt.ErrorCode != types.MutationErrorCodeResourceLimit {
+		t.Fatalf("original round-trip receipt=%+v", decodedOrig.Receipt)
 	}
 }

@@ -41,6 +41,7 @@ const (
 	MutationErrorCodeExecutionFailed     = "execution_failed"
 	MutationErrorCodePreconditionFailed  = "precondition_failed"
 	MutationErrorCodeResultRetentionFull = "result_retention_full"
+	MutationErrorCodeResourceLimit       = "resource_limit"
 )
 
 // MutationReceipt is the bounded result retained for idempotent retries.
