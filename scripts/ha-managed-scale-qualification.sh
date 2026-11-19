@@ -259,8 +259,7 @@ managed_functional_start_load() {
 }
 
 managed_functional_stage() {
-  printf '%s' "$1" > "$private/functional-stage"
-  k -n "$namespace" exec -i "$functional_client_pod" -c client -- sh -c 'cat > /work/stage' < "$private/functional-stage"
+  k -n "$namespace" exec "$functional_client_pod" -c client -- sh -c 'printf "%s" "$1" > /work/stage.tmp && mv /work/stage.tmp /work/stage' -- "$1"
 }
 
 managed_functional_wait_up3_samples() {
@@ -1488,8 +1487,9 @@ leave-u5'
   cmp "$scratch/scale-up-expected.txt" "$mfsu_order"
   functional_client_pod=load-pod private=$scratch
   k() {
-    [ "$1 $2 $3 $4 $5" = "-n managed-bootstrap exec -i load-pod" ] || return 97
-    cat > "$scratch/stage-forwarded"
+    [ "$1 $2 $3 $4 $5" = "-n managed-bootstrap exec load-pod -c" ] || return 97
+    for mfs_arg; do mfs_stage=$mfs_arg; done
+    printf '%s' "$mfs_stage" > "$scratch/stage-forwarded"
   }
   managed_functional_stage up-3
   [ "$(cat "$scratch/stage-forwarded")" = up-3 ]
