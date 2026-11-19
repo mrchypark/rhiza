@@ -67,6 +67,9 @@ func TestManagedPublisherPublishesExactCheckpointWithoutTrimmingArchive(t *testi
 			if err != nil || !exists || !certified || locator.Policy != int(test.policy) || locator.Index != uint64(sealed.Index) || locator.RootHash != sealed.RootHash || locator.SealDecisionSlot != uint64(sealed.DecisionSlot) || locator.SealDecisionHash != decision.Hash {
 				t.Fatalf("CURRENT does not identify the exact published QCKP: locator=%+v exists=%t decision=%+v certified=%t seal=%+v err=%v", locator, exists, decision, certified, sealed, err)
 			}
+			if floor := n.core.CompactionFloor(); floor != 0 {
+				t.Fatalf("small managed WAL was compacted before the local threshold: floor=%d index=%d", floor, sealed.Index)
+			}
 			if n.archive.Tip() != sealed.DecisionSlot {
 				t.Fatalf("publisher changed archived tip: got=%d want=%d", n.archive.Tip(), sealed.DecisionSlot)
 			}
@@ -98,6 +101,27 @@ func TestManagedPublisherPublishesExactCheckpointWithoutTrimmingArchive(t *testi
 			}
 			if after := fixture.bucket.mutationSnapshot(); !reflect.DeepEqual(after, beforeCatchup) {
 				t.Fatalf("below-floor catch-up mutated storage: before=%v after=%v", beforeCatchup, after)
+			}
+		})
+	}
+}
+
+func TestManagedLocalWALCompactionThreshold(t *testing.T) {
+	const mib = int64(1 << 20)
+	for _, tc := range []struct {
+		name        string
+		used, limit int64
+		want        bool
+	}{
+		{name: "empty", limit: 4 << 30},
+		{name: "below cap", used: 255 * mib, limit: 4 << 30},
+		{name: "at cap", used: 256 * mib, limit: 4 << 30, want: true},
+		{name: "half of small limit", used: mib, limit: 2 * mib, want: true},
+		{name: "unbounded", used: 1 << 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedLocalWALCompactionDue(tc.used, tc.limit); got != tc.want {
+				t.Fatalf("due(%d,%d)=%t want %t", tc.used, tc.limit, got, tc.want)
 			}
 		})
 	}

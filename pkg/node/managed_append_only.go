@@ -137,7 +137,7 @@ func (n *Node) verifyManagedAppendOnlyCandidate(ctx context.Context, candidate q
 	if err := n.checkpoints.Verify(ctx, uint64(candidate.Seal.Index), candidate.Seal.RootHash, candidate.Seal.StateHash); err != nil {
 		return fmt.Errorf("managed append-only immutable objects failed content verification: %w", err)
 	}
-	stage, err := os.MkdirTemp("", "rhiza-managed-append-only-candidate-*")
+	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-append-only-candidate-*")
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (n *Node) verifyManagedAppendOnlyArchiveHistory(ctx context.Context, seal q
 	if n == nil || n.archive == nil || n.config == nil || seal.Index == 0 {
 		return fmt.Errorf("managed append-only archive history verifier unavailable")
 	}
-	stage, err := os.MkdirTemp("", "rhiza-managed-append-only-history-*")
+	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-append-only-history-*")
 	if err != nil {
 		return err
 	}
@@ -545,8 +545,30 @@ func (n *Node) promoteManagedAppendOnlySeal(ctx context.Context, sealed quepaxa.
 			return errors.Join(err, verifyErr, fmt.Errorf("verified managed append-only root changed during stale promotion"))
 		}
 	}
+	n.compactManagedLocalCheckpoint(sealed.Index, sealed.RootHash)
 	n.markManagedGraphInitialRootComplete()
 	return nil
+}
+
+// A promoted QCKP is already durable in object storage and restored locally.
+// Reclaim the WAL prefix it covers without trimming the shared archive.
+func (n *Node) compactManagedLocalCheckpoint(index quepaxa.Slot, root [32]byte) {
+	if n == nil || n.core == nil || n.material == nil || n.wal == nil || n.managedStartup == nil || !isManagedAppendOnlyProtocol(n.managedStartup.Identity.ApplicationProtocol) || index == 0 || uint64(index) > n.material.Tip() {
+		return
+	}
+	if !managedLocalWALCompactionDue(n.wal.Bytes(), n.wal.Capacity().Limit) {
+		return
+	}
+	if err := n.core.CompactManagedThrough(index, root); err != nil {
+		log.Printf("managed local WAL compaction deferred through %d: %v", index, err)
+	}
+}
+
+func managedLocalWALCompactionDue(used, limit int64) bool {
+	if used <= 0 || limit <= 0 {
+		return false
+	}
+	return used >= min(int64(256<<20), limit/2)
 }
 
 func (n *Node) startManagedAppendOnlyPublisher(ctx context.Context) {

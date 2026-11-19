@@ -487,7 +487,7 @@ func (n *Node) prepareManagedGraphPeerCheckpoint(ctx context.Context, sender que
 	if err != nil || root.Hash != seal.StateHash || root.Generation != uint64(seal.Index) {
 		return fmt.Errorf("managed Graph peer paired root mismatch: %w", err)
 	}
-	dir, err := os.MkdirTemp("", "rhiza-graph-peer-prepare-*")
+	dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-graph-peer-prepare-*")
 	if err != nil {
 		return err
 	}
