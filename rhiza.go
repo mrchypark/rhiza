@@ -166,6 +166,7 @@ const (
 	MutationRejected                    = types.MutationRejected
 	MutationErrorCodeExecutionFailed    = types.MutationErrorCodeExecutionFailed
 	MutationErrorCodePreconditionFailed = types.MutationErrorCodePreconditionFailed
+	MutationErrorCodeResourceLimit      = types.MutationErrorCodeResourceLimit
 	RequestKindSQL                      = "sql"
 	RequestKindKV                       = "kv"
 	RequestKindNotify                   = "notify"

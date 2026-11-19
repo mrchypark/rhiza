@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -530,7 +531,7 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 			if !errors.As(err, &rejected) {
 				return err
 			}
-			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough, uint32(i)); recordErr != nil {
+			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough, rejected.errorCode, uint32(i)); recordErr != nil {
 				return recordErr
 			}
 		}
@@ -563,7 +564,10 @@ func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	return types.GraphFingerprint(command)
 }
 
-type graphRejectedCommandError struct{ err error }
+type graphRejectedCommandError struct {
+	err       error
+	errorCode string
+}
 
 func (e *graphRejectedCommandError) Error() string { return e.err.Error() }
 func (e *graphRejectedCommandError) Unwrap() error { return e.err }
@@ -580,21 +584,46 @@ func isDeterministicGraphQueryError(err error) bool {
 }
 
 func isInfrastructureGraphError(err error) bool {
+	return errors.Is(err, latticedb.ErrResourceLimit) || isNonBudgetInfrastructureGraphError(err)
+}
+
+func isNonBudgetInfrastructureGraphError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, latticedb.ErrResourceLimit) || errors.Is(err, latticedb.ErrWriteTxActive) ||
+		errors.Is(err, latticedb.ErrWriteTxActive) ||
 		errors.Is(err, latticedb.ErrRecoveryRequired) || errors.Is(err, ErrGraphCommitUnknown) {
 		return true
 	}
 	var dbErr *latticedb.Error
 	if errors.As(err, &dbErr) && (dbErr.Code == latticedb.ErrorIO || dbErr.Code == latticedb.ErrorCorruption ||
 		dbErr.Code == latticedb.ErrorChecksum || dbErr.Code == latticedb.ErrorVersionMismatch || dbErr.Code == latticedb.ErrorOutOfMemory ||
-		dbErr.Code == latticedb.ErrorDatabaseLocked || dbErr.Code == latticedb.ErrorFull || dbErr.Code == latticedb.ErrorValueTooLarge) {
+		dbErr.Code == latticedb.ErrorDatabaseLocked || (dbErr.Code == latticedb.ErrorFull && !errors.Is(dbErr, latticedb.ErrResourceLimit)) || dbErr.Code == latticedb.ErrorValueTooLarge) {
 		return true
 	}
 	var queryErr *latticedb.QueryError
 	return errors.As(err, &queryErr) && (queryErr.Code == latticedb.ErrorIO || queryErr.Code == latticedb.ErrorCorruption ||
 		queryErr.Code == latticedb.ErrorChecksum || queryErr.Code == latticedb.ErrorVersionMismatch || queryErr.Code == latticedb.ErrorOutOfMemory ||
-		queryErr.Code == latticedb.ErrorDatabaseLocked || queryErr.Code == latticedb.ErrorFull || queryErr.Code == latticedb.ErrorValueTooLarge)
+		queryErr.Code == latticedb.ErrorDatabaseLocked || (queryErr.Code == latticedb.ErrorFull && !errors.Is(queryErr, latticedb.ErrResourceLimit)) || queryErr.Code == latticedb.ErrorValueTooLarge)
+}
+
+var deterministicGraphBudgetMessages = []string{
+	fmt.Sprintf("query work exceeds %d", MaxGraphQueryWork),
+	fmt.Sprintf("query rows exceed %d", MaxReturningRows),
+	fmt.Sprintf("query temporary bytes exceed %d", MaxResultBytes),
+	fmt.Sprintf("query result bytes exceed %d", MaxResultBytes),
+	"source byte admission",
+}
+
+func isDeterministicGraphQueryBudgetError(err error) bool {
+	if !errors.Is(err, latticedb.ErrResourceLimit) || isNonBudgetInfrastructureGraphError(err) {
+		return false
+	}
+	msg := err.Error()
+	for _, want := range deterministicGraphBudgetMessages {
+		if strings.Contains(msg, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64, ordinal ...uint32) error {
@@ -642,7 +671,9 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 					_, err = tx.QueryContext(ctx, command.Cypher, args, graphQueryOptions())
 				}
 				if isDeterministicGraphQueryError(err) {
-					err = &graphRejectedCommandError{err: err}
+					err = &graphRejectedCommandError{err: err, errorCode: types.MutationErrorCodeExecutionFailed}
+				} else if isDeterministicGraphQueryBudgetError(err) {
+					err = &graphRejectedCommandError{err: err, errorCode: types.MutationErrorCodeResourceLimit}
 				}
 			}
 			if err != nil {
@@ -683,7 +714,10 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 	return updateErr
 }
 
-func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64, ordinal ...uint32) error {
+func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64, errorCode string, ordinal ...uint32) error {
+	if errorCode == "" {
+		errorCode = types.MutationErrorCodeExecutionFailed
+	}
 	if fingerprint == ([32]byte{}) {
 		var err error
 		fingerprint, err = types.GraphFingerprint(command)
@@ -713,7 +747,7 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 				return err
 			}
 			if !found && command.RequestID != "" {
-				receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeExecutionFailed, RetryThroughSlot: slot + g.idempotencyWindow - 1}
+				receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: errorCode, RetryThroughSlot: slot + g.idempotencyWindow - 1}
 				request, err := g.originalRequest(command, fingerprint, receipt, valueHash, ordinal)
 				if err != nil {
 					return err
@@ -894,6 +928,9 @@ func decodeGraphRequest(data []byte) (graphRequest, bool, error) {
 	case 2:
 		request.Receipt.Status = types.MutationRejected
 		request.Receipt.ErrorCode = types.MutationErrorCodeExecutionFailed
+	case 3:
+		request.Receipt.Status = types.MutationRejected
+		request.Receipt.ErrorCode = types.MutationErrorCodeResourceLimit
 	default:
 		return graphRequest{}, false, fmt.Errorf("invalid graph request status")
 	}
@@ -905,7 +942,11 @@ func encodeGraphRequest(request graphRequest) []byte {
 	copy(data, request.Fingerprint[:])
 	binary.BigEndian.PutUint64(data[32:40], request.Receipt.Slot)
 	if request.Receipt.Status == types.MutationRejected {
-		data[40] = 2
+		if request.Receipt.ErrorCode == types.MutationErrorCodeResourceLimit {
+			data[40] = 3
+		} else {
+			data[40] = 2
+		}
 	} else {
 		data[40] = 1
 	}

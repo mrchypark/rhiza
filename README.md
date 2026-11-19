@@ -266,9 +266,13 @@ return `ErrGraphResourceLimit` without a partial result.
 
 Graph reads and replicated mutations share a per-query execution-work ceiling
 of `MaxGraphQueryWork` (10,000,000), in addition to row and logical-byte limits.
-It does not bound parser CPU or wall-clock time. A mutation exceeding the budget
-rolls back and returns an error, not a rejected receipt; its committed slot
-cannot be skipped, and exact replay can fail again after reopen.
+It does not bound parser CPU or wall-clock time. A replicated mutation that
+exceeds the per-query execution work, row, or byte budget rolls back, publishes
+no stream events, records a durable `MutationRejected` receipt with
+`MutationErrorCodeResourceLimit` (`resource_limit`), and advances `tip`
+idempotently so exact replay after reopen does not wedge. Configure matching
+`LocalGraphNodePropertyIndexes` across replicas when mutations rely on indexed
+lookups to stay under the execution budget.
 
 The embedded `GraphReachable` API performs a bounded traversal on one immutable
 local graph snapshot. `Direction` selects `outgoing` or `incoming`; an empty
