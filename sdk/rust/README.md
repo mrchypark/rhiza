@@ -15,15 +15,12 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.27.1"
+rhizadb = "0.27.2"
 serde_json = "1"
 ```
 
-`rhizadb` 0.27.1 is the latest tagged release. The `execute_detailed` API
-described under [Managed SQL hosts](#managed-sql-hosts) is available on
-unreleased `main`; use a path dependency from a local `main` checkout until a
-release includes it. Applying this README's managed example to the 0.27.1 crate
-will not compile.
+`rhizadb` 0.27.2 is the latest tagged release and includes the
+`execute_detailed` API described under [Managed SQL hosts](#managed-sql-hosts).
 
 For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers
 refresh the bundled native tree with `prepare-native.sh`; releases stage it with
@@ -80,7 +77,7 @@ For Local object-storage backup, the Rust facade passes documented Go config
 fields through `set_option`; it does not provide typed object-store builders.
 The engine streams backup history and can restore an empty `DataDir` during
 open. Use the same storage identity and ensure only one process owns the archive
-at a time. See the [Local backup and recovery contract](https://github.com/mrchypark/rhiza/blob/v0.27.1/docs/embedded-object-storage.md),
+at a time. See the [Local backup and recovery contract](https://github.com/mrchypark/rhiza/blob/v0.27.2/docs/embedded-object-storage.md),
 including durability, archive compatibility, and filesystem ownership limits.
 
 `execute` and other mutations return `MutationReceipt`; always call
@@ -312,15 +309,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.27.1/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.27.1
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.27.2/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.27.2
 export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
 For containers, pass the host target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.27.1 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.27.2 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download
