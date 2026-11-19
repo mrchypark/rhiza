@@ -26,9 +26,10 @@ func TestManagedHostMinimizesK8sAPIGetsForLiveStartupAndReadiness(t *testing.T) 
 	counter := &countingKubeRoundTripper{base: configs[0].Store.Kube.Client.Transport}
 	configs[0].Store.Kube.Client.Transport = counter
 
+	ctx := context.Background()
 	hosts := make([]*Host, len(configs))
-	for i, cfg := range configs {
-		h, err := f.open(context.Background(), cfg)
+	openMember := func(i int) {
+		h, err := f.open(ctx, configs[i])
 		if h != nil {
 			hosts[i] = h
 			t.Cleanup(func() {
@@ -41,11 +42,9 @@ func TestManagedHostMinimizesK8sAPIGetsForLiveStartupAndReadiness(t *testing.T) 
 			t.Fatalf("open member %d: %v", i, err)
 		}
 	}
-	for _, h := range hosts {
-		readySQL(t, h)
-	}
 
-	ctx := context.Background()
+	openMember(0)
+
 	counter.gets.Store(0)
 	if _, err := hosts[0].live(ctx); err != nil {
 		t.Fatalf("live: %v", err)
@@ -60,6 +59,21 @@ func TestManagedHostMinimizesK8sAPIGetsForLiveStartupAndReadiness(t *testing.T) 
 	}
 	if got := counter.gets.Load(); got != 1 {
 		t.Fatalf("Host.ValidateManagedStartup GETs=%d, want 1", got)
+	}
+
+	for i := 1; i < len(configs); i++ {
+		openMember(i)
+	}
+	for _, h := range hosts {
+		readySQL(t, h)
+	}
+
+	counter.gets.Store(0)
+	if _, err := hosts[0].live(ctx); err != nil {
+		t.Fatalf("ready live: %v", err)
+	}
+	if got := counter.gets.Load(); got != 1 {
+		t.Fatalf("ready Host.live GETs=%d, want 1", got)
 	}
 
 	counter.gets.Store(0)
