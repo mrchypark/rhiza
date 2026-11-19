@@ -185,7 +185,7 @@ func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCan
 	if c.floor > seal.Index {
 		return fmt.Errorf("managed checkpoint root is below the recovery floor")
 	}
-	if prefix, ok := c.prefixes[seal.Index]; ok && prefix != seal.PrefixHash {
+	if prefix, ok := c.prefixHashLocked(seal.Index); ok && prefix != seal.PrefixHash {
 		return fmt.Errorf("managed checkpoint prefix differs from available local history")
 	}
 	if order, following, err := c.checkpointLeaderOrdersLocked(seal.Index); err == nil && (!slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder)) {
@@ -300,7 +300,7 @@ func (c *Core) validateManagedCandidateLocalLocked(candidate ManagedCheckpointCa
 	if !c.reconfigEnabled && seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
 		return fmt.Errorf("managed checkpoint cut config differs from local history")
 	}
-	if prefix, ok := c.prefixes[seal.Index]; ok && prefix != seal.PrefixHash {
+	if prefix, ok := c.prefixHashLocked(seal.Index); ok && prefix != seal.PrefixHash {
 		return fmt.Errorf("managed checkpoint prefix differs from available local history")
 	}
 	if order, following, err := c.checkpointLeaderOrdersLocked(seal.Index); err == nil && (!slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder)) {
@@ -351,29 +351,55 @@ func (c *Core) LatestManagedCheckpointSeal() (SealedCheckpoint, bool, error) {
 	defer c.mu.RUnlock()
 	var latest SealedCheckpoint
 	var latestHash ValueHash
-	for slot, decided := range c.decided {
+	seen := make(map[Slot]struct{}, len(c.decided)+len(c.sealedRoots))
+	inspectSlot := func(slot Slot) error {
+		if slot == 0 {
+			return nil
+		}
+		if _, done := seen[slot]; done {
+			return nil
+		}
+		seen[slot] = struct{}{}
+		decided, ok, err := c.loadDecidedLocked(slot)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 		if decided.Slot != slot || sha256.Sum256(decided.Value) != decided.Hash {
-			return SealedCheckpoint{}, false, fmt.Errorf("managed checkpoint decision identity mismatch at slot %d", slot)
+			return fmt.Errorf("managed checkpoint decision identity mismatch at slot %d", slot)
 		}
 		seal, checkpoint, err := DecodeCheckpointSeal(decided.Value)
 		if err != nil {
-			return SealedCheckpoint{}, false, err
+			return err
 		}
 		if !checkpoint {
-			continue
+			return nil
 		}
 		configID, decision, err := decodeCertificate(decided.Certificate)
 		if err != nil || decision.Slot != slot || decision.Proposal.Hash != decided.Hash || configID == 0 {
-			return SealedCheckpoint{}, false, fmt.Errorf("managed checkpoint certificate identity mismatch at slot %d", slot)
+			return fmt.Errorf("managed checkpoint certificate identity mismatch at slot %d", slot)
 		}
 		hash := decided.Hash
 		current := SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}
 		if current.Index > latest.Index || current.Index == latest.Index && current.DecisionSlot > latest.DecisionSlot {
 			latest, latestHash = current, hash
-			continue
+			return nil
 		}
 		if current.Index == latest.Index && current.DecisionSlot == latest.DecisionSlot && latest.Index != 0 && (current.RootHash != latest.RootHash || hash != latestHash) {
-			return SealedCheckpoint{}, false, fmt.Errorf("conflicting managed checkpoint values at rank (%d,%d)", current.Index, current.DecisionSlot)
+			return fmt.Errorf("conflicting managed checkpoint values at rank (%d,%d)", current.Index, current.DecisionSlot)
+		}
+		return nil
+	}
+	for _, seal := range c.sealedRoots {
+		if err := inspectSlot(seal.DecisionSlot); err != nil {
+			return SealedCheckpoint{}, false, err
+		}
+	}
+	for slot := range c.decided {
+		if err := inspectSlot(slot); err != nil {
+			return SealedCheckpoint{}, false, err
 		}
 	}
 	return latest, latest.Index != 0, nil

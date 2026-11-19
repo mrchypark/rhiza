@@ -1107,3 +1107,91 @@ func TestEstimateCompactedBytesMatchesBuildSelection(t *testing.T) {
 		t.Fatalf("estimate=%d built=%d", got, plan.offset)
 	}
 }
+
+func TestWALAppendAtScanWithLocationAndReadEntryAt(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal.maxSize = 96
+
+	var want []Entry
+	var locs []EntryLocation
+	for slot := uint64(1); slot <= 10; slot++ {
+		payload := bytes.Repeat([]byte{byte('a' + slot)}, 40)
+		entry := Entry{Slot: slot, Hash: sha256.Sum256(payload), Type: EntryDecide, Payload: payload}
+		loc, err := wal.AppendAt(entry)
+		if err != nil {
+			t.Fatalf("AppendAt slot %d: %v", slot, err)
+		}
+		want = append(want, entry)
+		locs = append(locs, loc)
+	}
+	if locs[len(locs)-1].Segment <= locs[0].Segment {
+		t.Fatalf("expected segment rollover: first=%+v last=%+v", locs[0], locs[len(locs)-1])
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	var scannedLocs []EntryLocation
+	var scannedEntries []Entry
+	if err := wal.ScanWithLocation(func(e Entry, loc EntryLocation) error {
+		scannedEntries = append(scannedEntries, e)
+		scannedLocs = append(scannedLocs, loc)
+		return nil
+	}); err != nil {
+		t.Fatalf("ScanWithLocation: %v", err)
+	}
+	if len(scannedLocs) != len(want) {
+		t.Fatalf("scanned=%d want=%d", len(scannedLocs), len(want))
+	}
+	for i := range want {
+		if scannedLocs[i] != locs[i] {
+			t.Fatalf("slot %d location mismatch: scanned=%+v append=%+v", want[i].Slot, scannedLocs[i], locs[i])
+		}
+		got, err := wal.ReadEntryAt(locs[i])
+		if err != nil {
+			t.Fatalf("ReadEntryAt slot %d: %v", want[i].Slot, err)
+		}
+		if got.Slot != want[i].Slot || got.Type != want[i].Type || got.Hash != want[i].Hash || !bytes.Equal(got.Payload, want[i].Payload) {
+			t.Fatalf("ReadEntryAt slot %d mismatch: got=%+v want=%+v", want[i].Slot, got, want[i])
+		}
+	}
+
+	for _, bad := range []EntryLocation{
+		{Segment: 0, Offset: 0, Length: 10},
+		{Segment: 1, Offset: -1, Length: 10},
+		{Segment: 1, Offset: 0, Length: 0},
+		{Segment: 999, Offset: 0, Length: 10},
+		{Segment: locs[0].Segment, Offset: locs[0].Offset, Length: locs[0].Length + 4096},
+	} {
+		if _, err := wal.ReadEntryAt(bad); err == nil {
+			t.Fatalf("ReadEntryAt(%+v) succeeded, want error", bad)
+		}
+	}
+	segPath := wal.segmentPath(locs[0].Segment)
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open read-only cleanly, then flip one byte in the first segment on disk and
+	// verify ReadEntryAt rejects the corrupted entry via CRC.
+	reopened, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	raw, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[locs[0].Offset+int64(locs[0].Length)-1] ^= 0xff
+	if err := os.WriteFile(segPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.ReadEntryAt(locs[0]); err == nil {
+		t.Fatal("ReadEntryAt succeeded on CRC-corrupted entry")
+	}
+}

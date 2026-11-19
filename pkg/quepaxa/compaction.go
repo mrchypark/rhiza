@@ -89,13 +89,13 @@ func (c *Core) InstallFencedGenerationBase(ctx context.Context, fenced FencedGen
 		if c.generationAnchorHash != fenced.AnchorHash {
 			return fmt.Errorf("fenced generation base anchor does not match local lineage")
 		}
-		prefix, ok := c.prefixes[fenced.Index]
+		prefix, ok := c.prefixHashLocked(fenced.Index)
 		if c.floor != fenced.Index || c.floorRoot != fenced.RootHash || !ok || prefix != fenced.PrefixHash {
 			return fmt.Errorf("fenced generation base is inconsistent with local lineage")
 		}
 		return nil
 	}
-	if c.tip != 0 || c.floor != 0 || len(c.decided) != 0 || len(c.recorders) != 0 || len(c.preparedCheckpoints) != 0 || c.reconfiguration != nil || len(c.configHistory) != 1 {
+	if c.tip != 0 || c.floor != 0 || len(c.decided) != 0 || len(c.cold) != 0 || len(c.recorders) != 0 || len(c.preparedCheckpoints) != 0 || c.reconfiguration != nil || len(c.configHistory) != 1 {
 		return fmt.Errorf("fenced generation base requires an empty target core")
 	}
 	if err := c.freshFencedGenerationWALLocked(); err != nil {
@@ -188,7 +188,7 @@ func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, 
 	c.mu.RLock()
 	validator := c.checkpointValidator
 	tip, floor, floorRoot, anchor := c.tip, c.floor, c.floorRoot, c.generationAnchorHash
-	prefix, prefixOK := c.prefixes[seal.Index]
+	prefix, prefixOK := c.prefixHashLocked(seal.Index)
 	c.mu.RUnlock()
 	if validator == nil {
 		return fmt.Errorf("checkpoint validation is unavailable")
@@ -254,7 +254,7 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 		c.unlockCompactionBarrier()
 		return fmt.Errorf("recovery root is not locally verified and quorum sealed through %d", through)
 	}
-	prefix, ok := c.prefixes[through]
+	prefix, ok := c.prefixHashLocked(through)
 	if !ok {
 		c.mu.Unlock()
 		c.unlockCompactionBarrier()
@@ -362,7 +362,7 @@ func (c *Core) estimateLocalCompactionOwned(seal CheckpointSeal) (uint64, error)
 		c.mu.RUnlock()
 		return 0, fmt.Errorf("Local checkpoint floor is outside retained history")
 	}
-	prefix, ok := c.prefixes[seal.Index]
+	prefix, ok := c.prefixHashLocked(seal.Index)
 	if !ok {
 		c.mu.RUnlock()
 		return 0, fmt.Errorf("Local checkpoint prefix is unavailable")
@@ -413,7 +413,16 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 		return nil, err
 	}
 	v.installBaseLocked(base)
-	slots := make([]Slot, 0, len(c.decided))
+	slots := make([]Slot, 0, len(c.decided)+len(c.cold))
+	for i, entry := range c.cold {
+		if entry.loc.Length <= 0 {
+			continue
+		}
+		slot := c.coldBase + Slot(i)
+		if slot > base.ClosedThrough {
+			slots = append(slots, slot)
+		}
+	}
 	for slot := range c.decided {
 		if slot > base.ClosedThrough {
 			slots = append(slots, slot)
@@ -421,7 +430,13 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 	}
 	slices.Sort(slots)
 	for _, slot := range slots {
-		value := c.decided[slot]
+		value, ok, err := c.loadDecidedLocked(slot)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("compaction suffix slot %d is missing", slot)
+		}
 		decision, err := v.certifiedDecision(value)
 		if err != nil {
 			return nil, err
@@ -429,7 +444,7 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 		if err := v.validateDecisionForRecovery(decision, true); err != nil {
 			return nil, err
 		}
-		v.decided[slot] = value
+		v.putDecidedLocked(slot, value)
 		if v.reconfigEnabled {
 			if err := v.advanceReconfigurationTipLocked(); err != nil {
 				return nil, err
@@ -439,7 +454,8 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 		}
 	}
 	if c.tip >= base.ClosedThrough {
-		if v.tip != c.tip || v.prefixes[v.tip] != c.prefixes[c.tip] || v.reconfiguration != nil {
+		tipPrefix, tipOK := c.prefixHashLocked(c.tip)
+		if v.tip != c.tip || !tipOK || v.prefixes[v.tip] != tipPrefix || v.reconfiguration != nil {
 			return nil, fmt.Errorf("compaction suffix changed checked prefix")
 		}
 		if c.reconfigEnabled {
@@ -471,7 +487,31 @@ func (c *Core) installVerifiedBaseLocked(base consensusBase, v *Core) {
 	c.reconfiguration, c.membershipVersion = v.reconfiguration, v.membershipVersion
 	c.generationAnchorHash = v.generationAnchorHash
 	c.installBaseLocked(base)
+	for slot, val := range v.decided {
+		if _, exists := c.decided[slot]; !exists {
+			c.putDecidedLocked(slot, val)
+			c.durable[slot] = true
+			c.logged[slot] = true
+			c.values[val.Hash] = append([]byte(nil), val.Value...)
+			c.valueDurable[val.Hash] = true
+			c.updateHashIndexLocked(val.Hash, slot)
+		}
+	}
+	if c.wal != nil {
+		if err := c.wal.ScanWithLocation(func(entry qlog.Entry, loc qlog.EntryLocation) error {
+			if entry.Type == qlog.EntryDecide && entry.Slot > uint64(base.ClosedThrough) {
+				if c.decisionLocs == nil {
+					c.decisionLocs = make(map[Slot]qlog.EntryLocation)
+				}
+				c.decisionLocs[Slot(entry.Slot)] = loc
+			}
+			return nil
+		}); err != nil {
+			clear(c.decisionLocs)
+		}
+	}
 	c.tip, c.prefixes = v.tip, v.prefixes
+	c.advanceDurableThroughLocked()
 }
 
 func (c *Core) liveProposalValuesAboveLocked(through Slot) (map[[32]byte][]byte, error) {
@@ -488,11 +528,19 @@ func (c *Core) liveProposalValuesAboveLocked(through Slot) (map[[32]byte][]byte,
 	// merely because an unresolved recorder references that same value. A local
 	// decision that has not reached the WAL still needs its proposal retained.
 	decided := make(map[ValueHash]struct{})
+	for i, entry := range c.cold {
+		if entry.loc.Length <= 0 {
+			continue
+		}
+		if c.coldBase+Slot(i) > through {
+			decided[entry.hash] = struct{}{}
+		}
+	}
 	for slot, value := range c.decided {
 		if slot <= through {
 			continue
 		}
-		if c.logged[slot] {
+		if c.isLoggedLocked(slot) {
 			decided[value.Hash] = struct{}{}
 			continue
 		}
@@ -527,8 +575,13 @@ func (c *Core) beginCompactionLocked(base qlog.Entry, retained map[[32]byte][]by
 	for hash := range retained {
 		c.compactionValues[hash] = struct{}{}
 	}
+	for i, entry := range c.cold {
+		if entry.loc.Length > 0 && uint64(c.coldBase+Slot(i)) > base.Slot {
+			c.compactionValues[[32]byte(entry.hash)] = struct{}{}
+		}
+	}
 	for slot, value := range c.decided {
-		if uint64(slot) > base.Slot && c.logged[slot] {
+		if uint64(slot) > base.Slot && c.isLoggedLocked(slot) {
 			c.compactionValues[[32]byte(value.Hash)] = struct{}{}
 		}
 	}
@@ -538,6 +591,8 @@ func (c *Core) beginCompactionLocked(base qlog.Entry, retained map[[32]byte][]by
 func (c *Core) finishCompaction() {
 	c.mu.Lock()
 	c.compactionValues = nil
+	c.advanceDurableThroughLocked()
+	c.evictColdDecisionsLocked()
 	c.mu.Unlock()
 }
 
@@ -624,6 +679,17 @@ func (c *Core) installBaseLocked(base consensusBase) {
 		c.baseFollowingOrder = append([]NodeID(nil), base.FollowingLeaderOrder...)
 	}
 	c.tip = base.ClosedThrough
+	c.cold = nil
+	c.coldBase = 0
+	c.evictedThrough = base.ClosedThrough
+	clear(c.decisionLocs)
+	keptAbort := c.abortTerminalSlots[:0]
+	for _, slot := range c.abortTerminalSlots {
+		if slot > base.ClosedThrough {
+			keptAbort = append(keptAbort, slot)
+		}
+	}
+	c.abortTerminalSlots = keptAbort
 	clear(c.prefixes)
 	c.prefixes[base.ClosedThrough] = base.PrefixHash
 	for slot := range c.decided {
@@ -631,11 +697,12 @@ func (c *Core) installBaseLocked(base consensusBase) {
 			if c.localMode && !c.logged[slot] && c.localUnloggedCount > 0 {
 				c.localUnloggedCount--
 			}
-			delete(c.decided, slot)
+			c.deleteDecidedLocked(slot)
 			delete(c.durable, slot)
 			delete(c.logged, slot)
 		}
 	}
+	c.recomputeHotDecisionBytesLocked()
 	clear(c.byHash)
 	for slot, decision := range c.decided {
 		c.updateHashIndexLocked(decision.Hash, slot)

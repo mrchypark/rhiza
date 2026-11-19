@@ -19,7 +19,7 @@ func (c *Core) RuntimeProgressSnapshot() RuntimeProgress {
 	if progress.RecorderTip <= progress.CertifiedTip {
 		return progress
 	}
-	if decision, ok := c.decided[progress.RecorderTip]; ok {
+	if decision, ok, err := c.loadDecidedLocked(progress.RecorderTip); err == nil && ok {
 		progress.RecorderHash = decision.Hash
 		progress.RecorderHashPresent = true
 		progress.RecorderHashIsCertified = true

@@ -16,6 +16,14 @@ import (
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
+// EntryLocation identifies one encoded WAL entry within a segment file.
+// Locations are valid until the WAL is compacted or closed.
+type EntryLocation struct {
+	Segment uint32
+	Offset  int64
+	Length  int32
+}
+
 // Segment is a single WAL segment file.
 type Segment struct {
 	file                  *os.File
@@ -692,37 +700,47 @@ func (w *WAL) cleanupOldManifests(current string) error {
 
 // Append appends an entry to the WAL.
 func (w *WAL) Append(entry Entry) error {
+	_, err := w.AppendAt(entry)
+	return err
+}
+
+// AppendAt appends an entry to the WAL and returns its physical location.
+func (w *WAL) AppendAt(entry Entry) (EntryLocation, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.readOnly {
-		return fmt.Errorf("WAL inspection is read-only")
+		return EntryLocation{}, fmt.Errorf("WAL inspection is read-only")
 	}
 	if w.fatal != nil {
-		return w.fatal
+		return EntryLocation{}, w.fatal
 	}
 
 	data := entry.Encode()
+	if int64(len(data)) > 1<<31-1 {
+		return EntryLocation{}, fmt.Errorf("WAL entry length %d exceeds EntryLocation range", len(data))
+	}
 	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
-		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
+		return EntryLocation{}, fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
 	}
 
 	// Roll over if needed
 	if w.current != nil && w.current.offset+int64(len(data)) > w.maxSize {
 		if err := w.createSegment(w.current.index + 1); err != nil {
-			return err
+			return EntryLocation{}, err
 		}
 	}
 
 	if w.current == nil {
 		if err := w.createSegment(1); err != nil {
-			return err
+			return EntryLocation{}, err
 		}
 	}
 
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
 
-	n, err := w.writeAt(w.current.file, data, w.current.offset)
+	offset := w.current.offset
+	n, err := w.writeAt(w.current.file, data, offset)
 	if err != nil || n != len(data) {
 		if err == nil {
 			err = io.ErrShortWrite
@@ -730,13 +748,17 @@ func (w *WAL) Append(entry Entry) error {
 		// The physical tail is uncertain, even when a full count accompanies an
 		// error. Only reopening may validate it; a shorter retry must not overwrite it.
 		w.fatal = fmt.Errorf("WAL append at %d is uncertain: %w", w.current.offset, err)
-		return w.fatal
+		return EntryLocation{}, w.fatal
 	}
 	w.current.offset += int64(n)
 	w.totalBytes += int64(n)
 	w.dirty = true
 
-	return nil
+	return EntryLocation{
+		Segment: w.current.index,
+		Offset:  offset,
+		Length:  int32(len(data)),
+	}, nil
 }
 
 // Sync flushes the current segment. Older segments are immutable and synced
@@ -783,17 +805,62 @@ func (w *WAL) Scan(visit func(Entry) error) error {
 	if visit == nil {
 		return fmt.Errorf("WAL scan callback is required")
 	}
+	return w.ScanWithLocation(func(entry Entry, _ EntryLocation) error {
+		return visit(entry)
+	})
+}
+
+// ScanWithLocation streams validated entries together with each entry's physical
+// WAL location in segment order.
+func (w *WAL) ScanWithLocation(visit func(Entry, EntryLocation) error) error {
+	if visit == nil {
+		return fmt.Errorf("WAL scan callback is required")
+	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	for _, seg := range w.segments {
 		seg.mu.Lock()
-		err := seg.scanEntries(false, visit)
+		err := seg.scanEntriesWithLocation(false, visit)
 		seg.mu.Unlock()
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ReadEntryAt reads and CRC-verifies a single entry from its recorded WAL location.
+func (w *WAL) ReadEntryAt(loc EntryLocation) (Entry, error) {
+	if loc.Segment == 0 || loc.Offset < 0 || loc.Length <= 0 {
+		return Entry{}, fmt.Errorf("invalid WAL entry location %+v", loc)
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	idx := sort.Search(len(w.segments), func(i int) bool {
+		return w.segments[i].index >= loc.Segment
+	})
+	if idx >= len(w.segments) || w.segments[idx].index != loc.Segment {
+		return Entry{}, fmt.Errorf("WAL segment %d not found", loc.Segment)
+	}
+	seg := w.segments[idx]
+	seg.mu.Lock()
+	defer seg.mu.Unlock()
+	end := loc.Offset + int64(loc.Length)
+	if end < loc.Offset || end > seg.offset {
+		return Entry{}, fmt.Errorf("WAL location %+v exceeds segment %d offset %d", loc, loc.Segment, seg.offset)
+	}
+	buf := make([]byte, int(loc.Length))
+	if _, err := seg.file.ReadAt(buf, loc.Offset); err != nil {
+		return Entry{}, err
+	}
+	entry, n, err := DecodeEntry(buf)
+	if err != nil {
+		return Entry{}, err
+	}
+	if n != len(buf) {
+		return Entry{}, fmt.Errorf("WAL entry at %+v decoded %d bytes, want %d", loc, n, len(buf))
+	}
+	return entry, nil
 }
 
 // EstimateCompactedBytes returns the exact encoded size for the base,
@@ -873,6 +940,12 @@ func (s *Segment) scan(repairTail bool) ([]Entry, error) {
 }
 
 func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
+	return s.scanEntriesWithLocation(repairTail, func(entry Entry, _ EntryLocation) error {
+		return visit(entry)
+	})
+}
+
+func (s *Segment) scanEntriesWithLocation(repairTail bool, visit func(Entry, EntryLocation) error) error {
 	info, err := s.file.Stat()
 	if err != nil {
 		return err
@@ -933,7 +1006,7 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 		if err != nil {
 			return err
 		}
-		if err := visit(entry); err != nil {
+		if err := visit(entry, EntryLocation{Segment: s.index, Offset: offset, Length: int32(totalLen)}); err != nil {
 			return err
 		}
 		offset += totalLen

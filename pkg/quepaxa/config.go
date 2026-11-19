@@ -41,6 +41,14 @@ type Config struct {
 	// ManagedAppendOnly fixes the V1 managed checkpoint policy at construction.
 	// Nil preserves the legacy and Local checkpoint protocols.
 	ManagedAppendOnly *ManagedAppendOnlyConfig
+	// MaxRetainedDecisionBytes bounds hot in-memory DecidedValue payloads when
+	// CompactThrough does not run. Zero selects DefaultMaxRetainedDecisionBytes;
+	// a negative value disables byte-based eviction.
+	MaxRetainedDecisionBytes int64
+	// MaxRetainedDecisionSlots bounds hot decided slots retained in memory when
+	// CompactThrough does not run. Zero selects DefaultMaxRetainedDecisionSlots;
+	// a negative value disables slot-count eviction.
+	MaxRetainedDecisionSlots int
 }
 
 // New validates and creates a QuePaxa core.
@@ -173,6 +181,12 @@ func newCoreFromConfig(config Config, observer, learner, localReadOnlyInspection
 	}
 	core.reconfigEnabled = config.EnableReconfiguration
 	core.reconfigAdmission = config.ReconfigurationAdmission
+	if config.MaxRetainedDecisionBytes != 0 {
+		core.maxRetainedBytes = config.MaxRetainedDecisionBytes
+	}
+	if config.MaxRetainedDecisionSlots != 0 {
+		core.maxRetainedSlots = config.MaxRetainedDecisionSlots
+	}
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(cluster)}}
 	core.retiredIDs = make(map[NodeID]struct{})
 	if err := core.recover(); err != nil {
