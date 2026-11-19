@@ -400,7 +400,7 @@ func openMaterializerPolicy(dbPath string, readerCount int, protocol string, ide
 
 func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 	readOnly := strings.Contains(dsn, "mode=ro")
-	return sqlite3driver.Open(dsn, func(conn *sqlite3.Conn) error {
+	init := func(conn *sqlite3.Conn) error {
 		if err := fts5.Register(conn); err != nil {
 			return err
 		}
@@ -428,7 +428,11 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 			}
 		}
 		return setSQLAuthorizer(conn, writer, readOnly, false)
-	})
+	}
+	if writer {
+		return openRollbackWitnessSQLite(dsn, init)
+	}
+	return sqlite3driver.Open(dsn, init)
 }
 
 // sqlFunctionDenylist holds functions a replicated write must not use. The
@@ -1245,8 +1249,66 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
+	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
+	oldRetention := m.sqlReceiptRetention
+	commitAttempted := false
+	commitFailed := false
+	var rollbackWitness *rollbackWitnessConn
+	var statementCloseErr error
 	defer func() {
-		_ = tx.Rollback()
+		if rollbackWitness == nil {
+			_ = conn.Raw(func(driverConn any) error {
+				rollbackWitness, _ = driverConn.(*rollbackWitnessConn)
+				return nil
+			})
+		}
+		if applyErr != nil && !commitAttempted {
+			if rollbackWitness != nil {
+				rollbackWitness.armAutoRollback()
+			}
+		}
+		rollbackErr := tx.Rollback()
+		if commitAttempted && errors.Is(rollbackErr, sql.ErrTxDone) {
+			rollbackErr = nil
+		}
+		retire := commitFailed || rollbackErr != nil || statementCloseErr != nil
+		if rollbackWitness != nil && rollbackWitness.takeRetire() {
+			retire = true
+		}
+		if retire {
+			// The transaction is finished; database/sql owns final physical close.
+			retireErr := conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+			if !errors.Is(retireErr, sqldriver.ErrBadConn) {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("retire apply connection: %w", retireErr))
+			}
+		}
+		if applyErr != nil {
+			m.sqlReceiptRetention = oldRetention
+			if !commitAttempted {
+				if rollbackErr != nil {
+					m.commitUnknown = true
+					if m.graph != nil {
+						m.graph.mu.Lock()
+						m.graph.poisonCommitOutcome()
+						m.graph.mu.Unlock()
+					}
+					applyErr = errors.Join(applyErr, ErrGraphCommitUnknown, fmt.Errorf("rollback apply batch: %w", rollbackErr))
+				} else if m.graph != nil {
+					m.graph.mu.Lock()
+					// Only a confirmed rollback permits discarding control-slot progress.
+					m.graph.tip = min(m.graph.tip, max(oldTip, m.graph.durableTip))
+					m.graph.mu.Unlock()
+				}
+			}
+		} else if rollbackErr != nil {
+			m.commitUnknown = true
+			if m.graph != nil {
+				m.graph.mu.Lock()
+				m.graph.poisonCommitOutcome()
+				m.graph.mu.Unlock()
+			}
+			applyErr = errors.Join(applyErr, ErrGraphCommitUnknown, fmt.Errorf("close apply batch: %w", rollbackErr))
+		}
 		if errors.Is(applyErr, errSQLPolicyState) {
 			// Discard only after rollback releases the transaction's Conn lock.
 			// ErrBadConn from Raw while the transaction is active deadlocks Close.
@@ -1261,14 +1323,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	statements := make(map[string]*sql.Stmt)
 	defer func() {
 		for _, statement := range statements {
-			statement.Close()
-		}
-	}()
-	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
-	oldRetention := m.sqlReceiptRetention
-	defer func() {
-		if applyErr != nil {
-			m.sqlReceiptRetention = oldRetention
+			if err := statement.Close(); err != nil {
+				statementCloseErr = errors.Join(statementCloseErr, fmt.Errorf("close prepared statement: %w", err))
+			}
 		}
 	}()
 	pending := make([]pendingNotification, 0)
@@ -1312,12 +1369,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return err
 	}
+	commitAttempted = true
 	commitErr := tx.Commit()
 	if commitErr == nil && m.afterApplyCommitError != nil {
 		// Test seam: model a lost acknowledgement after SQLite committed.
 		commitErr = m.afterApplyCommitError()
 	}
 	if commitErr != nil {
+		commitFailed = true
 		m.commitUnknown = true
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		if m.graph != nil {
