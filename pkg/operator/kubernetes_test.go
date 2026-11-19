@@ -66,6 +66,32 @@ func TestKubernetesRereadsRotatingToken(t *testing.T) {
 	}
 }
 
+func TestKubernetesDeleteSecretRequiresExactScopedIdentity(t *testing.T) {
+	client, _, closeServer := testKubernetes(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/v1/namespaces/test/secrets/replacement-uid-credentials" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer closeServer()
+	if err := client.ConfigureDeletion("test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteSecret(context.Background(), "test", "replacement-uid-credentials", ""); err == nil {
+		t.Fatal("accepted Secret deletion without exact UID")
+	}
+	if err := client.DeleteSecret(context.Background(), "test", "Bad_Name", "uid"); err == nil {
+		t.Fatal("accepted invalid Secret name")
+	}
+	if err := client.DeleteSecret(context.Background(), "other", "replacement-uid-credentials", "uid"); err == nil {
+		t.Fatal("accepted out-of-scope Secret namespace")
+	}
+	if err := client.DeleteSecret(context.Background(), "test", "replacement-uid-credentials", "uid"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestKubernetesObjectRoundTripPreservesResourceVersion(t *testing.T) {
 	client, _, closeServer := testKubernetes(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.Method {

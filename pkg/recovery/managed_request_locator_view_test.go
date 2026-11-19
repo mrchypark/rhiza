@@ -239,6 +239,20 @@ func TestManagedRequestReadOnlyLocatorAndFixedHandoff(t *testing.T) {
 	if archive.head.Base != 0 || core.CompactionFloor() != 0 {
 		t.Fatal("read-only checkpoint selection trimmed archive or producer WAL")
 	}
+	t.Run("captured-H-discovers-older-verified-qckp-after-current-advances", func(t *testing.T) {
+		before := requestViewBucketHashes(t, ctx, bucket)
+		fixed, err := OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, view.CapturedHead(), policy, window, protocol, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seal, decision, ok := fixed.RecoveryBase()
+		if !ok || fixed.Base() != quepaxa.Slot(l.Index) || seal.RootHash != l.RootHash || decision.Slot != quepaxa.Slot(l.SealDecisionSlot) || fixed.Tip() != view.Tip() {
+			t.Fatalf("older verified QCKP was not selected: base=%d tip=%d ok=%t seal=%+v decision=%d", fixed.Base(), fixed.Tip(), ok, seal, decision.Slot)
+		}
+		if after := requestViewBucketHashes(t, ctx, bucket); !reflect.DeepEqual(before, after) {
+			t.Fatal("captured-head discovery mutated source objects")
+		}
+	})
 	t.Run("captured-checkpointless-H-does-not-import-J", func(t *testing.T) {
 		before := requestViewBucketHashes(t, ctx, bucket)
 		v, err := OpenReadOnlyViewAtHeadForApplicationProtocol(ctx, readonly, prefix, 1, bootstrap, noCheckpoint.CapturedHead(), policy, window, protocol, false)

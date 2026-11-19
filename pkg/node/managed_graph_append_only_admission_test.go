@@ -112,39 +112,30 @@ func TestManagedGraphAppendOnlyAdmissionCancellationAfterOwnedBarrierStarts(t *t
 	case <-ctx.Done():
 		t.Fatal("admission waiter did not stop after caller cancellation")
 	}
-	select {
-	case <-owned.done:
-		if owned.err == nil {
-			t.Fatal("owned barrier worker did not retain its cancellation error")
-		}
-	case <-ctx.Done():
-		t.Fatal("owned barrier worker outlived its caller cancellation")
-	}
 	fixture.transport.releaseAll()
 	if err := awaitProposal(t, remoteOwner); err != nil {
 		t.Fatalf("remote control did not cleanly finish after release: %v", err)
 	}
-	if fixture.node.core.RecorderTip() > 10 {
-		t.Fatalf("canceled owner retried or submitted another intent: recorder tip=%d", fixture.node.core.RecorderTip())
+	select {
+	case <-owned.done:
+		if owned.err != nil || owned.slot == 0 {
+			t.Fatalf("shared owned barrier inherited caller cancellation: slot=%d err=%v", owned.slot, owned.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("shared owned barrier did not finish after caller cancellation", ctx.Err())
 	}
 	settled := fixture.node.core.RuntimeProgressSnapshot()
-	if settled.RecorderTip != settled.CertifiedTip {
-		t.Fatalf("test requires settled recorder state before a fresh admission: %+v", settled)
-	}
-	if err := fixture.node.replayLocalDecisions(ctx); err != nil {
-		t.Fatalf("replay the now-certified control before fresh admission: %v", err)
+	if settled.RecorderTip != settled.CertifiedTip || settled.RecorderTip < quepaxa.Slot(owned.slot) || fixture.node.material.Tip() < uint64(owned.slot) {
+		t.Fatalf("detached owned barrier did not settle its certified prefix: progress=%+v applied=%d slot=%d", settled, fixture.node.material.Tip(), owned.slot)
 	}
 	if err := fixture.node.admitInternalApplication(ctx); err != nil {
-		t.Fatalf("later fresh admission remained poisoned by the settled canceled owner: %v", err)
+		t.Fatalf("later fresh admission remained poisoned by the completed shared owner: %v", err)
 	}
 	fixture.node.managedGraphControlMu.Lock()
 	remaining := fixture.node.managedGraphControl
 	fixture.node.managedGraphControlMu.Unlock()
 	if remaining != nil {
 		t.Fatal("fresh admission left a stale operation pointer")
-	}
-	if !errors.Is(owned.err, context.Canceled) {
-		t.Fatalf("fresh admission rewrote original owner's cancellation result: %v", owned.err)
 	}
 	for slot := quepaxa.Slot(9); slot <= fixture.node.core.RecorderTip(); slot++ {
 		var value []byte
@@ -159,6 +150,31 @@ func TestManagedGraphAppendOnlyAdmissionCancellationAfterOwnedBarrierStarts(t *t
 		if isBarrier, err := types.DecodeReadBarrier(value); err != nil || !isBarrier {
 			t.Fatalf("cancellation introduced a non-control application value at slot %d: barrier=%t error=%v", slot, isBarrier, err)
 		}
+	}
+}
+
+func TestManagedGraphReadWaitsForAuthenticatedInitialRoot(t *testing.T) {
+	fixture := newManagedAppendOnlyAdmissionFixture(t, "managed-graph-read-root", sqlpolicy.ManagedGraphRequestMaterializationPolicy, sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol, types.ValidateManagedGraphExecutionPolicy)
+	fixture.node.managedGraphInitialRootDone = make(chan struct{})
+	fixture.node.managedGraphInitialRootOnce = sync.Once{}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, release, err := fixture.node.beginManagedGraphRead(ctx, "linearizable"); !errors.Is(err, context.DeadlineExceeded) {
+		if release != nil {
+			release()
+		}
+		t.Fatalf("Graph read bypassed initial-root gate: %v", err)
+	}
+	close(fixture.node.managedGraphInitialRootDone)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := fixture.node.beginManagedGraphRead(ctx, "linearizable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if release == nil {
+		t.Fatal("Graph read returned no release")
 	}
 }
 

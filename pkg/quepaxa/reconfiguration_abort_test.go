@@ -154,6 +154,21 @@ func TestAbortReconfigurationRejectsRemoval(t *testing.T) {
 	}
 }
 
+func TestAbortReconfigurationWithoutFreezeReturnsError(t *testing.T) {
+	cores, _ := reconfigCluster(t)
+	core := cores["a"]
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := core.BeginReconfiguration(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfiguration(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfiguration(context.Background()); err == nil || err.Error() != "reconfiguration is not frozen" {
+		t.Fatalf("abort without freeze error=%v", err)
+	}
+}
+
 func TestBeginReconfigurationAtChecksDurableAbortRevision(t *testing.T) {
 	cores, _ := reconfigCluster(t)
 	core := cores["a"]

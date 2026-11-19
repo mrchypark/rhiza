@@ -262,7 +262,17 @@ func (s V1Alpha2AdmissionSnapshot) Repair() (V1Alpha2RepairRecord, bool) {
 		h := *r.PreparedHandoff
 		h.Head = slices.Clone(h.Head)
 		h.Survivors.Members = slices.Clone(h.Survivors.Members)
+		if h.PreparedConfig != nil {
+			prepared := *h.PreparedConfig
+			prepared.Members = slices.Clone(prepared.Members)
+			h.PreparedConfig = &prepared
+		}
 		r.PreparedHandoff = &h
+	}
+	if r.AddCompletion != nil {
+		c := *r.AddCompletion
+		c.FinalVoterIDs = slices.Clone(c.FinalVoterIDs)
+		r.AddCompletion = &c
 	}
 	if r.Completion != nil {
 		c := *r.Completion
@@ -414,7 +424,7 @@ func parseV1Alpha2Repair(s V1Alpha2StatusSnapshot) (*V1Alpha2RepairRecord, error
 		if r.Completion != nil || !repairMatchesAuthority(r.Plan, s.authority) || hasV1Alpha2Transition(auth["transition"]) {
 			return nil, fmt.Errorf("repair overlaps changed authority or transition")
 		}
-	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Terminal" && r.AddCompletion == nil) || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Abort" && r.AddCompletion != nil) || (repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.PreparedHandoff == nil || r.AddCompletion != nil)) {
+	} else if (r.State != "Completed" && r.State != "Aborted") || r.Completion == nil || !validateV1Alpha2RepairCompletion(r.Plan, *r.Completion) || (r.State == "Completed") != (r.Completion.Kind == "Terminal") || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Terminal" && r.AddCompletion == nil) || (repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && r.Completion.Kind == "Abort" && r.AddCompletion != nil) || (repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.AddCompletion != nil || r.Completion.Kind == "Terminal" && r.PreparedHandoff == nil)) {
 		return nil, fmt.Errorf("invalid repair terminal")
 	}
 	if r.Completion != nil && !validV1Alpha2RepairTerminalOrder(r.Plan, *r.Completion, r.AddCompletion) {
@@ -471,7 +481,7 @@ func FinishV1Alpha2Repair(ctx context.Context, store *V1Alpha2StatusStore, old V
 		return V1Alpha2AdmissionSnapshot{}, "", err
 	}
 	r, ok := old.Repair()
-	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) || repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && (completion.Kind == "Terminal" && r.AddCompletion == nil || completion.Kind == "Abort" && r.AddCompletion != nil) || repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.PreparedHandoff == nil || r.AddCompletion != nil) {
+	if old.status.store != store || old.Authority() != expected || !ok || !old.SQLReservationsClosed() || !repairMatchesAuthority(r.Plan, expected) || hasV1Alpha2Transition(old.transition) || !validateV1Alpha2RepairCompletion(r.Plan, completion) || repairSequence(r.Plan) == V1Alpha2RepairAddThenRemove && (completion.Kind == "Terminal" && r.AddCompletion == nil || completion.Kind == "Abort" && r.AddCompletion != nil) || repairSequence(r.Plan) == V1Alpha2RepairAdd && (r.AddCompletion != nil || completion.Kind == "Terminal" && r.PreparedHandoff == nil) {
 		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("repair completion preconditions do not match")
 	}
 	if !validV1Alpha2RepairTerminalOrder(r.Plan, completion, r.AddCompletion) {

@@ -406,6 +406,13 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 	}
 	switch request.Operation {
 	case peerfb.OperationRecord:
+		if s.promotionReady != nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.promotionReady:
+			}
+		}
 		if request.Record == nil {
 			return nil, fmt.Errorf("record is required")
 		}

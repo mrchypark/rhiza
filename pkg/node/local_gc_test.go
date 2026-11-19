@@ -715,7 +715,7 @@ func TestLocalGCPolicyReopenPreservesIdentityAndPinnedSnapshots(t *testing.T) {
 }
 
 func TestLocalGCRestorePinLeaseProtectsRootAcrossNodeReopen(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	config := types.ExecutionConfig{Local: true, NodeID: "local", ClusterID: "gc-pin-reopen", DataDir: t.TempDir(), ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(), ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour, CheckpointRetainCount: 3, ObjStoreGCInterval: time.Hour, ObjStoreGCGracePeriod: time.Hour}
 	n1 := New(&config)

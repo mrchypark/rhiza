@@ -301,7 +301,6 @@ func (m *Manager) loadHead(ctx context.Context, verified map[extentObject]Extent
 	}
 	hash, object, end := head.TailHash, head.TailObject, head.Tip
 	reused := false
-	readOnlyBytes := 0
 	for end > head.Base {
 		if fixed && len(extents) >= maxReadOnlyDecisions {
 			return fmt.Errorf("read-only archive suffix exceeds extent limit")
@@ -328,14 +327,6 @@ func (m *Manager) loadHead(ctx context.Context, verified map[extentObject]Extent
 			extent, err = m.readExtent(ctx, hash, object)
 			if err != nil {
 				return err
-			}
-			if fixed {
-				for _, decision := range extent.Decisions {
-					readOnlyBytes += len(decision.Value) + len(decision.Certificate)
-					if readOnlyBytes > maxReadOnlyPayloadBytes {
-						return fmt.Errorf("read-only archive suffix exceeds byte limit")
-					}
-				}
 			}
 			extent = extentRef(extent)
 			verified[key] = extent

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -47,6 +48,12 @@ type ManagedRepairSource struct {
 	PreparedConfig *quepaxa.Cluster
 	PreparedSlot   quepaxa.Slot
 	PreparedHash   [32]byte
+}
+
+type ManagedRepairAbort struct {
+	ConfigID uint
+	Slot     quepaxa.Slot
+	Hash     string
 }
 
 // ManagedRepairPreparationChecker authorizes only the read-only source capture
@@ -136,6 +143,9 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	if err := n.archive.SyncThrough(ctx, n.core, tip); err != nil {
 		return ManagedRepairSource{}, fmt.Errorf("sync fixed ADD-first source: %w", err)
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-repair:after-fixed-source-sync")
+	}
 	prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 	bootstrap := quepaxa.Cluster{ConfigID: 1, Members: n.config.Members}
 	var view *recovery.ReadOnlyView
@@ -150,8 +160,9 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 	if err := checker.ValidateManagedRepairPreparation(ctx, n.managedStartup.Identity, r, current, abortSlot); err != nil {
 		return ManagedRepairSource{}, err
 	}
-	corePrefix, prefixOK := n.core.PrefixHash(tip)
-	if view.Tip() != tip || !prefixOK || view.PrefixHash() != corePrefix {
+	viewTip := view.Tip()
+	corePrefix, prefixOK := n.core.PrefixHash(viewTip)
+	if viewTip < tip || !prefixOK || view.PrefixHash() != corePrefix {
 		return ManagedRepairSource{}, fmt.Errorf("prepared repair source prefix differs from live source: %w", network.ErrRequestConflict)
 	}
 	currentAfterArchive := n.core.CurrentCluster()
@@ -166,7 +177,7 @@ func (n *Node) CaptureManagedPreparedRepairSource(ctx context.Context, r Managed
 		return ManagedRepairSource{}, fmt.Errorf("prepared repair source changed after archive sync: %w", network.ErrRequestConflict)
 	}
 	preparedConfig := current
-	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: tip, PreparedHash: view.PrefixHash()}, nil
+	return ManagedRepairSource{Head: view.CapturedHead(), HeadHash: view.HeadHash(), Survivors: current, PreparedConfig: &preparedConfig, PreparedSlot: viewTip, PreparedHash: view.PrefixHash()}, nil
 }
 
 // CaptureManagedRepairSource requires the exact completed REMOVE journal and
@@ -207,7 +218,7 @@ func (n *Node) VerifyManagedRepairAddition(ctx context.Context, request ManagedM
 	if operation.Target.ConfigID != request.ExpectedConfigID+1 {
 		return ManagedRepairCompletion{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairCompletion{}, err
 	}
@@ -260,7 +271,7 @@ func (n *Node) VerifyManagedRepairRemoval(ctx context.Context, request ManagedMe
 	if operation.Target.ConfigID != request.ExpectedConfigID+1 || !reflect.DeepEqual(n.core.CurrentCluster(), operation.Target) {
 		return ManagedRepairSource{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -314,7 +325,7 @@ func (n *Node) captureManagedRepairSource(ctx context.Context, r ManagedMembersh
 	if len(data) == 0 || json.Unmarshal(data, &operation) != nil || !reflect.DeepEqual(operation.Request, change) || operation.Request.Remove != r.OldNodeID || operation.Request.Add != nil || !operation.ManagedExcludedRead || !reflect.DeepEqual(operation.Target, n.core.CurrentCluster()) {
 		return ManagedRepairSource{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairSource{}, err
 	}
@@ -410,6 +421,38 @@ func (n *Node) ChangeManagedMembership(ctx context.Context, r ManagedMembershipR
 	return n.runManagedMembership(ctx, r, nil)
 }
 
+// AbortManagedRepairAddition certifies an unfinished managed ADD under the
+// surviving source quorum. The exact journaled learner request is required.
+func (n *Node) AbortManagedRepairAddition(ctx context.Context, r ManagedMembershipRequest) (ManagedRepairAbort, error) {
+	if n == nil || r.Action != ManagedMembershipAdd || r.Addition == nil {
+		return ManagedRepairAbort{}, network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	if err := n.managedRepairReady(); err != nil {
+		return ManagedRepairAbort{}, err
+	}
+	change := r.change(string(n.config.ClusterID))
+	ctx = context.WithValue(ctx, managedMembershipPermitKey{}, managedMembershipPermit{request: r, change: change})
+	if err := n.abortMembership(ctx, change); err != nil {
+		return ManagedRepairAbort{}, err
+	}
+	slot, _, aborted := n.core.LastReconfigurationAbort()
+	current := n.core.CurrentCluster()
+	if !aborted || slot <= r.ExpectedAbortSlot || current.ConfigID != r.ExpectedConfigID {
+		return ManagedRepairAbort{}, network.ErrRequestConflict
+	}
+	certified, ok := n.core.CertifiedValue(slot)
+	if !ok {
+		return ManagedRepairAbort{}, fmt.Errorf("managed ADD abort decision unavailable")
+	}
+	control, err := quepaxa.DecodeReconfiguration(certified.Value)
+	if err != nil || !control {
+		return ManagedRepairAbort{}, network.ErrRequestConflict
+	}
+	return ManagedRepairAbort{ConfigID: current.ConfigID, Slot: slot, Hash: fmt.Sprintf("%x", certified.Hash)}, nil
+}
+
 func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequest, capture *ManagedRepairSource) error {
 	if n == nil {
 		return network.ErrNotReady
@@ -481,7 +524,7 @@ func (n *Node) validateManagedMembership(ctx context.Context, change network.Mem
 	if n.config == nil || n.core == nil || n.bucket == nil {
 		return network.ErrNotReady
 	}
-	if !ok || abort || change.Fence != nil || !reflect.DeepEqual(permit.change, change) {
+	if !ok || change.Fence != nil || !reflect.DeepEqual(permit.change, change) || abort && permit.request.Action != ManagedMembershipAdd {
 		return network.ErrNotReady
 	}
 	checker, ok := n.managedStartup.Checker.(ManagedMembershipChecker)
