@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -304,11 +305,11 @@ func AbandonV1Alpha2ReplicaCheck(ctx context.Context, store *V1Alpha2StatusStore
 	}
 	check, ok, err := old.ReplicaCheck()
 	if err != nil || !ok || check.ID != checkID {
-		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica check changed")
+		return replicaChanged(ctx, store, old, errors.Join(fmt.Errorf("replica check changed"), err))
 	}
 	step, active, err := old.ReplicaStep()
 	if err != nil || !active {
-		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step changed")
+		return replicaChanged(ctx, store, old, errors.Join(fmt.Errorf("replica step changed"), err))
 	}
 	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, _ map[string]json.RawMessage) {
 		delete(status, "replicaCheck")
@@ -316,6 +317,53 @@ func AbandonV1Alpha2ReplicaCheck(ctx context.Context, store *V1Alpha2StatusStore
 			step.CheckID = ""
 			status["replicaStep"], _ = json.Marshal(step)
 		}
+	})
+}
+
+func replicaChanged(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, cause error) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if store == nil || old.status.store != store || old.status.object == nil {
+		return V1Alpha2AdmissionSnapshot{}, "", errors.Join(cause, fmt.Errorf("invalid admission snapshot"))
+	}
+	live, err := store.Load(ctx, old.status.ref)
+	if err != nil {
+		return V1Alpha2AdmissionSnapshot{}, "", errors.Join(cause, err)
+	}
+	if live.ResourceVersion() != old.ResourceVersion() {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("%w: %v", ErrV1Alpha2StatusConflict, cause)
+	}
+	return V1Alpha2AdmissionSnapshot{}, "", cause
+}
+
+// AbandonV1Alpha2ReplicaStep clears a step only while membership is still at
+// its source count. A closed repair must be finished before its step is cleared.
+func AbandonV1Alpha2ReplicaStep(ctx context.Context, store *V1Alpha2StatusStore, old V1Alpha2AdmissionSnapshot, expected V1Alpha2AuthorityView, voters int32) (V1Alpha2AdmissionSnapshot, V1Alpha2CASObservation, error) {
+	if old.Authority() != expected {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step authority mismatch")
+	}
+	if _, external, err := old.ReplicaProposal(); err != nil || !external {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step requires external replica control")
+	}
+	parsed, applied, err := parseV1Alpha2ReplicaStep(old.status)
+	if err != nil || parsed == nil {
+		return replicaChanged(ctx, store, old, errors.Join(fmt.Errorf("replica step changed"), err))
+	}
+	step := *parsed
+	if voters != step.From {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step cancellation requires the source voter count")
+	}
+	if applied != nil && *applied != step.From {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step cancellation would lower the certified voter count")
+	}
+	if replicaStepPending(old) {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("transition or pending write blocks replica step cancellation")
+	}
+	if repair, ok := old.Repair(); ok && repair.State != "Aborted" {
+		return V1Alpha2AdmissionSnapshot{}, "", fmt.Errorf("replica step cancellation requires the repair to finish first")
+	}
+	return updateV1Alpha2AdmissionStatus(ctx, store, old, func(status, _ map[string]json.RawMessage) {
+		delete(status, "replicaStep")
+		delete(status, "replicaCheck")
+		status["appliedVoterCount"], _ = json.Marshal(step.From)
 	})
 }
 

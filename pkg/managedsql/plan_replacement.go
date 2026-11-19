@@ -40,9 +40,6 @@ func (h *Host) PlanVoterReplacement(ctx context.Context, replacement operator.V1
 		}
 	}
 	if r, ok := a.Repair(); ok && r.State == "Closed" {
-		if _, err := operator.ValidateV1Alpha2RepairPodBinding(ctx, h.cfg.Store, h.cfg.Ref, r.Plan); err != nil {
-			return nil, fmt.Errorf("closed repair candidate unavailable; retargeting forbidden: %w", err)
-		}
 		return &r.Plan, nil
 	}
 	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})

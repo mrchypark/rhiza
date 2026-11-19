@@ -185,6 +185,9 @@ func TestV1Alpha2ReplicaDownCheckIsFreshAndOneUse(t *testing.T) {
 	if err != nil || observation != V1Alpha2CASApplied {
 		t.Fatalf("abandon old check: %s %v", observation, err)
 	}
+	if _, _, err := AbandonV1Alpha2ReplicaCheck(ctx, store, proven, proven.Authority(), check.ID); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+		t.Fatalf("stale challenge abandon error=%v, want status conflict", err)
+	}
 	nextCheck := V1Alpha2ReplicaCheck{ID: "next-check", DeploymentResourceVersion: "92", ExpiresAt: time.Now().Add(time.Minute)}
 	replaced, observation, err := BeginV1Alpha2ReplicaCheck(ctx, store, abandoned, abandoned.Authority(), nextCheck)
 	if err != nil || observation != V1Alpha2CASApplied {
@@ -216,6 +219,37 @@ func TestV1Alpha2ReplicaCheckConcurrentBeginKeepsFirst(t *testing.T) {
 	check, ok, err := live.ReplicaCheck()
 	if err != nil || !ok || check.ID != first.ID {
 		t.Fatalf("first check lost: %+v present=%t err=%v", check, ok, err)
+	}
+}
+
+func TestV1Alpha2ReplicaStepSafeCancelAndStaleAbandon(t *testing.T) {
+	ctx := context.Background()
+	step := V1Alpha2ReplicaStep{Generation: 2, DeploymentUID: "deployment", DeploymentResourceVersion: "91", ConfigID: 5, From: 4, To: 3, ExpiresAt: time.Now().Add(time.Minute)}
+	store, _, old := replicaCASSetup(t, replicaStatusObject(t, 3, &step, nil))
+	if _, _, err := AbandonV1Alpha2ReplicaStep(ctx, store, old, old.Authority(), 3); err == nil {
+		t.Fatal("canceled a step after membership advanced")
+	}
+	cleared, observation, err := AbandonV1Alpha2ReplicaStep(ctx, store, old, old.Authority(), 4)
+	if err != nil || observation != V1Alpha2CASApplied {
+		t.Fatalf("safe cancel: %s %v", observation, err)
+	}
+	if _, ok, err := cleared.ReplicaStep(); err != nil || ok {
+		t.Fatalf("canceled step remained: present=%t err=%v", ok, err)
+	}
+	if target, err := cleared.TargetVoterCount(); err != nil || target != 4 {
+		t.Fatalf("safe cancel changed certified target: %d %v", target, err)
+	}
+	if _, _, err := AbandonV1Alpha2ReplicaStep(ctx, store, old, old.Authority(), 4); !errors.Is(err, ErrV1Alpha2StatusConflict) {
+		t.Fatalf("stale cancel error=%v, want status conflict", err)
+	}
+	checkStore, _, pendingCheck := replicaCASSetup(t, replicaStatusObject(t, 3, &step, nil))
+	check := V1Alpha2ReplicaCheck{ID: "check", DeploymentResourceVersion: "91", ExpiresAt: time.Now().Add(time.Minute)}
+	withCheck, _, err := BeginV1Alpha2ReplicaCheck(ctx, checkStore, pendingCheck, pendingCheck.Authority(), check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AbandonV1Alpha2ReplicaStep(ctx, checkStore, withCheck, withCheck.Authority(), 4); err != nil {
+		t.Fatalf("cancel with one-use check: %v", err)
 	}
 }
 

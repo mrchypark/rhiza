@@ -61,6 +61,9 @@ func CheckRepairGate(ctx context.Context, kube *operator.Kubernetes, ref operato
 	if !ok || r.PreparedHandoff == nil {
 		return empty, output, ErrLearnerAdmissionPending
 	}
+	if r.State == "Aborted" {
+		return empty, output, ErrLearnerAdmissionPending
+	}
 	if !bytes.Equal(bytes.TrimSpace(a.Transition()), []byte("null")) && len(bytes.TrimSpace(a.Transition())) != 0 {
 		return empty, output, errors.New("repair overlaps authority transition")
 	}
@@ -71,6 +74,9 @@ func CheckRepairGate(ctx context.Context, kube *operator.Kubernetes, ref operato
 	if r.State == "Completed" && p.Replacement.PodUID != podUID {
 		// The previous repair stays in status until the controller records
 		// this new Pod's plan. Its terminal never authorizes the new Pod.
+		return empty, output, ErrLearnerAdmissionPending
+	}
+	if r.State == "Closed" && (p.Replacement.PodName != podName || p.Replacement.PodUID != podUID) {
 		return empty, output, ErrLearnerAdmissionPending
 	}
 	if r.State != "Closed" && !(allowCompleted && r.State == "Completed") {
@@ -598,7 +604,7 @@ func ManagedRepairConfig(ctx context.Context, kube *operator.Kubernetes, ref ope
 		return empty, noop, err
 	}
 	var bootstrap operator.V1Alpha2BootstrapPlan
-	if err := ReadGateFile(bootstrapPath, &bootstrap, 65536, false); err != nil || !reflect.DeepEqual(bootstrap, plan) {
+	if err := ReadGateFile(bootstrapPath, &bootstrap, operator.V1Alpha2BootstrapHandoffLimit, false); err != nil || !reflect.DeepEqual(bootstrap, plan) {
 		return empty, noop, errors.New("bootstrap handoff differs from committed original plan")
 	}
 	cfg, err := ManagedRuntimeConfig(ctx, kube, ref, podUID, identity, profile, plan)

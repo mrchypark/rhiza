@@ -49,6 +49,12 @@ type ManagedRepairSource struct {
 	PreparedHash   [32]byte
 }
 
+type ManagedRepairAbort struct {
+	ConfigID uint
+	Slot     quepaxa.Slot
+	Hash     string
+}
+
 // ManagedRepairPreparationChecker authorizes only the read-only source capture
 // that precedes an ADD-first repair. It is separate from the membership
 // mutator capability and cannot authorize a consensus change.
@@ -410,6 +416,38 @@ func (n *Node) ChangeManagedMembership(ctx context.Context, r ManagedMembershipR
 	return n.runManagedMembership(ctx, r, nil)
 }
 
+// AbortManagedRepairAddition certifies an unfinished managed ADD under the
+// surviving source quorum. The exact journaled learner request is required.
+func (n *Node) AbortManagedRepairAddition(ctx context.Context, r ManagedMembershipRequest) (ManagedRepairAbort, error) {
+	if n == nil || r.Action != ManagedMembershipAdd || r.Addition == nil {
+		return ManagedRepairAbort{}, network.ErrInvalidRequest
+	}
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	if err := n.managedRepairReady(); err != nil {
+		return ManagedRepairAbort{}, err
+	}
+	change := r.change(string(n.config.ClusterID))
+	ctx = context.WithValue(ctx, managedMembershipPermitKey{}, managedMembershipPermit{request: r, change: change})
+	if err := n.abortMembership(ctx, change); err != nil {
+		return ManagedRepairAbort{}, err
+	}
+	slot, _, aborted := n.core.LastReconfigurationAbort()
+	current := n.core.CurrentCluster()
+	if !aborted || slot <= r.ExpectedAbortSlot || current.ConfigID != r.ExpectedConfigID {
+		return ManagedRepairAbort{}, network.ErrRequestConflict
+	}
+	certified, ok := n.core.CertifiedValue(slot)
+	if !ok {
+		return ManagedRepairAbort{}, fmt.Errorf("managed ADD abort decision unavailable")
+	}
+	control, err := quepaxa.DecodeReconfiguration(certified.Value)
+	if err != nil || !control {
+		return ManagedRepairAbort{}, network.ErrRequestConflict
+	}
+	return ManagedRepairAbort{ConfigID: current.ConfigID, Slot: slot, Hash: fmt.Sprintf("%x", certified.Hash)}, nil
+}
+
 func (n *Node) runManagedMembership(ctx context.Context, r ManagedMembershipRequest, capture *ManagedRepairSource) error {
 	if n == nil {
 		return network.ErrNotReady
@@ -481,7 +519,7 @@ func (n *Node) validateManagedMembership(ctx context.Context, change network.Mem
 	if n.config == nil || n.core == nil || n.bucket == nil {
 		return network.ErrNotReady
 	}
-	if !ok || abort || change.Fence != nil || !reflect.DeepEqual(permit.change, change) {
+	if !ok || change.Fence != nil || !reflect.DeepEqual(permit.change, change) || abort && permit.request.Action != ManagedMembershipAdd {
 		return network.ErrNotReady
 	}
 	checker, ok := n.managedStartup.Checker.(ManagedMembershipChecker)

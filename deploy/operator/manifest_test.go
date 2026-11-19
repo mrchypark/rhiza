@@ -157,6 +157,7 @@ func TestClusterCRDReplicaScaleContract(t *testing.T) {
 		t.Fatalf("selector is not bounded: %v", selector)
 	}
 	foundProofCheck := false
+	foundSafeCancel := false
 	for _, raw := range status["x-kubernetes-validations"].([]any) {
 		message := raw.(map[string]any)["message"].(string)
 		switch message {
@@ -168,10 +169,15 @@ func TestClusterCRDReplicaScaleContract(t *testing.T) {
 			t.Fatal("selector equality exceeds the status CEL budget")
 		case "replica step proof requires the current one-use check":
 			foundProofCheck = true
+		case "clearing a replica step requires its exact certified terminal or an unchanged safe cancel":
+			foundSafeCancel = true
 		}
 	}
 	if !foundProofCheck {
 		t.Fatal("missing one-use proof CEL")
+	}
+	if !foundSafeCancel {
+		t.Fatal("missing safe replica step cancellation CEL")
 	}
 }
 

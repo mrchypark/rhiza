@@ -231,6 +231,9 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 		if _, _, err := operator.CaptureV1Alpha2RepairHandoff(context.Background(), store, closed, closed.Authority(), capture); err != nil {
 			t.Fatal(err)
 		}
+		if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "next-pod", "next-uid", replacementIdentity, false); !errors.Is(err, errLearnerAdmissionPending) {
+			t.Fatalf("concurrent replacement did not remain retryable behind Closed repair: %v", err)
+		}
 		bootstrapOutput, repairOutput := filepath.Join(dir, "original-bootstrap.json"), filepath.Join(dir, "repair.json")
 		if err := awaitBootstrapWithRepair(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, bootstrapOutput, repairOutput); err != nil {
 			t.Fatal(err)
@@ -273,6 +276,21 @@ func TestAwaitCommittedPlanAndLiveGuards(t *testing.T) {
 			}
 			if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, false); err == nil || errors.Is(err, errLearnerAdmissionPending) {
 				t.Fatalf("same Pod must not turn a terminal into first-start permission: %v", err)
+			}
+		})
+		t.Run("aborted repair remains retryable", func(t *testing.T) {
+			prior := bytes.Clone(clusterJSON)
+			defer func() { clusterJSON = prior }()
+			prepared, err := operator.LoadV1Alpha2Admission(context.Background(), store, ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			abort := operator.V1Alpha2RepairCompletion{OperationID: intent.OperationID, PlanDigest: intent.Digest(), ExpectedConfigID: intent.ExpectedConfigID, ExpectedAbortSlot: intent.ExpectedAbortSlot, Kind: "Abort", ConfigID: intent.ExpectedConfigID, Slot: intent.ExpectedAbortSlot + 18, Hash: strings.Repeat("d", 64)}
+			if _, _, err := operator.FinishV1Alpha2Repair(context.Background(), store, prepared, prepared.Authority(), abort); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := checkRepairGate(context.Background(), k, ref, 0, "pod-name", "replacement-uid", replacementIdentity, false); !errors.Is(err, errLearnerAdmissionPending) {
+				t.Fatalf("aborted repair was not retryable: %v", err)
 			}
 		})
 		// This HTTP gate fixture establishes no consensus proof. A later valid

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -78,6 +79,13 @@ func validateMixedRepairBudget(raw json.RawMessage) error {
 	}
 	// Terminal completion is larger than Abort and retains the same handoff.
 	// Preserve every existing field while projecting the complete successor.
+	if repairSequence(plan) == V1Alpha2RepairAddThenRemove {
+		intermediate := slices.DeleteFunc(slices.Clone(plan.FinalVoterIDs), func(id types.NodeID) bool { return id == plan.Replacement.NodeID })
+		intermediate = append(intermediate, plan.OldNodeID)
+		slices.Sort(intermediate)
+		addition := V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Terminal", ConfigID: plan.ExpectedConfigID + 1, Slot: math.MaxInt64 - 1, Hash: fmt.Sprintf("%064x", 0), FinalVoterIDs: intermediate}
+		record["addCompletion"], _ = json.Marshal(addition)
+	}
 	completion := V1Alpha2RepairCompletion{OperationID: plan.OperationID, PlanDigest: plan.Digest(), ExpectedConfigID: plan.ExpectedConfigID, ExpectedAbortSlot: plan.ExpectedAbortSlot, Kind: "Terminal", ConfigID: math.MaxInt64, Slot: math.MaxInt64, Hash: fmt.Sprintf("%064x", 0), FinalVoterIDs: plan.FinalVoterIDs}
 	record["state"] = json.RawMessage(`"Completed"`)
 	record["completion"], _ = json.Marshal(completion)

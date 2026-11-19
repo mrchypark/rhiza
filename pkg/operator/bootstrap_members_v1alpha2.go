@@ -27,6 +27,7 @@ const (
 	V1Alpha2ManagedRuntimeProfileKey    = "runtime.json"
 	V1Alpha2ManagedRuntimeProfileVolume = "rhiza-runtime-profile"
 	V1Alpha2BootstrapHandoffPath        = "/var/lib/rhiza/bootstrap.json"
+	V1Alpha2BootstrapHandoffLimit       = 1 << 20
 	V1Alpha2ManagedHostServiceAccount   = "rhiza-managed-host"
 )
 

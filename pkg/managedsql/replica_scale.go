@@ -62,6 +62,13 @@ func (h *Host) ReconcileExternalReplicas(ctx context.Context) (string, error) {
 		return "step", err
 	}
 	if present {
+		canceled, err := h.cancelReplicaStepOnVoterLoss(ctx, a, step)
+		if err != nil {
+			return "step-cancel", err
+		}
+		if canceled {
+			return "step-canceled", nil
+		}
 		return h.reconcileActiveReplicaStep(ctx, a, step)
 	}
 	if h.replicaDecisionBlocked(a) {
@@ -410,6 +417,13 @@ func (h *Host) resumeExternalReplicaRepair(ctx context.Context, record operator.
 		if err := h.replaceVoterLocked(ctx, record.Plan); err != nil {
 			return "resume-add", err
 		}
+		latest, err := h.live(ctx)
+		if err != nil {
+			return "resume-add", err
+		}
+		if current, ok := latest.Repair(); ok && current.State == "Aborted" {
+			return "resume-add", h.abandonReplicaStep(ctx, step)
+		}
 		return h.finishReplicaStepAfterRepair(ctx, step)
 	case operator.V1Alpha2RepairLeave:
 		snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
@@ -463,6 +477,63 @@ func (h *Host) resumeExternalReplicaRepair(ctx context.Context, record operator.
 	default:
 		return "ordinary-repair", nil
 	}
+}
+
+func (h *Host) cancelReplicaStepOnVoterLoss(ctx context.Context, a operator.V1Alpha2AdmissionSnapshot, step operator.V1Alpha2ReplicaStep) (bool, error) {
+	if h.replicaDecisionBlocked(a) {
+		return false, nil
+	}
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil || snapshot.PendingOK || snapshot.Current.ConfigID != uint(step.ConfigID) || len(snapshot.Current.Members) != int(step.From) {
+		return false, err
+	}
+	pods, err := h.observePods(ctx)
+	if err != nil {
+		return false, err
+	}
+	missing := 0
+	present := make(map[quepaxa.NodeID]bool, len(pods))
+	for _, pod := range pods {
+		present[pod.Member.NodeID] = true
+	}
+	for _, member := range snapshot.Current.Members {
+		if !present[member.ID] {
+			missing++
+		}
+	}
+	if missing == 0 || step.To < step.From && missing == 1 {
+		return false, nil
+	}
+	return true, h.abandonReplicaStep(ctx, step)
+}
+
+func (h *Host) abandonReplicaStep(ctx context.Context, step operator.V1Alpha2ReplicaStep) error {
+	snapshot, err := h.node.ManagedRepairSnapshot(ctx, "", quepaxa.PublicKey{})
+	if err != nil {
+		return err
+	}
+	if snapshot.PendingOK || snapshot.Current.ConfigID != uint(step.ConfigID) || len(snapshot.Current.Members) != int(step.From) {
+		return fmt.Errorf("replica step cancellation requires unchanged source membership")
+	}
+	latest, err := h.live(ctx)
+	if err != nil {
+		return err
+	}
+	current, present, err := latest.ReplicaStep()
+	if err != nil || !present || !sameReplicaStep(current, step) || h.replicaDecisionBlocked(latest) {
+		return errors.Join(fmt.Errorf("replica step changed before safe cancel"), err)
+	}
+	if record, ok := latest.Repair(); ok && record.State != "Aborted" {
+		return fmt.Errorf("replica step repair must finish before cancellation")
+	}
+	_, observation, err := operator.AbandonV1Alpha2ReplicaStep(ctx, h.cfg.Store, latest, h.authority, int32(len(snapshot.Current.Members)))
+	if err != nil {
+		return err
+	}
+	if observation != operator.V1Alpha2CASApplied {
+		return fmt.Errorf("replica step cancellation CAS outcome %s", observation)
+	}
+	return nil
 }
 
 func (h *Host) verifyReplicaLeaveBeforeRemove(ctx context.Context, record operator.V1Alpha2RepairRecord, proof replicaLeaveProof) error {

@@ -325,12 +325,8 @@ func managedCandidateSpecMatches(raw, expected json.RawMessage) bool {
 			if json.Unmarshal(c["image"], &image) != nil {
 				return false
 			}
-			policy := `"IfNotPresent"`
-			last := image[strings.LastIndex(image, "/")+1:]
-			if !strings.Contains(image, "@") && (!strings.Contains(last, ":") || strings.HasSuffix(last, ":latest")) {
-				policy = `"Always"`
-			}
-			defaults["imagePullPolicy"] = policy
+			policy, _ := json.Marshal(defaultImagePullPolicy(image))
+			defaults["imagePullPolicy"] = string(policy)
 			strip(c, defaults)
 		}
 		pod[key], _ = json.Marshal(containers)
@@ -678,10 +674,11 @@ func initializeV1Alpha2ListWith(ctx context.Context, kube *Kubernetes, reconcile
 			return fmt.Errorf("invalid cluster list")
 		}
 		version = page.Metadata.ResourceVersion
-		for _, raw := range page.Items {
+		for itemIndex, raw := range page.Items {
 			c, err := DecodeV1Alpha2Cluster(raw)
 			if err != nil {
-				return fmt.Errorf("invalid list item")
+				log.Printf("initializer list item %d failed: %v", itemIndex, err)
+				continue
 			}
 			var ref V1Alpha2ClusterRef
 			var rv string
