@@ -138,10 +138,10 @@ func TestPostSubmitActualConflictRemainsConflict(t *testing.T) {
 func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
 	for _, kind := range []string{"sql", "kv"} {
 		t.Run(kind, func(t *testing.T) {
-			t.Parallel()
 			ctx := context.Background()
+			const window = 1024
 			core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
-			m, err := materializer.Open(t.TempDir()+"/state.sqlite", 1, 1024)
+			m, err := materializer.Open(t.TempDir()+"/state.sqlite", 1, window)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -162,7 +162,7 @@ func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
 					calls.Add(1)
 					slotApplied.Store(uint64(slot))
 					barrier := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})
-					for core.Tip() < slot+1024 {
+					for core.Tip() < slot+window {
 						if _, _, err := core.Propose(ctx, barrier); err != nil {
 							return slot, err
 						}

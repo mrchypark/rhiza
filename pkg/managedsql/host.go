@@ -204,8 +204,12 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 		localtesthooks.Hit("managed-host:graph-bootstrap:source-checked")
 	}
 	graphBootstrap := cfg.Plan.ApplicationProtocol == sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol
-	if graphBootstrap && initial.Assignment().State == "Unused" {
-		localtesthooks.Hit("managed-host:graph-bootstrap:before-unused-source-check")
+	if initial.Assignment().State == "Unused" {
+		if graphBootstrap {
+			localtesthooks.Hit("managed-host:graph-bootstrap:before-unused-source-check")
+		} else {
+			localtesthooks.Hit("managed-host:sql-bootstrap:before-unused-source-check")
+		}
 		initial, err = h.loadStartupInitialization(ctx)
 		if err != nil {
 			return nil, logManagedHostOpenFailure(openStage, err)
@@ -218,7 +222,9 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 			return nil, logManagedHostOpenFailure(openStage, err)
 		}
 		reserved := a.EverApplicationReserved()
-		if _, pending := a.Pending(); reserved || pending {
+		if _, pending := a.Pending(); reserved || pending || !graphBootstrap {
+			// Policy 9 has no control-only bootstrap phase. Once a peer consumes
+			// E0, this Pod must not retain a stale empty-source privilege.
 			h.identity.Fresh = false
 		}
 	}
@@ -239,18 +245,20 @@ func Open(ctx context.Context, cfg Config) (*Host, error) {
 	if initial.Assignment().State == "Unused" {
 		if graphBootstrap {
 			localtesthooks.Hit("managed-host:graph-bootstrap:before-unused-evidence")
-			initial, err = h.loadStartupInitialization(ctx)
-			if err != nil {
+		} else {
+			localtesthooks.Hit("managed-host:sql-bootstrap:before-unused-evidence")
+		}
+		initial, err = h.loadStartupInitialization(ctx)
+		if err != nil {
+			return h, logManagedHostOpenFailure(openStage, err)
+		}
+		if initial.Assignment().State == "Consumed" {
+			// Do not inspect a now-live runtime as empty or attempt another
+			// E0. Admission remains an independent live check.
+			if _, err := h.live(ctx); err != nil {
 				return h, logManagedHostOpenFailure(openStage, err)
 			}
-			if initial.Assignment().State == "Consumed" {
-				// Do not inspect a now-live runtime as empty or attempt another
-				// E0. Admission remains an independent live check.
-				if _, err := h.live(ctx); err != nil {
-					return h, logManagedHostOpenFailure(openStage, err)
-				}
-				return h, nil
-			}
+			return h, nil
 		}
 		evidence, err := h.inspectEvidence(ctx, true, false)
 		if err != nil {

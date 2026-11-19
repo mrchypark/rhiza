@@ -106,7 +106,7 @@ func (n *Node) VerifyManagedRepairCompletion(ctx context.Context, request Manage
 	if !reflect.DeepEqual(current, operation.Target) {
 		return ManagedRepairCompletion{}, network.ErrRequestConflict
 	}
-	terminal, err := n.retainedMembershipTerminal(operation)
+	terminal, err := n.retainedMembershipTerminal(ctx, operation)
 	if err != nil {
 		return ManagedRepairCompletion{}, err
 	}

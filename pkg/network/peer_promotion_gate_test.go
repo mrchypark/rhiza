@@ -71,6 +71,30 @@ func testLearnerPromotionGate(t *testing.T, borrowed bool) {
 	if err == nil || core.Tip() != 0 {
 		t.Fatalf("VerifyPrefix bypassed promotion gate: tip=%d err=%v", core.Tip(), err)
 	}
+	var sourceDecision quepaxa.Decision
+	if err := json.Unmarshal(values[0].Certificate, &sourceDecision); err != nil {
+		t.Fatal(err)
+	}
+	sourceDecision.Proposal.Value = values[0].Value
+	recordCtx, cancelRecord := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	recordDone := make(chan error, 1)
+	go func() {
+		_, err := peer.handle(recordCtx, source.member.PublicKey[:], &peerfb.RequestT{
+			ClusterId: "cluster", ConfigId: 1, SenderId: "a", Operation: peerfb.OperationRecord,
+			Record: &peerfb.RecordRequestT{Slot: 1, Step: 4, Proposal: proposalToWire(sourceDecision.Proposal)},
+		})
+		recordDone <- err
+	}()
+	select {
+	case err := <-recordDone:
+		t.Fatalf("Record bypassed promotion gate before adopted suffix replay: %v", err)
+	case <-recordCtx.Done():
+	}
+	if core.RecorderTip() != 0 {
+		t.Fatalf("blocked Record mutated recorder tip: %d", core.RecorderTip())
+	}
+	cancelRecord()
+	<-recordDone
 	close(ready)
 	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
