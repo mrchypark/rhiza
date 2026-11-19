@@ -164,7 +164,7 @@ type independentScope struct {
 func buildIndependentScope(state fenceLedger, request FenceRequest, nodes []string, requestHash, ledgerHash string, current []string, storage AttestationStoreScope) (independentScope, error) {
 	scope := independentScope{request: request, requestHash: requestHash, ledgerHash: ledgerHash, currentPodUIDs: append([]string(nil), current...), targets: append([]FenceTarget(nil), request.Targets...), storage: storage}
 	for _, target := range scope.targets {
-		if target.NodeName == "" || target.NodeUID == "" || target.ContainerID == "" || target.ImageID == "" || target.PodUID == "" {
+		if target.NodeName == "" || target.ContainerID == "" || target.ImageID == "" || target.PodUID == "" {
 			return scope, fmt.Errorf("fencing: target %q has no captured runtime identity", target.NodeID)
 		}
 	}

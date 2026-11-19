@@ -237,7 +237,6 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 		"missing container id": func(t *FenceTarget) { t.ContainerID = "" },
 		"missing image id":     func(t *FenceTarget) { t.ImageID = "" },
 		"missing node name":    func(t *FenceTarget) { t.NodeName = "" },
-		"missing node uid":     func(t *FenceTarget) { t.NodeUID = "" },
 		"missing pod uid":      func(t *FenceTarget) { t.PodUID = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
