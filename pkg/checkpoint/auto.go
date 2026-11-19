@@ -92,6 +92,10 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 			lastCheckpoint = latest.Index
 		}
 		lastCheckpointAt := time.Now()
+		lastCheckpointBytes := int64(0)
+		if a.tailBytes != nil {
+			lastCheckpointBytes = a.tailBytes()
+		}
 
 		for {
 			select {
@@ -104,7 +108,7 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 					return
 				}
 				timeDue := time.Since(lastCheckpointAt) >= a.duration
-				tailDue := a.tailBytes != nil && a.tailBudget > 0 && a.tailBytes() >= a.tailBudget
+				tailDue := a.tailBytes != nil && checkpointTailDue(a.tailBytes(), lastCheckpointBytes, a.tailBudget)
 				if !timeDue && !tailDue {
 					continue
 				}
@@ -135,10 +139,17 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 
 				lastCheckpoint = appliedTip
 				lastCheckpointAt = time.Now()
+				if a.tailBytes != nil {
+					lastCheckpointBytes = a.tailBytes()
+				}
 
 			}
 		}
 	}()
+}
+
+func checkpointTailDue(current, certified, budget int64) bool {
+	return budget > 0 && current > certified && current-certified >= budget
 }
 
 // Stop cancels and joins automatic checkpoint work, including active callbacks.

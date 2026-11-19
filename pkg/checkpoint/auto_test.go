@@ -64,6 +64,15 @@ func TestAutoCheckpointerStopCancelsAndJoinsBefore(t *testing.T) {
 	auto.Stop()
 }
 
+func TestCheckpointTailDueUsesDeltaSinceCertifiedCheckpoint(t *testing.T) {
+	if checkpointTailDue(640<<20, 600<<20, 512<<20) {
+		t.Fatal("cumulative WAL size retriggered after a certified checkpoint")
+	}
+	if !checkpointTailDue(512<<20, 0, 512<<20) || !checkpointTailDue(520<<20, 8<<20, 512<<20) {
+		t.Fatal("tail delta did not trigger")
+	}
+}
+
 func TestAutoCheckpointerStopCancelsAndJoinsClaimWork(t *testing.T) {
 	for _, phase := range []string{"advance", "publish"} {
 		t.Run(phase, func(t *testing.T) {
