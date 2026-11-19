@@ -320,14 +320,15 @@ type clusterTransport struct {
 	catchup      sync.Map
 	cores        map[NodeID]*Core
 	down         map[NodeID]bool
+	recordDown   map[NodeID]bool
 	dropDecision map[NodeID]bool
 }
 
 func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
 	transport.mu.RLock()
-	core, down := transport.cores[to], transport.down[to]
+	core, down, recordDown := transport.cores[to], transport.down[to], transport.recordDown[to]
 	transport.mu.RUnlock()
-	if down {
+	if down || recordDown {
 		return Summary{}, errors.New("replica down")
 	}
 	if through := core.RecordCatchUpThrough(request); through > core.Tip() {
@@ -362,12 +363,18 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 func (transport *clusterTransport) SendDecision(ctx context.Context, decision Decision) error {
 	transport.mu.RLock()
 	coreCount := len(transport.cores)
-	targets := make([]*Core, 0, len(transport.cores))
+	type target struct {
+		core       *Core
+		waitPrefix bool
+	}
+	targets := make([]target, 0, len(transport.cores))
 	var nextMembers, added map[NodeID]Member
 	for id, core := range transport.cores {
+		waitPrefix := false
 		if core.reconfigEnabled {
 			old, next := core.ClusterForSlot(decision.Slot), core.ClusterForSlot(decision.Slot+1)
 			if old.ConfigID != next.ConfigID {
+				waitPrefix = true
 				nextMembers, added = next.MemberSet(), next.MemberSet()
 				for _, member := range old.Members {
 					delete(added, member.ID)
@@ -375,7 +382,7 @@ func (transport *clusterTransport) SendDecision(ctx context.Context, decision De
 			}
 		}
 		if !transport.down[id] && !transport.dropDecision[id] {
-			targets = append(targets, core)
+			targets = append(targets, target{core: core, waitPrefix: waitPrefix})
 		}
 	}
 	transport.mu.RUnlock()
@@ -384,15 +391,15 @@ func (transport *clusterTransport) SendDecision(ctx context.Context, decision De
 		err error
 	}
 	results := make(chan result, len(targets))
-	for _, core := range targets {
+	for _, target := range targets {
 		go func() {
-			if nextMembers != nil {
-				if err := core.WaitTip(ctx, decision.Slot-1); err != nil {
-					results <- result{core.nodeID, err}
+			if target.waitPrefix {
+				if err := target.core.WaitTip(ctx, decision.Slot-1); err != nil {
+					results <- result{target.core.nodeID, err}
 					return
 				}
 			}
-			results <- result{core.nodeID, core.AcceptDecision(decision)}
+			results <- result{target.core.nodeID, target.core.AcceptDecision(decision)}
 		}()
 	}
 	successes := 0
@@ -468,6 +475,15 @@ func (transport *clusterTransport) fail(ids ...NodeID) {
 	for _, id := range ids {
 		transport.down[id] = true
 	}
+}
+
+func (transport *clusterTransport) failRecord(id NodeID, down bool) {
+	transport.mu.Lock()
+	if transport.recordDown == nil {
+		transport.recordDown = make(map[NodeID]bool)
+	}
+	transport.recordDown[id] = down
+	transport.mu.Unlock()
 }
 
 func (transport *clusterTransport) recover(ids ...NodeID) {

@@ -148,10 +148,10 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 	}
 
 	record := MembershipRecord{Genesis: genesis, Transitions: transitions}
-	if c.lastAbort != nil {
+	if c.lastAbort != nil && (through == 0 || c.lastAbort.Terminal.Slot <= through) {
 		abort := ConfigTransition{Freeze: cloneDecidedValue(c.lastAbort.Freeze), Terminal: cloneDecidedValue(c.lastAbort.Terminal)}
 		record.Abort = &abort
-	} else if c.baseMembership != nil && len(c.configHistory)-1 == baseTransitions && c.baseMembership.Abort != nil {
+	} else if c.baseMembership != nil && len(c.configHistory)-1 == baseTransitions && c.baseMembership.Abort != nil && (through == 0 || c.baseMembership.Abort.Terminal.Slot <= through) {
 		abort := cloneMembershipRecord(*c.baseMembership).Abort
 		record.Abort = abort
 	}

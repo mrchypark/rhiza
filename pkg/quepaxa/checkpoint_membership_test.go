@@ -593,6 +593,14 @@ func TestRestoreReplaysAbortAboveCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	core = restored
+	core.mu.RLock()
+	for slot := seal.Index + 1; slot <= tip; slot++ {
+		if !core.isDurableLocked(slot) || !core.isLoggedLocked(slot) {
+			core.mu.RUnlock()
+			t.Fatalf("retained suffix slot %d durable/logged flags were not restored", slot)
+		}
+	}
+	core.mu.RUnlock()
 	if got, ok := core.PrefixHash(tip); core.Tip() != tip || !ok || got != prefix {
 		t.Fatal("compaction changed checked prefix")
 	}
