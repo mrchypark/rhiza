@@ -445,6 +445,8 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 			return nil, err
 		}
 		v.putDecidedLocked(slot, value)
+		v.durable[slot] = true
+		v.logged[slot] = true
 		if v.reconfigEnabled {
 			if err := v.advanceReconfigurationTipLocked(); err != nil {
 				return nil, err
@@ -490,12 +492,12 @@ func (c *Core) installVerifiedBaseLocked(base consensusBase, v *Core) {
 	for slot, val := range v.decided {
 		if _, exists := c.decided[slot]; !exists {
 			c.putDecidedLocked(slot, val)
-			c.durable[slot] = true
-			c.logged[slot] = true
 			c.values[val.Hash] = append([]byte(nil), val.Value...)
 			c.valueDurable[val.Hash] = true
 			c.updateHashIndexLocked(val.Hash, slot)
 		}
+		c.durable[slot] = true
+		c.logged[slot] = true
 	}
 	if c.wal != nil {
 		if err := c.wal.ScanWithLocation(func(entry qlog.Entry, loc qlog.EntryLocation) error {
@@ -678,9 +680,16 @@ func (c *Core) installBaseLocked(base consensusBase) {
 		}
 		c.baseFollowingOrder = append([]NodeID(nil), base.FollowingLeaderOrder...)
 	}
+	for epoch := range c.epochStart {
+		if epoch < base.LeaderEpoch {
+			delete(c.epochStart, epoch)
+		}
+	}
 	c.tip = base.ClosedThrough
 	c.cold = nil
 	c.coldBase = 0
+	clear(c.coldLeaderSchedules)
+	c.coldLeaderOrder = nil
 	c.evictedThrough = base.ClosedThrough
 	clear(c.decisionLocs)
 	keptAbort := c.abortTerminalSlots[:0]

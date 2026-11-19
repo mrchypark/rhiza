@@ -96,6 +96,41 @@ func TestTerminalDecisionCancelsUnneededPeerHandshake(t *testing.T) {
 	t.Run("drains-before-close", testTerminalDecisionDrainsBeforeClose)
 }
 
+func TestFreezeDecisionReturnsOnOldQuorumAfterRecorderLoss(t *testing.T) {
+	clusterID := types.ClusterID("freeze-quorum-loss")
+	a := testMember(clusterID, "a", "a-token")
+	b, _, bAcked := terminalACKPeerControlled(t, clusterID, "b", "b-token", nil)
+	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blackhole.Close() })
+	c := testMember(clusterID, "c", "c-token")
+	c.PeerURL = "quic://" + blackhole.LocalAddr().String()
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{a, b, c}}
+	transport := NewTransport(clusterID, "a", &cluster, "a-token")
+	transport.quic = &quic.Config{HandshakeIdleTimeout: 500 * time.Millisecond, MaxIdleTimeout: 500 * time.Millisecond}
+	t.Cleanup(func() { _ = transport.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	decision := quepaxa.Decision{Slot: 1, Summaries: []quepaxa.Summary{
+		{RecorderID: "a", Step: 4},
+		{RecorderID: "c", Step: 4},
+	}}
+	go func() { done <- transport.sendFreezeDecision(ctx, decision) }()
+	awaitTerminalSignal(t, bAcked, "surviving voter ACK")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("freeze decision with one recorder lost: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("freeze decision did not complete on the surviving old-voter quorum")
+	}
+}
+
 func testTerminalDecisionDrainsBeforeClose(t *testing.T) {
 	clusterID := types.ClusterID("cluster-drain")
 	a := testMember(clusterID, "a", "a-token")
