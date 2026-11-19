@@ -231,11 +231,19 @@ func validateIndependentEvidence(scope independentScope, ev *IndependentEvidence
 	if ev.Provider == "" || ev.Mode == "" || ev.ObservedAt == "" || ev.BarrierID == "" {
 		return fmt.Errorf("fencing: independent evidence is incomplete")
 	}
+	observedAt, err := time.Parse(time.RFC3339, ev.ObservedAt)
+	if err != nil || observedAt.After(time.Now().Add(attestationClockSkew)) {
+		return fmt.Errorf("fencing: independent evidence observation time is invalid")
+	}
 	if ev.RequestHash != scope.requestHash || ev.LedgerHash != scope.ledgerHash {
 		return fmt.Errorf("fencing: independent evidence is bound to another request or ledger")
 	}
 	if ev.Barrier.Kind == "" || ev.Barrier.DeniedAt == "" || ev.Barrier.ClosedOperationID != scope.request.OperationID || ev.Barrier.ClosedRequestHash != scope.requestHash {
 		return fmt.Errorf("fencing: independent barrier evidence differs from the closed operation")
+	}
+	deniedAt, err := time.Parse(time.RFC3339, ev.Barrier.DeniedAt)
+	if err != nil || deniedAt.After(observedAt) {
+		return fmt.Errorf("fencing: barrier denial time is invalid")
 	}
 	if !sameStrings(ev.Barrier.CurrentPodUIDs, scope.currentPodUIDs) {
 		return fmt.Errorf("fencing: independent barrier names a different Pod inventory")

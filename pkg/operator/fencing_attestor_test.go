@@ -39,7 +39,7 @@ func independentEvidenceFor(req AttestationRequest) *AttestationResponse {
 			ClosedOperationID: req.Request.OperationID,
 			ClosedRequestHash: req.RequestHash,
 			CurrentPodUIDs:    append([]string(nil), req.CurrentPodUIDs...),
-			DeniedAt:          "2026-10-19T00:00:30Z",
+			DeniedAt:          "2026-10-18T23:59:30Z",
 		},
 		Storage: EvidenceStorage{
 			Provider:               req.StorageScope.Provider,
@@ -120,13 +120,16 @@ func TestIndependentEvidenceMustBindTheClosedScope(t *testing.T) {
 		"other closed request":     func(r *AttestationResponse) { r.Independent.Barrier.ClosedRequestHash = "other" },
 		"changed pod inventory":    func(r *AttestationResponse) { r.Independent.Barrier.CurrentPodUIDs = []string{"pod-0"} },
 		"missing barrier denial":   func(r *AttestationResponse) { r.Independent.Barrier.DeniedAt = "" },
-		"foreign pod uid":          func(r *AttestationResponse) { r.Independent.Runtimes[0].PodUID = "remote-pod" },
-		"foreign pod name":         func(r *AttestationResponse) { r.Independent.Runtimes[0].PodName = "rhiza-9" },
-		"foreign node name":        func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeName = "node-z" },
-		"foreign node uid":         func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "node-uid-z" },
-		"missing node uid":         func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "" },
-		"missing instance id":      func(r *AttestationResponse) { r.Independent.Runtimes[0].InstanceID = "" },
-		"foreign container":        func(r *AttestationResponse) { r.Independent.Runtimes[0].ContainerIDs = []string{"containerd://other"} },
+		"barrier denial after observation": func(r *AttestationResponse) {
+			r.Independent.Barrier.DeniedAt = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+		},
+		"foreign pod uid":     func(r *AttestationResponse) { r.Independent.Runtimes[0].PodUID = "remote-pod" },
+		"foreign pod name":    func(r *AttestationResponse) { r.Independent.Runtimes[0].PodName = "rhiza-9" },
+		"foreign node name":   func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeName = "node-z" },
+		"foreign node uid":    func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "node-uid-z" },
+		"missing node uid":    func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "" },
+		"missing instance id": func(r *AttestationResponse) { r.Independent.Runtimes[0].InstanceID = "" },
+		"foreign container":   func(r *AttestationResponse) { r.Independent.Runtimes[0].ContainerIDs = []string{"containerd://other"} },
 		"extra container": func(r *AttestationResponse) {
 			r.Independent.Runtimes[0].ContainerIDs = append(r.Independent.Runtimes[0].ContainerIDs, "containerd://new")
 		},
