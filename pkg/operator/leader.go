@@ -21,7 +21,9 @@ type operatorLease struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
 	Metadata   struct {
-		Name, Namespace, ResourceVersion string
+		Name            string `json:"name"`
+		Namespace       string `json:"namespace,omitempty"`
+		ResourceVersion string `json:"resourceVersion,omitempty"`
 	} `json:"metadata"`
 	Spec struct {
 		HolderIdentity       string `json:"holderIdentity"`

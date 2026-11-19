@@ -192,7 +192,19 @@ func TestRunLeaderElectionAcquireAndCancel(t *testing.T) {
 			b, _ := json.Marshal(lease)
 			return phase2Response(200, string(b)), nil
 		case strings.HasSuffix(r.URL.Path, "/leases") && r.Method == http.MethodPost:
-			if err := json.NewDecoder(r.Body).Decode(&lease); err != nil {
+			var raw map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				return phase2Response(400, err.Error()), nil
+			}
+			meta, _ := raw["metadata"].(map[string]any)
+			if meta["name"] != "rhiza-operator" || meta["namespace"] != "ns" {
+				return phase2Response(422, "metadata.name and metadata.namespace must be lowercase"), nil
+			}
+			if _, hasUpper := meta["Name"]; hasUpper {
+				return phase2Response(422, "unexpected uppercase Name in metadata"), nil
+			}
+			b, _ := json.Marshal(raw)
+			if err := json.Unmarshal(b, &lease); err != nil {
 				return phase2Response(400, err.Error()), nil
 			}
 			if _, err := time.Parse(kubernetesMicroTimeFmt, lease.Spec.AcquireTime); err != nil || len(lease.Spec.AcquireTime) != len("2006-01-02T15:04:05.000000Z") {
