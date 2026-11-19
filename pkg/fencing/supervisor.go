@@ -108,10 +108,24 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("fencing: child exited without a terminal receipt: %w", errors.Join(err, completionErr))
 		case <-ctx.Done():
-			_ = child.Process.Kill()
-			<-waited
-			childWaited = true
-			return ctx.Err()
+			// Give the supervised application its normal SIGTERM path so a clean
+			// drain/exit receipt can still be persisted before PID 1 returns.
+			_ = child.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-waited:
+				childWaited = true
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+				defer cancel()
+				if err := s.finishExitedChild(cleanupCtx, terminatePrivateNamespace); err != nil {
+					return errors.Join(ctx.Err(), err)
+				}
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+				_ = child.Process.Kill()
+				<-waited
+				childWaited = true
+				return ctx.Err()
+			}
 		case <-tick.C:
 			s.mu.Lock()
 			receipt := s.drain
