@@ -20,7 +20,22 @@ import (
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
+func ensureWritableTempDir(fallbackParent string) {
+	if probe, err := os.MkdirTemp("", "rhiza-tmp-probe-*"); err == nil {
+		_ = os.RemoveAll(probe)
+		return
+	}
+	if fallbackParent == "" {
+		return
+	}
+	dir := filepath.Join(fallbackParent, ".tmp")
+	if os.MkdirAll(dir, 0o700) == nil {
+		_ = os.Setenv("TMPDIR", dir)
+	}
+}
+
 func run(args []string) error {
+	ensureWritableTempDir(operator.V1Alpha2BootstrapDataDir)
 	if len(args) > 0 && args[0] == "serve-managed-sql" {
 		return runServe(args[1:])
 	}
