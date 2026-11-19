@@ -120,6 +120,8 @@ type Core struct {
 	values              map[ValueHash][]byte
 	valueDurable        map[ValueHash]bool
 	compactionValues    map[[32]byte]struct{}
+	stagedPins          map[ValueHash]int
+	recentStaged        []ValueHash
 	prefixes            map[Slot][32]byte
 	checkpointMu        sync.Mutex
 	checkpointValidator func(context.Context, CheckpointSeal) error
@@ -136,6 +138,8 @@ type Core struct {
 	cold                []coldDecision
 	evictedThrough      Slot
 	abortTerminalSlots  []Slot
+	coldLeaderSchedules map[Slot][]NodeID
+	recovering          bool
 	commits             *groupCommit
 	listeners           []chan SlotValue
 	now                 func() time.Time
@@ -175,8 +179,8 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
-		maxRetainedBytes: DefaultMaxRetainedDecisionBytes, maxRetainedSlots: DefaultMaxRetainedDecisionSlots, decisionLocs: make(map[Slot]qlog.EntryLocation), coldBase: 1,
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), stagedPins: make(map[ValueHash]int), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
+		maxRetainedBytes: DefaultMaxRetainedDecisionBytes, maxRetainedSlots: DefaultMaxRetainedDecisionSlots, decisionLocs: make(map[Slot]qlog.EntryLocation), coldBase: 1, coldLeaderSchedules: make(map[Slot][]NodeID),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
 	core.configHistory = []configEpoch{{start: 1, cluster: cloneCluster(*config)}}
@@ -648,6 +652,9 @@ func (c *Core) stageValueLocked(hash ValueHash, value []byte) error {
 				c.compactionValues[key] = struct{}{}
 			}
 		}
+		if !c.recovering {
+			c.recordRecentStagedLocked(hash)
+		}
 		return nil
 	}
 	if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
@@ -656,6 +663,9 @@ func (c *Core) stageValueLocked(hash ValueHash, value []byte) error {
 	c.values[hash] = append([]byte(nil), value...)
 	if c.compactionValues != nil {
 		c.compactionValues[[32]byte(hash)] = struct{}{}
+	}
+	if !c.recovering {
+		c.recordRecentStagedLocked(hash)
 	}
 	return nil
 }
@@ -1186,6 +1196,9 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 			return rotateMembers(cluster.Members, int(epoch%uint64(len(cluster.Members)))), nil
 		}
 		controlSlot := start + Slot(epoch-1)*leaderEpochSize
+		if cached, ok := c.coldLeaderSchedules[controlSlot]; ok && validateLeaderSchedule(cluster, cached) {
+			return append([]NodeID(nil), cached...), nil
+		}
 		decision, ok, err := c.loadDecidedLocked(controlSlot)
 		if err != nil {
 			return nil, err
@@ -1211,6 +1224,9 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		return rotateMembers(c.config.Members, int(epoch%uint64(len(c.config.Members)))), nil
 	}
 	controlSlot := leaderEpochFirst(epoch - 1)
+	if cached, ok := c.coldLeaderSchedules[controlSlot]; ok && c.validateLeaderSchedule(cached) {
+		return append([]NodeID(nil), cached...), nil
+	}
 	decision, ok, err := c.loadDecidedLocked(controlSlot)
 	if err != nil {
 		return nil, err
@@ -1439,8 +1455,6 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 		cluster := *c.config
 		if c.reconfigEnabled {
 			cluster = c.clusterForSlot(slot)
-		}
-		if c.reconfigEnabled {
 			if control, ok, _ := decodeReconfiguration(candidate.Value); ok && control.Terminal {
 				c.mu.RLock()
 				state := c.reconfiguration
@@ -1448,16 +1462,6 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 				if state == nil {
 					return Decision{}, fmt.Errorf("terminal has no freeze evidence")
 				}
-				safe := make([]Member, 0, len(cluster.Members))
-				for _, member := range cluster.Members {
-					if _, ok := state.safe[member.ID]; ok {
-						safe = append(safe, member)
-					}
-				}
-				if len(safe) < cluster.QuorumSize() {
-					return Decision{}, fmt.Errorf("freeze evidence lacks old quorum")
-				}
-				cluster.Members = safe
 			}
 		}
 		requests := make(map[NodeID]RecordRequest, len(cluster.Members))
@@ -1596,6 +1600,9 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 		}
 		// Finish the owned receipt before observing request cancellation.
 		summary, err := c.recordLocalOwned(context.WithoutCancel(ctx), request)
+		if err == nil && request.ReconfigurationID != ([32]byte{}) && summary.ReconfigurationID != request.ReconfigurationID {
+			err = fmt.Errorf("recorder %s did not bind reconfiguration", c.nodeID)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, err)
 		}
@@ -1621,6 +1628,9 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 				err = fmt.Errorf("no transport for %s", nodeID)
 			} else {
 				summary, err = c.transport.SendRecord(callCtx, nodeID, request)
+			}
+			if err == nil && request.ReconfigurationID != ([32]byte{}) && summary.ReconfigurationID != request.ReconfigurationID {
+				err = fmt.Errorf("recorder %s did not bind reconfiguration", nodeID)
 			}
 			results <- result{summary: summary, err: err}
 		}(nodeID, request)
@@ -1874,6 +1884,8 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 	if err := c.rejectCompacted(request.Slot); err != nil {
 		return Summary{}, err
 	}
+	c.pinStagedValue(request.Proposal.Hash)
+	defer c.unpinStagedValue(request.Proposal.Hash)
 	if len(request.Proposal.Value) != 0 {
 		if err := c.checkValue(request.Proposal.Value); err != nil {
 			return Summary{}, err
@@ -4024,6 +4036,14 @@ func (c *Core) IsQuorum(receipts []Receipt) bool {
 func (c *Core) recover() error {
 	var prepared []CheckpointSeal
 	var previousManagedMarker *CheckpointSeal
+	c.mu.Lock()
+	c.recovering = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.recovering = false
+		c.mu.Unlock()
+	}()
 	if err := c.wal.ScanWithLocation(func(entry qlog.Entry, loc qlog.EntryLocation) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
@@ -4128,9 +4148,15 @@ func (c *Core) recover() error {
 				}
 			}
 			c.mu.Lock()
-			if existing, ok := c.decided[decision.Slot]; ok && existing.Hash != decision.Proposal.Hash {
-				c.mu.Unlock()
-				return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
+			if existingHash, decided := c.decisionHashLocked(decision.Slot); decided {
+				if existingHash != decision.Proposal.Hash {
+					c.mu.Unlock()
+					return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
+				}
+				if _, hot := c.decided[decision.Slot]; !hot {
+					c.mu.Unlock()
+					return nil
+				}
 			}
 			c.putDecidedLocked(decision.Slot, DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: value, Certificate: certificate})
 			if c.decisionLocs == nil {
@@ -4147,61 +4173,34 @@ func (c *Core) recover() error {
 			c.updateHashIndexLocked(decision.Proposal.Hash, decision.Slot)
 			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()
+			if err := c.recoverContiguousDecisions(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	c.mu.RLock()
-	recovered := make([]Decision, 0, len(c.decided))
-	for _, value := range c.decided {
+	c.mu.Lock()
+	c.recovering = false
+	sparse := make([]DecidedValue, 0)
+	for slot, value := range c.decided {
+		if slot > c.tip {
+			sparse = append(sparse, value)
+		}
+	}
+	c.mu.Unlock()
+	sort.Slice(sparse, func(i, j int) bool { return sparse[i].Slot < sparse[j].Slot })
+	for _, value := range sparse {
 		configID, decision, err := decodeCertificate(value.Certificate)
 		if err != nil {
-			c.mu.RUnlock()
 			return err
 		}
 		decision.Proposal.Value = value.Value
 		decision.ConfigID = configID
-		recovered = append(recovered, decision)
-	}
-	c.mu.RUnlock()
-	sort.Slice(recovered, func(i, j int) bool { return recovered[i].Slot < recovered[j].Slot })
-	if c.reconfigEnabled {
-		for _, decision := range recovered {
-			if err := c.validateDecisionForRecovery(decision, true); err != nil {
-				return fmt.Errorf("recover QuePaxa decision: %w", err)
-			}
-			c.mu.Lock()
-			if decision.Slot != c.tip+1 {
-				c.mu.Unlock()
-				continue // Keep certified sparse slots until their prefix is recovered.
-			}
-			if err := c.validateScheduledValueLocked(decision.Slot, decision.Proposal.Value); err != nil {
-				c.mu.Unlock()
-				return fmt.Errorf("recover reconfiguration: %w", err)
-			}
-			if err := c.validateFreezeBindingLocked(decision); err != nil {
-				c.mu.Unlock()
-				return fmt.Errorf("recover reconfiguration: %w", err)
-			}
-			if err := c.applyReconfigurationLocked(decision); err != nil {
-				c.mu.Unlock()
-				return fmt.Errorf("recover reconfiguration: %w", err)
-			}
-			c.tip = decision.Slot
-			prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
-			c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Proposal.Hash)
-			c.mu.Unlock()
+		if err := c.validateDecisionForRecovery(decision, true); err != nil {
+			return fmt.Errorf("recover QuePaxa decision: %w", err)
 		}
-	} else {
-		for _, decision := range recovered {
-			if err := c.validateDecisionForRecovery(decision, true); err != nil {
-				return fmt.Errorf("recover QuePaxa decision: %w", err)
-			}
-		}
-		c.mu.Lock()
-		c.advanceTipLocked()
-		c.mu.Unlock()
 	}
 	if c.managedAppendOnly == nil {
 		for _, seal := range prepared {
@@ -4225,8 +4224,70 @@ func (c *Core) recover() error {
 	c.mu.Lock()
 	c.advanceDurableThroughLocked()
 	c.evictColdDecisionsLocked()
+	c.pruneColdLeaderSchedulesLocked()
+	c.pruneDeadValuesLocked(nil)
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Core) recoverContiguousDecisions() error {
+	for {
+		c.mu.RLock()
+		nextSlot := c.tip + 1
+		decided, ok := c.decided[nextSlot]
+		reconfig := c.reconfigEnabled
+		c.mu.RUnlock()
+		if !ok {
+			return nil
+		}
+		configID, decision, err := decodeCertificate(decided.Certificate)
+		if err != nil {
+			return err
+		}
+		decision.Proposal.Value = decided.Value
+		decision.ConfigID = configID
+		if err := c.validateDecisionForRecovery(decision, true); err != nil {
+			return fmt.Errorf("recover QuePaxa decision: %w", err)
+		}
+		c.mu.Lock()
+		if c.tip+1 != nextSlot {
+			c.mu.Unlock()
+			continue
+		}
+		if reconfig {
+			dNow, stillHot := c.decided[nextSlot]
+			if !stillHot || dNow.Hash != decision.Proposal.Hash {
+				c.mu.Unlock()
+				return fmt.Errorf("recovered decision at slot %d changed", nextSlot)
+			}
+			if err := c.validateScheduledValueLocked(decision.Slot, decision.Proposal.Value); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
+			}
+			if err := c.validateFreezeBindingLocked(decision); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
+			}
+			if err := c.applyReconfigurationLocked(decision); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
+			}
+			c.tip = decision.Slot
+			prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
+			c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Proposal.Hash)
+			c.observeLeaderEpochLocked(c.tip)
+		} else {
+			c.tip = decision.Slot
+			prevPrefix, _ := c.prefixHashLocked(c.tip - 1)
+			c.prefixes[c.tip] = AdvancePrefixHash(prevPrefix, c.tip, decision.Proposal.Hash)
+			c.observeLeaderEpochLocked(c.tip)
+		}
+		c.advanceDurableThroughLocked()
+		if c.overRetentionBudgetLocked() {
+			c.evictColdDecisionsLocked()
+		}
+		c.mu.Unlock()
+	}
 }
 
 func (c *Core) leaderEpochKeyLocked(slot Slot) uint64 {

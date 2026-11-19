@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -473,5 +475,558 @@ func TestCoreColdEvictionPrunesSupersededSealedRoots(t *testing.T) {
 	selected, found, err := core.LatestManagedCheckpointSeal()
 	if err != nil || !found || selected.RootHash != seal2.RootHash || selected.DecisionSlot != 4 {
 		t.Fatalf("LatestManagedCheckpointSeal got (%+v, %t, %v), want seal2", selected, found, err)
+	}
+}
+
+func TestCoreStagedValuePinSurvivesColdPruneSweep(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var core *Core
+	var wal *qlog.WAL
+	sweptDuringVerify := false
+
+	config, wal := managedAppendOnlyTestConfig(t, managedGraphRequestAppendOnlyApplicationProtocol, func(ctx context.Context, candidate ManagedCheckpointCandidate) error {
+		core.mu.Lock()
+		// Populate stale values well above sweepThreshold (256) and run full sweep
+		// while Core.record() has released Core.mu during candidate verification.
+		for i := range 300 {
+			h := ValueHash(sha256.Sum256([]byte{byte(i), byte(i >> 8), 0xaa}))
+			core.values[h] = []byte("orphan")
+		}
+		core.pruneDeadValuesLocked(map[ValueHash]struct{}{})
+		_, stillPresent := core.values[candidate.Hash]
+		core.mu.Unlock()
+		if !stillPresent {
+			return context.Canceled
+		}
+		sweptDuringVerify = true
+		return nil
+	})
+	var err error
+	core, err = New(config)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+
+	if _, _, err := core.Propose(ctx, numberedTestPayload(1, 128)); err != nil {
+		t.Fatal(err)
+	}
+	prefix1, ok := core.PrefixHash(1)
+	if !ok {
+		t.Fatal("missing prefix at slot 1")
+	}
+	next1, err := core.LeaderOrder(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: 1, Index: 1,
+		RootHash: sha256.Sum256([]byte("pin-root")), StateHash: sha256.Sum256([]byte("pin-state")),
+		PrefixHash: prefix1, NextLeaderOrder: next1,
+	}
+	value, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := ValueHash(sha256.Sum256(value))
+	if _, err := core.Record(ctx, RecordRequest{
+		Slot: 2, Step: 4, ConfigID: 1,
+		Proposal: Proposal{Priority: highestPriority, ProposerID: "n1", Hash: hash, Value: value},
+	}); err != nil {
+		t.Fatalf("Record with concurrent prune sweep failed: %v", err)
+	}
+	if !sweptDuringVerify {
+		t.Fatal("expected verifier sweep callback to run")
+	}
+}
+
+func TestCoreColdEvictionCachesLeaderSchedulesUnderTightByteBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+
+	core, err := New(Config{
+		NodeID:                   "n1",
+		Cluster:                  Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}},
+		WAL:                      wal,
+		MaxRetainedDecisionSlots: 8,
+		MaxRetainedDecisionBytes: 512,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1-node explorationEpochs() = 3 (48 slots). Slot 33 is control slot for epoch 3 (slots 49..64),
+	// and slot 49 is control slot for epoch 4 (slots 65..80).
+	for seq := 1; seq <= 65; seq++ {
+		if _, _, err := core.Propose(ctx, numberedTestPayload(seq, 256)); err != nil {
+			t.Fatalf("propose %d: %v", seq, err)
+		}
+	}
+
+	core.mu.RLock()
+	_, ctrl33Hot := core.decided[33]
+	_, ctrl33Cached := core.coldLeaderSchedules[33]
+	_, ctrl49Cached := core.coldLeaderSchedules[49]
+	core.mu.RUnlock()
+	if ctrl33Hot {
+		t.Fatal("expected leader schedule control slot 33 to be cold-evicted under tight byte budget")
+	}
+	if !ctrl33Cached || !ctrl49Cached {
+		t.Fatalf("expected coldLeaderSchedules to cache evicted schedule slots: s33=%t s49=%t", ctrl33Cached, ctrl49Cached)
+	}
+	if order, err := core.LeaderOrder(core.Tip() + 1); err != nil || len(order) != 1 || order[0] != "n1" {
+		t.Fatalf("LeaderOrder after cold eviction=%v err=%v", order, err)
+	}
+}
+
+func TestCoreColdEvictionCleansSupersededSealPrefixAndIgnoresUntippedFutureSeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	config, wal := managedAppendOnlyTestConfig(t, managedGraphRequestAppendOnlyApplicationProtocol, func(context.Context, ManagedCheckpointCandidate) error {
+		return nil
+	})
+	config.MaxRetainedDecisionSlots = 4
+	config.MaxRetainedDecisionBytes = 1 << 20
+	core, err := New(config)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+
+	proposeSealAtNext := func(cutIdx Slot, label string) CheckpointSeal {
+		prefix, ok := core.PrefixHash(cutIdx)
+		if !ok {
+			t.Fatalf("missing prefix at cut %d", cutIdx)
+		}
+		order, err := core.LeaderOrder(cutIdx + 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seal := CheckpointSeal{
+			ConfigID:        1,
+			Index:           cutIdx,
+			RootHash:        sha256.Sum256([]byte(label + "-root")),
+			StateHash:       sha256.Sum256([]byte(label + "-state")),
+			PrefixHash:      prefix,
+			NextLeaderOrder: order,
+		}
+		encoded, err := EncodeCheckpointSeal(seal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.Propose(ctx, encoded); err != nil {
+			t.Fatalf("propose %s: %v", label, err)
+		}
+		return seal
+	}
+
+	if _, _, err := core.Propose(ctx, numberedTestPayload(1, 128)); err != nil {
+		t.Fatal(err)
+	}
+	seal1 := proposeSealAtNext(1, "seal1") // slot 2, non-stride index 1
+	wantPrefix1, ok := core.PrefixHash(seal1.Index)
+	if !ok {
+		t.Fatal("missing prefix1")
+	}
+
+	if _, _, err := core.Propose(ctx, numberedTestPayload(3, 128)); err != nil {
+		t.Fatal(err)
+	}
+	seal2 := proposeSealAtNext(3, "seal2") // slot 4
+
+	// Plant a sparse untipped future durable seal entry (DecisionSlot > c.tip)
+	// and verify it never counts as latestSeal to prune seal2 before c.tip.
+	futureRoot := sha256.Sum256([]byte("future-seal-root"))
+	core.mu.Lock()
+	core.sealedRoots[futureRoot] = SealedCheckpoint{
+		CheckpointSeal: CheckpointSeal{ConfigID: 1, Index: 500, RootHash: futureRoot},
+		DecisionSlot:   501,
+	}
+	core.durable[501] = true
+	core.mu.Unlock()
+
+	for seq := 5; seq <= 12; seq++ {
+		if _, _, err := core.Propose(ctx, numberedTestPayload(seq, 128)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	core.mu.RLock()
+	_, hasSeal1 := core.sealedRoots[seal1.RootHash]
+	_, hasSeal2 := core.sealedRoots[seal2.RootHash]
+	_, hasSeal1Prefix := core.prefixes[seal1.Index]
+	core.mu.RUnlock()
+
+	if hasSeal1 {
+		t.Fatal("expected seal1 to be pruned once seal2 superseded it")
+	}
+	if !hasSeal2 {
+		t.Fatal("untipped future seal improperly pruned active latestSeal seal2")
+	}
+	if hasSeal1Prefix {
+		t.Fatalf("expected pruned non-stride prefix at slot %d to be deleted from c.prefixes", seal1.Index)
+	}
+	if recomputed, ok := core.PrefixHash(seal1.Index); !ok || recomputed != wantPrefix1 {
+		t.Fatalf("PrefixHash(%d) recompute failed: ok=%t match=%t", seal1.Index, ok, recomputed == wantPrefix1)
+	}
+}
+
+func TestCoreRecoverBoundsHotDecisionsDuringWALScan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("fixed-membership", func(t *testing.T) {
+		dir := t.TempDir()
+		wal, err := qlog.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{
+			NodeID:                   "n1",
+			Cluster:                  Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}},
+			WAL:                      wal,
+			MaxRetainedDecisionSlots: 8,
+			MaxRetainedDecisionBytes: 1 << 20,
+		}
+		core, err := New(cfg)
+		if err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
+		}
+		for seq := 1; seq <= 100; seq++ {
+			if _, _, err := core.Propose(ctx, numberedTestPayload(seq, 256)); err != nil {
+				_ = wal.Close()
+				t.Fatalf("propose %d: %v", seq, err)
+			}
+		}
+		wantTip := core.Tip()
+		wantPrefix, ok := core.PrefixHash(wantTip)
+		if !ok {
+			_ = wal.Close()
+			t.Fatal("missing tip prefix")
+		}
+		if err := wal.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		reopenedWAL, err := qlog.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reopenedWAL.Close() }()
+		cfg.WAL = reopenedWAL
+		reopened, err := New(cfg)
+		if err != nil {
+			t.Fatalf("reopen bounded WAL: %v", err)
+		}
+		reopened.mu.RLock()
+		hotCount := len(reopened.decided)
+		evictedThrough := reopened.evictedThrough
+		reopened.mu.RUnlock()
+		if hotCount > 8 || evictedThrough < 90 {
+			t.Fatalf("expected bounded hot decisions during recover(): hot=%d evicted=%d", hotCount, evictedThrough)
+		}
+		if gotTip := reopened.Tip(); gotTip != wantTip {
+			t.Fatalf("reopened tip=%d want=%d", gotTip, wantTip)
+		}
+		if gotPrefix, ok := reopened.PrefixHash(wantTip); !ok || gotPrefix != wantPrefix {
+			t.Fatalf("reopened prefix ok=%t match=%t", ok, gotPrefix == wantPrefix)
+		}
+		if order, err := reopened.LeaderOrder(wantTip + 1); err != nil || len(order) != 1 || order[0] != "n1" {
+			t.Fatalf("LeaderOrder after bounded reopen=%v err=%v", order, err)
+		}
+	})
+
+	t.Run("reconfiguration-enabled", func(t *testing.T) {
+		initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+		dir := t.TempDir()
+		transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+		wals := make(map[NodeID]*qlog.WAL, len(initial.Members))
+		for _, member := range initial.Members {
+			wal, err := qlog.Open(filepath.Join(dir, string(member.ID)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			core, err := New(Config{
+				NodeID:                   member.ID,
+				Cluster:                  initial,
+				WAL:                      wal,
+				Transport:                transport,
+				EnableReconfiguration:    true,
+				MaxRetainedDecisionSlots: 8,
+				MaxRetainedDecisionBytes: 1 << 20,
+			})
+			if err != nil {
+				_ = wal.Close()
+				t.Fatal(err)
+			}
+			wals[member.ID] = wal
+			transport.cores[member.ID] = core
+		}
+		target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+		if _, err := transport.cores["a"].BeginReconfiguration(ctx, target); err != nil {
+			t.Fatal(err)
+		}
+		if err := transport.cores["a"].FinishReconfiguration(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for seq := 1; seq <= 80; seq++ {
+			if _, _, err := transport.cores["a"].Propose(ctx, numberedTestPayload(seq, 256)); err != nil {
+				t.Fatalf("post-reconfig propose %d: %v", seq, err)
+			}
+		}
+		wantTip := transport.cores["a"].Tip()
+		wantPrefix, ok := transport.cores["a"].PrefixHash(wantTip)
+		if !ok {
+			t.Fatal("missing post-reconfig tip prefix")
+		}
+		for _, wal := range wals {
+			if err := wal.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		reopenedWAL, err := qlog.Open(filepath.Join(dir, "a"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reopenedWAL.Close() }()
+		reopened, err := New(Config{
+			NodeID:                   "a",
+			Cluster:                  initial,
+			WAL:                      reopenedWAL,
+			Transport:                &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}},
+			EnableReconfiguration:    true,
+			MaxRetainedDecisionSlots: 8,
+			MaxRetainedDecisionBytes: 1 << 20,
+		})
+		if err != nil {
+			t.Fatalf("reopen reconfig WAL: %v", err)
+		}
+		reopened.mu.RLock()
+		hotCount := len(reopened.decided)
+		evictedThrough := reopened.evictedThrough
+		reopened.mu.RUnlock()
+		if hotCount > 8 || evictedThrough < 80 {
+			t.Fatalf("expected bounded hot decisions in reconfig recover(): hot=%d evicted=%d", hotCount, evictedThrough)
+		}
+		if reopened.Tip() != wantTip || reopened.ConfigID() != 2 {
+			t.Fatalf("reopened tip=%d config=%d, want %d / 2", reopened.Tip(), reopened.ConfigID(), wantTip)
+		}
+		if gotPrefix, ok := reopened.PrefixHash(wantTip); !ok || gotPrefix != wantPrefix {
+			t.Fatalf("reopened prefix ok=%t match=%t", ok, gotPrefix == wantPrefix)
+		}
+		history, err := reopened.MembershipHistory()
+		if err != nil || len(history.Transitions) != 1 {
+			t.Fatalf("MembershipHistory after bounded reopen=%+v err=%v", history, err)
+		}
+		if _, err := validateMembershipHistory(initial, history); err != nil {
+			t.Fatalf("validate reopened history: %v", err)
+		}
+	})
+}
+
+func TestCoreCompactThroughWithTransitionInRetainedSuffixAndEpochStartPrune(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	dir := t.TempDir()
+	transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+	for _, member := range initial.Members {
+		wal, err := qlog.Open(filepath.Join(dir, string(member.ID)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wal.Close() })
+		core, err := New(Config{
+			NodeID:                member.ID,
+			Cluster:               initial,
+			WAL:                   wal,
+			Transport:             transport,
+			EnableReconfiguration: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+		transport.cores[member.ID] = core
+	}
+	core := transport.cores["a"]
+	// Propose slots spanning past one leaderEpochSize before creating checkpoint seal at cut=18.
+	for seq := 1; seq <= 18; seq++ {
+		if _, _, err := core.Propose(ctx, numberedTestPayload(seq, 64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cut := core.Tip()
+	prefix, ok := core.PrefixHash(cut)
+	if !ok {
+		t.Fatal("missing prefix at cut")
+	}
+	next, following, err := core.CheckpointLeaderOrders(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := core.CheckpointMembership(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: 1, Index: cut,
+		RootHash: sha256.Sum256([]byte("pre-transition-root")), StateHash: sha256.Sum256([]byte("pre-transition-state")),
+		PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership,
+	}
+	for _, member := range initial.Members {
+		voter := transport.cores[member.ID]
+		if err := voter.WaitTip(ctx, cut); err != nil {
+			t.Fatal(err)
+		}
+		if err := voter.PrepareCheckpoint(ctx, seal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encodedSeal, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, encodedSeal); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute a full certified membership transition AFTER the checkpoint cut.
+	if _, err := core.BeginReconfiguration(ctx, Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("post-transition-write")); err != nil {
+		t.Fatal(err)
+	}
+
+	core.mu.Lock()
+	core.epochStart[0] = core.now()
+	core.mu.Unlock()
+	if err := core.CompactThrough(cut, seal.RootHash); err != nil {
+		t.Fatalf("CompactThrough with transition in retained suffix failed: %v", err)
+	}
+	core.mu.RLock()
+	_, hasEpochZero := core.epochStart[0]
+	core.mu.RUnlock()
+	if hasEpochZero {
+		t.Fatal("installBaseLocked did not prune epochStart entries below base.LeaderEpoch")
+	}
+}
+
+func TestManagedAppendOnlyFailsClosedOnCorruptedCheckpointHistory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	dir := t.TempDir()
+	transport := &clusterTransport{cores: map[NodeID]*Core{}, down: map[NodeID]bool{}, dropDecision: map[NodeID]bool{}}
+	identity := bytes.Repeat([]byte{0x42}, 32)
+	for _, member := range initial.Members {
+		wal, err := qlog.Open(filepath.Join(dir, string(member.ID)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wal.Close() })
+		if err := wal.BindIdentity(identity); err != nil {
+			t.Fatal(err)
+		}
+		core, err := New(Config{
+			NodeID:                member.ID,
+			Cluster:               initial,
+			WAL:                   wal,
+			Transport:             transport,
+			EnableReconfiguration: true,
+			ManagedAppendOnly: &ManagedAppendOnlyConfig{
+				Binding: ManagedAppendOnlyBinding{
+					ApplicationProtocol: managedGraphRequestAppendOnlyApplicationProtocol,
+					BootstrapPlanDigest: strings.Repeat("11", 32),
+					MemberConfigDigest:  strings.Repeat("22", 32),
+					Generation:          0,
+					WALIdentity:         [32]byte(identity),
+				},
+				Verify: func(context.Context, ManagedCheckpointCandidate) error { return nil },
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport.cores[member.ID] = core
+	}
+	core := transport.cores["a"]
+	freezeSlot, err := core.BeginReconfiguration(ctx, Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("after-reconfig")); err != nil {
+		t.Fatal(err)
+	}
+	cut := core.Tip()
+	prefix, _ := core.PrefixHash(cut)
+	next, following, err := core.CheckpointLeaderOrders(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := core.CheckpointMembership(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: core.ConfigID(), Index: cut,
+		RootHash: sha256.Sum256([]byte("managed-fail-closed-root")), StateHash: sha256.Sum256([]byte("managed-fail-closed-state")),
+		PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership,
+	}
+	encodedSeal, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := core.Propose(ctx, encodedSeal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := ManagedCheckpointCandidate{
+		Value: encodedSeal, Hash: sha256.Sum256(encodedSeal), Seal: seal, DecisionSlot: slot, ConfigID: core.ConfigID(),
+	}
+
+	// Mark the freeze decision undurable so checkpointMembershipAtLocked returns an error.
+	core.mu.Lock()
+	core.durable[freezeSlot] = false
+	core.mu.Unlock()
+
+	if err := core.ValidateManagedCheckpointRoot(ctx, candidate); err == nil || !strings.Contains(err.Error(), "not durable") {
+		t.Fatalf("ValidateManagedCheckpointRoot swallowed membership history error: %v", err)
+	}
+	if err := core.validateManagedCandidateLocal(candidate); err == nil || !strings.Contains(err.Error(), "not durable") {
+		t.Fatalf("validateManagedCandidateLocal swallowed membership history error: %v", err)
 	}
 }

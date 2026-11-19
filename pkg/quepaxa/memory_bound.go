@@ -240,7 +240,7 @@ func (c *Core) evictColdDecisionsLocked() {
 	var latestSeal SealedCheckpoint
 	for _, seal := range c.sealedRoots {
 		protectedPrefixSlots[seal.Index] = struct{}{}
-		if !c.isDurableLocked(seal.DecisionSlot) {
+		if seal.DecisionSlot > c.tip || !c.isDurableLocked(seal.DecisionSlot) {
 			continue
 		}
 		if seal.Index > latestSeal.Index || (seal.Index == latestSeal.Index && seal.DecisionSlot > latestSeal.DecisionSlot) {
@@ -281,6 +281,7 @@ func (c *Core) evictColdDecisionsLocked() {
 				c.recordAbortTerminalSlotLocked(s)
 			}
 		}
+		c.cacheColdLeaderScheduleLocked(s, d.Value)
 		c.cold = append(c.cold, coldDecision{loc: loc, hash: d.Hash})
 		c.deleteDecidedLocked(s)
 		delete(c.decisionLocs, s)
@@ -311,16 +312,107 @@ func (c *Core) evictColdDecisionsLocked() {
 		c.pruneDeadValuesLocked(candidateDead)
 	}
 	if latestSeal.Index != 0 {
+		var prunedSealIndices []Slot
 		for root, seal := range c.sealedRoots {
 			if seal.Index < latestSeal.Index && seal.DecisionSlot <= c.evictedThrough && root != c.floorRoot && c.preparedCheckpoints[seal.Index] != root {
 				delete(c.sealedRoots, root)
+				prunedSealIndices = append(prunedSealIndices, seal.Index)
+			}
+		}
+		if len(prunedSealIndices) > 0 {
+			stillReferenced := make(map[Slot]struct{}, len(c.sealedRoots))
+			for _, seal := range c.sealedRoots {
+				stillReferenced[seal.Index] = struct{}{}
+			}
+			for _, idx := range prunedSealIndices {
+				if idx <= c.evictedThrough && idx != c.floor && idx%coldPrefixStride != 0 {
+					if _, prepared := c.preparedCheckpoints[idx]; prepared {
+						continue
+					}
+					if _, referenced := stillReferenced[idx]; referenced {
+						continue
+					}
+					delete(c.prefixes, idx)
+				}
 			}
 		}
 	}
 }
 
+const (
+	maxRecentStagedHashes = 64
+	maxColdLeaderCache    = 64
+)
+
+func (c *Core) pinStagedValue(hash ValueHash) {
+	c.mu.Lock()
+	if c.stagedPins == nil {
+		c.stagedPins = make(map[ValueHash]int)
+	}
+	c.stagedPins[hash]++
+	c.mu.Unlock()
+}
+
+func (c *Core) unpinStagedValue(hash ValueHash) {
+	c.mu.Lock()
+	if count := c.stagedPins[hash]; count <= 1 {
+		delete(c.stagedPins, hash)
+	} else {
+		c.stagedPins[hash] = count - 1
+	}
+	c.mu.Unlock()
+}
+
+func (c *Core) recordRecentStagedLocked(hash ValueHash) {
+	for _, existing := range c.recentStaged {
+		if existing == hash {
+			return
+		}
+	}
+	if len(c.recentStaged) >= maxRecentStagedHashes {
+		copy(c.recentStaged, c.recentStaged[1:])
+		c.recentStaged[len(c.recentStaged)-1] = hash
+		return
+	}
+	c.recentStaged = append(c.recentStaged, hash)
+}
+
+func (c *Core) cacheColdLeaderScheduleLocked(slot Slot, value []byte) {
+	if !c.isLeaderScheduleSlotLocked(slot) {
+		return
+	}
+	order, scheduled, err := DecodeLeaderSchedule(value)
+	if err != nil || !scheduled {
+		return
+	}
+	if c.coldLeaderSchedules == nil {
+		c.coldLeaderSchedules = make(map[Slot][]NodeID)
+	}
+	c.coldLeaderSchedules[slot] = order
+	if !c.recovering {
+		c.pruneColdLeaderSchedulesLocked()
+	}
+}
+
+func (c *Core) pruneColdLeaderSchedulesLocked() {
+	if len(c.coldLeaderSchedules) <= maxColdLeaderCache {
+		return
+	}
+	cutoff := c.floor
+	if c.tip > maxColdLeaderCache*leaderEpochSize {
+		if windowCutoff := c.tip - maxColdLeaderCache*leaderEpochSize; windowCutoff > cutoff {
+			cutoff = windowCutoff
+		}
+	}
+	for s := range c.coldLeaderSchedules {
+		if s < cutoff {
+			delete(c.coldLeaderSchedules, s)
+		}
+	}
+}
+
 func (c *Core) pruneDeadValuesLocked(candidateDead map[ValueHash]struct{}) {
-	live := make(map[ValueHash]struct{}, len(c.decided)+len(c.recorders))
+	live := make(map[ValueHash]struct{}, len(c.decided)+len(c.recorders)+len(c.stagedPins))
 	for _, d := range c.decided {
 		live[d.Hash] = struct{}{}
 	}
@@ -331,14 +423,34 @@ func (c *Core) pruneDeadValuesLocked(candidateDead map[ValueHash]struct{}) {
 			}
 		}
 	}
+	for hash := range c.stagedPins {
+		live[hash] = struct{}{}
+	}
 	for hash := range candidateDead {
 		if _, ok := live[hash]; !ok {
 			delete(c.values, hash)
 			delete(c.valueDurable, hash)
 		}
 	}
+	if len(c.recentStaged) > 0 && len(candidateDead) > 0 {
+		kept := c.recentStaged[:0]
+		for _, hash := range c.recentStaged {
+			if _, dead := candidateDead[hash]; !dead {
+				kept = append(kept, hash)
+			}
+		}
+		c.recentStaged = kept
+	}
+	if c.recovering {
+		return
+	}
 	sweepThreshold := max(256, 2*max(c.maxRetainedSlots, 64))
 	if len(c.values) > sweepThreshold {
+		for _, hash := range c.recentStaged {
+			if _, dead := candidateDead[hash]; !dead {
+				live[hash] = struct{}{}
+			}
+		}
 		for hash := range c.values {
 			if _, ok := live[hash]; !ok {
 				delete(c.values, hash)

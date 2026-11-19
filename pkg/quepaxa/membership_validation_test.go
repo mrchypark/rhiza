@@ -68,3 +68,35 @@ func TestMembershipHistoryValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestMembershipHistoryAllowsDivergentFreezeAndTerminalQuorums(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	initial := cores["a"].CurrentCluster()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Freeze is certified by {a, b} while c is partitioned.
+	transport.fail("c")
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "c"}}}
+	freezeSlot, err := cores["a"].BeginReconfiguration(ctx, target)
+	if err != nil {
+		t.Fatalf("begin reconfiguration: %v", err)
+	}
+	transport.recover("c")
+
+	// Partition b before finishing removal of b, forcing terminal to certify via {a, c}.
+	transport.fail("b")
+	if err := cores["a"].FinishReconfiguration(ctx); err != nil {
+		t.Fatalf("finish reconfiguration via {a, c}: %v", err)
+	}
+	freeze, _ := cores["a"].decision(freezeSlot)
+	terminal, _ := cores["a"].decision(freezeSlot + 16)
+	record := MembershipRecord{Genesis: initial, Transitions: []ConfigTransition{{Freeze: freeze, Terminal: terminal}}}
+	verifier, err := validateMembershipHistory(initial, record)
+	if err != nil {
+		t.Fatalf("divergent freeze {a,b} / terminal {a,c} rejected: %v", err)
+	}
+	if got := verifier.clusterForSlot(terminal.Slot + 1).ConfigID; got != 2 {
+		t.Fatalf("verified configID=%d want 2", got)
+	}
+}

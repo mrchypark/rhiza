@@ -384,16 +384,48 @@ func (transport *clusterTransport) SendDecision(ctx context.Context, decision De
 		err error
 	}
 	results := make(chan result, len(targets))
+	control, _ := DecodeReconfiguration(decision.Proposal.Value)
 	for _, core := range targets {
-		go func() {
-			if nextMembers != nil {
+		go func(core *Core) {
+			waitConfigBoundary := nextMembers != nil
+			if !waitConfigBoundary && core.reconfigEnabled && decision.ConfigID != 0 {
+				waitConfigBoundary = core.ClusterForSlot(decision.Slot).ConfigID != decision.ConfigID
+			}
+			if waitConfigBoundary {
+				if control && decision.Slot > 1 && core.Tip() < decision.Slot-1 {
+					gate, _ := transport.catchup.LoadOrStore(core.nodeID, &sync.Mutex{})
+					gate.(*sync.Mutex).Lock()
+					if core.Tip() < decision.Slot-1 {
+						transport.mu.RLock()
+						var source *Core
+						for id, candidate := range transport.cores {
+							if !transport.down[id] && candidate.Tip() >= decision.Slot-1 && (source == nil || candidate.Tip() > source.Tip()) {
+								source = candidate
+							}
+						}
+						transport.mu.RUnlock()
+						if source != nil && source != core {
+							for from := core.Tip() + 1; from <= decision.Slot-1; {
+								values, _, err := source.DecisionsFrom(from, int(decision.Slot-1-from+1))
+								if err != nil || len(values) == 0 {
+									break
+								}
+								if err := core.AcceptCertifiedValues(values); err != nil {
+									break
+								}
+								from = values[len(values)-1].Slot + 1
+							}
+						}
+					}
+					gate.(*sync.Mutex).Unlock()
+				}
 				if err := core.WaitTip(ctx, decision.Slot-1); err != nil {
 					results <- result{core.nodeID, err}
 					return
 				}
 			}
 			results <- result{core.nodeID, core.AcceptDecision(decision)}
-		}()
+		}(core)
 	}
 	successes := 0
 	nextSuccesses := 0

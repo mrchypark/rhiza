@@ -48,9 +48,70 @@ func (c *Core) CheckpointMembership(index Slot) (MembershipRecord, error) {
 }
 
 func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
+	record, baseTransitions, err := c.membershipTransitionsLocked(through, through != 0)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	var baseAbort *ConfigTransition
+	if c.baseMembership != nil && len(c.configHistory)-1 == baseTransitions && c.baseMembership.Abort != nil {
+		baseAbort = cloneMembershipRecord(*c.baseMembership).Abort
+	}
+	if through == 0 {
+		if c.lastAbort != nil {
+			abort := ConfigTransition{Freeze: cloneDecidedValue(c.lastAbort.Freeze), Terminal: cloneDecidedValue(c.lastAbort.Terminal)}
+			record.Abort = &abort
+		} else if baseAbort != nil {
+			record.Abort = baseAbort
+		}
+		return record, nil
+	}
+	var lastSuccess Slot
+	if len(record.Transitions) != 0 {
+		lastSuccess = record.Transitions[len(record.Transitions)-1].Terminal.Slot
+	}
+	var candidateBaseAbort *ConfigTransition
+	if c.baseMembership != nil && c.baseMembership.Abort != nil {
+		candidateBaseAbort = cloneMembershipRecord(*c.baseMembership).Abort
+	}
+	abort, err := c.latestAbortAtLocked(through, lastSuccess, candidateBaseAbort)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	record.Abort = abort
+	return record, nil
+}
 
+// checkpointMembershipAtLocked returns the already-recovered membership prefix
+// that existed at a checkpoint cut. Later certified transitions must not
+// invalidate an older marker; the seal is independently checked against this
+// exact prefix and its own genesis-bound certificates.
+func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, error) {
+	if through == 0 {
+		return MembershipRecord{}, fmt.Errorf("checkpoint membership cut is zero")
+	}
+	record, _, err := c.membershipTransitionsLocked(through, false)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	var lastSuccess Slot
+	if len(record.Transitions) != 0 {
+		lastSuccess = record.Transitions[len(record.Transitions)-1].Terminal.Slot
+	}
+	var baseAbort *ConfigTransition
+	if c.baseMembership != nil && c.baseMembership.Abort != nil {
+		baseAbort = cloneMembershipRecord(*c.baseMembership).Abort
+	}
+	abort, err := c.latestAbortAtLocked(through, lastSuccess, baseAbort)
+	if err != nil {
+		return MembershipRecord{}, err
+	}
+	record.Abort = abort
+	return record, nil
+}
+
+func (c *Core) membershipTransitionsLocked(through Slot, rejectCrossing bool) (MembershipRecord, int, error) {
 	if len(c.configHistory) == 0 {
-		return MembershipRecord{}, fmt.Errorf("membership history: no config history")
+		return MembershipRecord{}, 0, fmt.Errorf("membership history: no config history")
 	}
 
 	genesis := cloneCluster(c.configHistory[0].cluster)
@@ -60,11 +121,20 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 	if c.baseMembership != nil {
 		genesis = cloneCluster(c.baseMembership.Genesis)
 		base := cloneMembershipRecord(*c.baseMembership)
-		transitions = base.Transitions
-		baseTransitions = len(transitions)
-		start += len(transitions)
-		if len(c.configHistory)-1 > len(transitions) {
-			base.Abort = nil // a later successful transition starts a new revision.
+		baseTransitions = len(base.Transitions)
+		start += baseTransitions
+		if through == 0 {
+			transitions = base.Transitions
+		} else {
+			for _, transition := range base.Transitions {
+				if transition.Terminal.Slot >= through {
+					if rejectCrossing {
+						return MembershipRecord{}, 0, fmt.Errorf("checkpoint membership crosses configuration boundary at slot %d", transition.Terminal.Slot)
+					}
+					return MembershipRecord{Genesis: genesis, Transitions: transitions}, baseTransitions, nil
+				}
+				transitions = append(transitions, transition)
+			}
 		}
 	}
 
@@ -72,37 +142,40 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 		epoch := c.configHistory[i]
 
 		// Every configHistory entry is produced by applyReconfigurationLocked
-		// which sets epoch.start = previous terminal + 1.  The freeze slot is
+		// which sets epoch.start = previous terminal + 1. The freeze slot is
 		// 17 slots before and the terminal slot is 1 slot before.
 		if epoch.start < 18 {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d has start %d < 18", i, epoch.start)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d has start %d < 18", i, epoch.start)
 		}
 		freezeSlot := epoch.start - 17
 		terminalSlot := epoch.start - 1
 		if through != 0 && terminalSlot >= through {
-			return MembershipRecord{}, fmt.Errorf("checkpoint membership crosses configuration boundary at slot %d", terminalSlot)
+			if rejectCrossing {
+				return MembershipRecord{}, 0, fmt.Errorf("checkpoint membership crosses configuration boundary at slot %d", terminalSlot)
+			}
+			break
 		}
 
 		freezeDecision, frozen, err := c.loadDecidedLocked(freezeSlot)
 		if err != nil {
-			return MembershipRecord{}, fmt.Errorf("membership history: load freeze slot %d: %w", freezeSlot, err)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: load freeze slot %d: %w", freezeSlot, err)
 		}
 		if !frozen {
-			return MembershipRecord{}, fmt.Errorf("membership history: freeze slot %d not decided", freezeSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: freeze slot %d not decided", freezeSlot)
 		}
 		if !c.isDurableLocked(freezeSlot) {
-			return MembershipRecord{}, fmt.Errorf("membership history: freeze slot %d not durable", freezeSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: freeze slot %d not durable", freezeSlot)
 		}
 
 		terminalDecision, terminated, err := c.loadDecidedLocked(terminalSlot)
 		if err != nil {
-			return MembershipRecord{}, fmt.Errorf("membership history: load terminal slot %d: %w", terminalSlot, err)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: load terminal slot %d: %w", terminalSlot, err)
 		}
 		if !terminated {
-			return MembershipRecord{}, fmt.Errorf("membership history: terminal slot %d not decided", terminalSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: terminal slot %d not decided", terminalSlot)
 		}
 		if !c.isDurableLocked(terminalSlot) {
-			return MembershipRecord{}, fmt.Errorf("membership history: terminal slot %d not durable", terminalSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: terminal slot %d not durable", terminalSlot)
 		}
 
 		// Validate internal invariant: the terminal value must be a terminal
@@ -110,25 +183,25 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 		// the same target cluster the configHistory records.
 		terminalControl, ok, err := decodeReconfiguration(terminalDecision.Value)
 		if err != nil || !ok {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal is not a reconfiguration control: %w", i, err)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal is not a reconfiguration control: %w", i, err)
 		}
 		if !terminalControl.Terminal {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal flag unset", i)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal flag unset", i)
 		}
 		if terminalControl.Freeze != freezeSlot {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal freeze=%d want %d", i, terminalControl.Freeze, freezeSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal freeze=%d want %d", i, terminalControl.Freeze, freezeSlot)
 		}
 		if terminalControl.TerminalSlot != terminalSlot {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal slot=%d want %d", i, terminalControl.TerminalSlot, terminalSlot)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal slot=%d want %d", i, terminalControl.TerminalSlot, terminalSlot)
 		}
 		if sha256.Sum256(terminalDecision.Value) != terminalDecision.Hash {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal value hash mismatch", i)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal value hash mismatch", i)
 		}
 		if sha256.Sum256(freezeDecision.Value) != freezeDecision.Hash {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d freeze value hash mismatch", i)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d freeze value hash mismatch", i)
 		}
 		if !sameCluster(terminalControl.Target, epoch.cluster) {
-			return MembershipRecord{}, fmt.Errorf("membership history: transition %d terminal target does not match configHistory", i)
+			return MembershipRecord{}, 0, fmt.Errorf("membership history: transition %d terminal target does not match configHistory", i)
 		}
 
 		transitions = append(transitions, ConfigTransition{
@@ -147,45 +220,28 @@ func (c *Core) membershipHistoryLocked(through Slot) (MembershipRecord, error) {
 		})
 	}
 
-	record := MembershipRecord{Genesis: genesis, Transitions: transitions}
-	if c.lastAbort != nil {
-		abort := ConfigTransition{Freeze: cloneDecidedValue(c.lastAbort.Freeze), Terminal: cloneDecidedValue(c.lastAbort.Terminal)}
-		record.Abort = &abort
-	} else if c.baseMembership != nil && len(c.configHistory)-1 == baseTransitions && c.baseMembership.Abort != nil {
-		abort := cloneMembershipRecord(*c.baseMembership).Abort
-		record.Abort = abort
-	}
-	return record, nil
+	return MembershipRecord{Genesis: genesis, Transitions: transitions}, baseTransitions, nil
 }
 
-// checkpointMembershipAtLocked returns the already-recovered membership prefix
-// that existed at a checkpoint cut. Later certified transitions must not
-// invalidate an older marker; the seal is independently checked against this
-// exact prefix and its own genesis-bound certificates.
-func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, error) {
-	if through == 0 {
-		return MembershipRecord{}, fmt.Errorf("checkpoint membership cut is zero")
-	}
-	record, err := c.membershipHistoryLocked(0)
-	if err != nil {
-		return MembershipRecord{}, err
-	}
-	cut := 0
-	for cut < len(record.Transitions) && record.Transitions[cut].Terminal.Slot < through {
-		cut++
-	}
-	record.Transitions = record.Transitions[:cut]
-	var lastSuccess Slot
-	if len(record.Transitions) != 0 {
-		lastSuccess = record.Transitions[len(record.Transitions)-1].Terminal.Slot
-	}
+// latestAbortAtLocked resolves the latest certified abort within
+// (lastSuccess, through]. Aborts do not change the active epoch, so an abort
+// at the exact checkpoint cut is included.
+func (c *Core) latestAbortAtLocked(through, lastSuccess Slot, baseAbort *ConfigTransition) (*ConfigTransition, error) {
 	var abort *ConfigTransition
-	// CheckpointMembership includes an abort decision at the exact checkpoint
-	// cut: aborts do not change the active epoch, unlike successful transitions
-	// whose terminal must remain strictly before the cut.
-	if record.Abort != nil && record.Abort.Terminal.Slot <= through && record.Abort.Terminal.Slot > lastSuccess {
-		copy := cloneMembershipRecord(MembershipRecord{Abort: record.Abort}).Abort
-		abort = copy
+	if baseAbort != nil && baseAbort.Terminal.Slot <= through && baseAbort.Terminal.Slot > lastSuccess {
+		abort = baseAbort
+	}
+	if c.lastAbort != nil && c.lastAbort.Terminal.Slot <= through && c.lastAbort.Terminal.Slot > lastSuccess {
+		if c.isDurableLocked(c.lastAbort.Freeze.Slot) && c.isDurableLocked(c.lastAbort.Terminal.Slot) {
+			if abort == nil || abort.Terminal.Slot < c.lastAbort.Terminal.Slot {
+				copyAbort := ConfigTransition{Freeze: cloneDecidedValue(c.lastAbort.Freeze), Terminal: cloneDecidedValue(c.lastAbort.Terminal)}
+				abort = &copyAbort
+			}
+		} else if c.lastAbort.Terminal.Slot <= c.floor && baseAbort != nil && sameMembershipTransition(*c.lastAbort, *baseAbort) {
+			if abort == nil || abort.Terminal.Slot < baseAbort.Terminal.Slot {
+				abort = baseAbort
+			}
+		}
 	}
 	inspectAbortSlot := func(slot Slot) error {
 		if slot <= lastSuccess || slot > through || !c.isDurableLocked(slot) {
@@ -224,7 +280,7 @@ func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, err
 		}
 		seenAbort[slot] = struct{}{}
 		if err := inspectAbortSlot(slot); err != nil {
-			return MembershipRecord{}, err
+			return nil, err
 		}
 	}
 	for slot := range c.decided {
@@ -232,9 +288,8 @@ func (c *Core) checkpointMembershipAtLocked(through Slot) (MembershipRecord, err
 			continue
 		}
 		if err := inspectAbortSlot(slot); err != nil {
-			return MembershipRecord{}, err
+			return nil, err
 		}
 	}
-	record.Abort = abort
-	return record, nil
+	return abort, nil
 }

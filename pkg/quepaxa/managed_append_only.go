@@ -195,11 +195,17 @@ func (c *Core) validateManagedCheckpointRootLocal(candidate ManagedCheckpointCan
 		if seal.Membership == nil {
 			return fmt.Errorf("managed checkpoint lacks historical membership proof")
 		}
-		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); err == nil && !sameMembershipRecord(localMembership, *seal.Membership) {
-			return fmt.Errorf("managed checkpoint membership differs from available local history")
-		}
-		if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
-			return fmt.Errorf("managed checkpoint cut config differs from available local history")
+		if seal.Index <= c.tip {
+			localMembership, err := c.checkpointMembershipAtLocked(seal.Index)
+			if err != nil {
+				return err
+			}
+			if !sameMembershipRecord(localMembership, *seal.Membership) {
+				return fmt.Errorf("managed checkpoint membership differs from available local history")
+			}
+			if seal.ConfigID != c.clusterForSlotLocked(seal.Index+1).ConfigID {
+				return fmt.Errorf("managed checkpoint cut config differs from available local history")
+			}
 		}
 	} else {
 		if seal.Membership != nil || seal.ConfigID != c.config.ConfigID {
@@ -310,7 +316,11 @@ func (c *Core) validateManagedCandidateLocalLocked(candidate ManagedCheckpointCa
 		if seal.Membership == nil {
 			return fmt.Errorf("managed checkpoint lacks historical membership proof")
 		}
-		if localMembership, err := c.checkpointMembershipAtLocked(seal.Index); err == nil {
+		if seal.Index <= c.tip {
+			localMembership, err := c.checkpointMembershipAtLocked(seal.Index)
+			if err != nil {
+				return err
+			}
 			if !sameMembershipRecord(localMembership, *seal.Membership) {
 				return fmt.Errorf("managed checkpoint membership differs from available local history")
 			}

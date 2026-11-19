@@ -7,12 +7,77 @@ import (
 	"time"
 )
 
-// TestIssue328FreezeQuorumVoterLossCharacterization documents the current
-// liveness limitation reported in issue 328. This is characterization of a
-// known defect, not the intended target behavior for membership transitions.
+// TestIssue328FreezeQuorumVoterLossCharacterization verifies that Freeze -> Terminal
+// transitions survive the loss of a freeze-quorum voter whenever another clean
+// old-config voter remains available, while still waiting for target quorum ACK
+// on terminal installation.
 func TestIssue328FreezeQuorumVoterLossCharacterization(t *testing.T) {
-	t.Run("finish removal", func(t *testing.T) {
+	t.Run("abort addition survives freeze voter loss", func(t *testing.T) {
 		cores, transport := reconfigCluster(t)
+		initial := cores["a"].CurrentCluster()
+		target := Cluster{ConfigID: 2, Members: []Member{
+			{ID: "a"}, {ID: "b"}, {ID: "c"},
+			{ID: "d", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"},
+		}}
+		freeze := freezeWithAB(t, boundedContext(t, 10*time.Second), cores["a"], transport, target)
+		terminal := freeze + 16
+
+		transport.fail("b")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := cores["a"].AbortReconfiguration(ctx); err != nil {
+			t.Fatalf("abort with freeze voter b unavailable: %v", err)
+		}
+		if got := cores["a"].CurrentCluster(); !sameCluster(got, initial) {
+			t.Fatalf("abort changed cluster: got=%+v want=%+v", got, initial)
+		}
+		if _, pending := cores["a"].PendingReconfiguration(); pending {
+			t.Fatal("abort remained pending after freeze voter loss")
+		}
+		if got := cores["a"].Tip(); got != terminal {
+			t.Fatalf("tip=%d want %d", got, terminal)
+		}
+		history, err := cores["a"].MembershipHistory()
+		if err != nil {
+			t.Fatalf("membership history: %v", err)
+		}
+		if _, err := validateMembershipHistory(initial, history); err != nil {
+			t.Fatalf("validate divergent freeze/abort history: %v", err)
+		}
+		assertReadWrite(t, boundedContext(t, 10*time.Second), cores["a"], "after-abort-freeze-voter-loss")
+	})
+
+	t.Run("finish removal of failed freeze voter", func(t *testing.T) {
+		cores, transport := reconfigCluster(t)
+		initial := cores["a"].CurrentCluster()
+		target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "c"}}}
+		freezeWithAB(t, boundedContext(t, 10*time.Second), cores["a"], transport, target)
+
+		transport.fail("b")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := cores["a"].FinishReconfiguration(ctx); err != nil {
+			t.Fatalf("finish removal of failed freeze voter b: %v", err)
+		}
+		if got := cores["a"].CurrentCluster(); !sameCluster(got, target) {
+			t.Fatalf("cluster after finish=%+v want=%+v", got, target)
+		}
+		if _, pending := cores["a"].PendingReconfiguration(); pending {
+			t.Fatal("reconfiguration remained pending after removal of failed freeze voter")
+		}
+		history, err := cores["a"].MembershipHistory()
+		if err != nil {
+			t.Fatalf("membership history: %v", err)
+		}
+		if _, err := validateMembershipHistory(initial, history); err != nil {
+			t.Fatalf("validate divergent freeze/terminal history: %v", err)
+		}
+		assertReadWrite(t, boundedContext(t, 10*time.Second), cores["a"], "after-finish-divergent-quorum")
+	})
+
+	t.Run("finish removal waiting on target voter recovery", func(t *testing.T) {
+		cores, transport := reconfigCluster(t)
+		initial := cores["a"].CurrentCluster()
 		target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
 		freeze := freezeWithAB(t, boundedContext(t, 10*time.Second), cores["a"], transport, target)
 		terminal := freeze + 16
@@ -21,9 +86,19 @@ func TestIssue328FreezeQuorumVoterLossCharacterization(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := cores["a"].FinishReconfiguration(ctx); !errors.Is(err, ErrQuorumUnavailable) {
-			t.Fatalf("finish with freeze voter b unavailable: %v", err)
+			t.Fatalf("finish without target voter b: %v, want ErrQuorumUnavailable", err)
 		}
-		assertFrozenTerminalBlocked(t, cores, terminal)
+		// Terminal was certified under old quorum {a, c}, advancing a to target {a, b},
+		// while target {a, b} still lacks b's ACK until b recovers.
+		if got := cores["a"].Tip(); got != terminal {
+			t.Fatalf("tip=%d want certified terminal %d", got, terminal)
+		}
+		if got := cores["a"].CurrentCluster(); !sameCluster(got, target) {
+			t.Fatalf("cluster=%+v want=%+v", got, target)
+		}
+		if _, _, err := cores["a"].Propose(boundedContext(t, 2*time.Second), []byte("blocked-without-b")); !errors.Is(err, ErrQuorumUnavailable) {
+			t.Fatalf("write without target voter b: %v, want ErrQuorumUnavailable", err)
+		}
 
 		transport.recover("b")
 		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
@@ -37,40 +112,14 @@ func TestIssue328FreezeQuorumVoterLossCharacterization(t *testing.T) {
 		if _, pending := cores["a"].PendingReconfiguration(); pending {
 			t.Fatal("reconfiguration remained pending after b recovery")
 		}
+		history, err := cores["a"].MembershipHistory()
+		if err != nil {
+			t.Fatalf("membership history: %v", err)
+		}
+		if _, err := validateMembershipHistory(initial, history); err != nil {
+			t.Fatalf("validate recovered history: %v", err)
+		}
 		assertReadWrite(t, boundedContext(t, 10*time.Second), cores["a"], "after-finish-recovery")
-	})
-
-	t.Run("abort addition", func(t *testing.T) {
-		cores, transport := reconfigCluster(t)
-		initial := cores["a"].CurrentCluster()
-		target := Cluster{ConfigID: 2, Members: []Member{
-			{ID: "a"}, {ID: "b"}, {ID: "c"},
-			{ID: "d", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"},
-		}}
-		freeze := freezeWithAB(t, boundedContext(t, 10*time.Second), cores["a"], transport, target)
-		terminal := freeze + 16
-
-		transport.fail("b")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := cores["a"].AbortReconfiguration(ctx); !errors.Is(err, ErrQuorumUnavailable) {
-			t.Fatalf("abort with freeze voter b unavailable: %v", err)
-		}
-		assertFrozenTerminalBlocked(t, cores, terminal)
-
-		transport.recover("b")
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := cores["a"].AbortReconfiguration(ctx); err != nil {
-			t.Fatalf("abort after b recovery: %v", err)
-		}
-		if got := cores["a"].CurrentCluster(); !sameCluster(got, initial) {
-			t.Fatalf("abort changed cluster: got=%+v want=%+v", got, initial)
-		}
-		if _, pending := cores["a"].PendingReconfiguration(); pending {
-			t.Fatal("abort remained pending after b recovery")
-		}
-		assertReadWrite(t, boundedContext(t, 10*time.Second), cores["a"], "after-abort-recovery")
 	})
 }
 
@@ -100,46 +149,6 @@ func freezeWithAB(t *testing.T, ctx context.Context, core *Core, transport *clus
 		t.Fatalf("freeze recorders=%v want [a b]", sources)
 	}
 	return freeze
-}
-
-func assertFrozenTerminalBlocked(t *testing.T, cores map[NodeID]*Core, terminal Slot) {
-	t.Helper()
-	core := cores["a"]
-	aTarget, aPending := core.PendingReconfiguration()
-	cTarget, cPending := cores["c"].PendingReconfiguration()
-	if !aPending || !cPending || !sameCluster(aTarget, cTarget) {
-		t.Fatalf("surviving voters pending: a=%t c=%t targets=%+v/%+v", aPending, cPending, aTarget, cTarget)
-	}
-	for _, id := range []NodeID{"a", "c"} {
-		if got := cores[id].Tip(); got != terminal-1 {
-			t.Fatalf("%s tip=%d want drained through %d", id, got, terminal-1)
-		}
-	}
-
-	core.mu.RLock()
-	_, attempted := core.recorders[terminal]
-	_, decided := core.decided[terminal]
-	core.mu.RUnlock()
-	if !attempted || decided {
-		t.Fatalf("a terminal attempted=%t decided=%t, want attempted and undecided", attempted, decided)
-	}
-
-	cores["c"].mu.RLock()
-	_, attempted = cores["c"].recorders[terminal]
-	_, decided = cores["c"].decided[terminal]
-	cores["c"].mu.RUnlock()
-	if attempted || decided {
-		t.Fatalf("live c received terminal: attempted=%t decided=%t", attempted, decided)
-	}
-
-	for _, id := range []NodeID{"a", "c"} {
-		if _, _, err := cores[id].Propose(boundedContext(t, 10*time.Second), []byte("blocked")); !errors.Is(err, ErrReconfigurationDrain) {
-			t.Fatalf("%s write while frozen: %v", id, err)
-		}
-		if _, _, err := cores[id].ReadIndex(boundedContext(t, 200*time.Millisecond)); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("%s read while frozen: %v, want deadline", id, err)
-		}
-	}
 }
 
 func assertReadWrite(t *testing.T, ctx context.Context, core *Core, value string) {

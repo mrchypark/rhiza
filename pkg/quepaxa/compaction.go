@@ -277,7 +277,14 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 			c.unlockCompactionBarrier()
 			return fmt.Errorf("compaction cannot cross active reconfiguration")
 		}
-		membership, membershipErr := c.membershipHistoryLocked(through)
+		for i := 1; i < len(c.configHistory); i++ {
+			if c.configHistory[i].start-1 == through {
+				c.mu.Unlock()
+				c.unlockCompactionBarrier()
+				return fmt.Errorf("checkpoint membership crosses configuration boundary at slot %d", through)
+			}
+		}
+		membership, membershipErr := c.checkpointMembershipAtLocked(through)
 		if membershipErr != nil || seal.Membership == nil || !sameMembershipRecord(membership, *seal.Membership) {
 			c.mu.Unlock()
 			c.unlockCompactionBarrier()
@@ -445,6 +452,8 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 			return nil, err
 		}
 		v.putDecidedLocked(slot, value)
+		v.durable[slot] = true
+		v.logged[slot] = true
 		if v.reconfigEnabled {
 			if err := v.advanceReconfigurationTipLocked(); err != nil {
 				return nil, err
@@ -459,11 +468,11 @@ func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
 			return nil, fmt.Errorf("compaction suffix changed checked prefix")
 		}
 		if c.reconfigEnabled {
-			before, err := c.membershipHistoryLocked(c.tip)
+			before, err := c.membershipHistoryLocked(0)
 			if err != nil {
 				return nil, err
 			}
-			after, err := v.membershipHistoryLocked(v.tip)
+			after, err := v.membershipHistoryLocked(0)
 			if err != nil {
 				return nil, err
 			}
@@ -690,6 +699,17 @@ func (c *Core) installBaseLocked(base consensusBase) {
 		}
 	}
 	c.abortTerminalSlots = keptAbort
+	for slot := range c.coldLeaderSchedules {
+		if slot <= base.ClosedThrough {
+			delete(c.coldLeaderSchedules, slot)
+		}
+	}
+	for epoch := range c.epochStart {
+		if epoch < base.LeaderEpoch {
+			delete(c.epochStart, epoch)
+		}
+	}
+	c.recentStaged = nil
 	clear(c.prefixes)
 	c.prefixes[base.ClosedThrough] = base.PrefixHash
 	for slot := range c.decided {

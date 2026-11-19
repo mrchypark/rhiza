@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -281,6 +282,45 @@ func TestWALIdentityExposesExistingBootstrapBinding(t *testing.T) {
 	}
 	if got, want := core.WALIdentity(), hex.EncodeToString(identity); got != want {
 		t.Fatalf("WAL identity=%q want=%q", got, want)
+	}
+}
+
+func TestCheckpointMembershipExcludesLaterAbortAndRejectsUnfrozenAbort(t *testing.T) {
+	cores, _ := reconfigCluster(t)
+	core := cores["a"]
+	ctx := context.Background()
+
+	// Complete one transition so previousTerminal != 0, then verify AbortReconfiguration
+	// rejects when no freeze is active.
+	target1 := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := core.BeginReconfiguration(ctx, target1); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.FinishReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfiguration(ctx); err == nil || !strings.Contains(err.Error(), "reconfiguration is not frozen") {
+		t.Fatalf("unfrozen abort error=%v, want 'reconfiguration is not frozen'", err)
+	}
+
+	// Write a certified pre-abort checkpoint cut, then perform an aborted addition.
+	if _, _, err := core.Propose(ctx, []byte("pre-abort-entry")); err != nil {
+		t.Fatal(err)
+	}
+	preAbortCut := core.Tip()
+	lost := Cluster{ConfigID: 3, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "d", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"}}}
+	if _, err := core.BeginReconfiguration(ctx, lost); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfiguration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	preAbortMembership, err := core.CheckpointMembership(preAbortCut)
+	if err != nil {
+		t.Fatalf("CheckpointMembership(%d): %v", preAbortCut, err)
+	}
+	if preAbortMembership.Abort != nil {
+		t.Fatalf("pre-abort cut %d leaked later abort at slot %d", preAbortCut, preAbortMembership.Abort.Terminal.Slot)
 	}
 }
 

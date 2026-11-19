@@ -243,25 +243,30 @@ func foregroundLearnDiagnosticErrorCategory(err error) string {
 	}
 }
 
-// sendFreezeDecision requires every recorder named by the freeze certificate.
-// A generic quorum could otherwise omit a safe recorder that must learn the
-// freeze before it can reject the terminal record under the old configuration.
+// sendFreezeDecision delivers the freeze certificate to a durable quorum of
+// old voters. Any clean old-config voter that learns the freeze and drains
+// through T-1 can participate in terminal certification, so a failed freeze
+// recorder no longer blocks freeze publication.
 func (t *Transport) sendFreezeDecision(ctx context.Context, decision quepaxa.Decision) error {
-	required := make(map[quepaxa.NodeID]bool, len(decision.Summaries))
 	for _, summary := range decision.Summaries {
 		if _, ok := t.members[summary.RecorderID]; !ok {
 			return fmt.Errorf("freeze recorder %q is not a voter", summary.RecorderID)
 		}
-		required[summary.RecorderID] = summary.RecorderID == t.localID
 	}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
-		id  quepaxa.NodeID
 		err error
 	}
-	results := make(chan result, len(t.members)-1)
+	results := make(chan result, len(t.members))
 	pending := 0
+	successes := 0
+	if _, ok := t.members[t.localID]; ok {
+		successes = 1
+	}
+	if successes >= len(t.members)/2+1 {
+		return nil
+	}
 	for _, member := range t.members {
 		if member.ID == t.localID {
 			continue
@@ -271,10 +276,9 @@ func (t *Transport) sendFreezeDecision(ctx context.Context, decision quepaxa.Dec
 			req := t.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
 			_, err := t.callQuorum(callCtx, member.ID, req)
-			results <- result{id: member.ID, err: err}
+			results <- result{err: err}
 		}(member)
 	}
-	successes := 1
 	var firstErr error
 	for range pending {
 		result := <-results
@@ -282,23 +286,10 @@ func (t *Transport) sendFreezeDecision(ctx context.Context, decision quepaxa.Dec
 			if firstErr == nil {
 				firstErr = result.err
 			}
-			if _, needed := required[result.id]; needed {
-				return result.err
-			}
 			continue
 		}
 		successes++
-		if _, needed := required[result.id]; needed {
-			required[result.id] = true
-		}
-		allRequired := true
-		for _, acknowledged := range required {
-			if !acknowledged {
-				allRequired = false
-				break
-			}
-		}
-		if allRequired && successes >= len(t.members)/2+1 {
+		if successes >= len(t.members)/2+1 {
 			return nil
 		}
 	}

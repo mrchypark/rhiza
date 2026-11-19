@@ -3,6 +3,7 @@ package quepaxa
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -323,5 +324,36 @@ func TestTerminalRecordCatchesUpInsidePipelineWindow(t *testing.T) {
 	ordinary := RecordRequest{Slot: 18, Proposal: newProposal(highestPriority, "a", []byte("ordinary"))}
 	if got := lagged.RecordCatchUpThrough(ordinary); got != 2 {
 		t.Fatalf("ordinary window changed: %d", got)
+	}
+}
+
+func TestReconfigurationRecordQuorumRejectsUnboundReconfigurationID(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	freezeSlot, err := cores["a"].BeginReconfiguration(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["a"].RecoverThrough(ctx, freezeSlot+15); err != nil {
+		t.Fatal(err)
+	}
+	// Downgrade c before terminal certification so its Summary omits ReconfigurationID.
+	cores["c"].reconfigEnabled = false
+	stale := newProposal(highestPriority, "c", []byte("stale-unupgraded"))
+	if _, err := cores["c"].Record(ctx, RecordRequest{Slot: freezeSlot + 16, Step: 4, Proposal: stale}); err != nil {
+		t.Fatal(err)
+	}
+	// Fail b: only c (un-upgraded) and a remain; recordQuorum must reject c's unbound Summary.
+	transport.fail("b")
+	if err := cores["a"].FinishReconfiguration(ctx); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("finish with unbound recorder c: err=%v, want ErrQuorumUnavailable", err)
+	}
+	// Once b recovers, {a, b} certify terminal with matching ReconfigurationID.
+	transport.recover("b")
+	if err := cores["a"].FinishReconfiguration(ctx); err != nil {
+		t.Fatalf("finish after b recovery: %v", err)
 	}
 }
