@@ -11,6 +11,7 @@ import (
 	"path"
 	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -213,7 +214,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 	} else {
 		stage = managedMembershipStageCompletion
 		// A locally durable terminal does not establish delivery/ACK completion.
-		terminal, err := n.retainedMembershipTerminal(operation)
+		terminal, err := n.retainedMembershipTerminal(ctx, operation)
 		if err != nil {
 			return err
 		}
@@ -242,7 +243,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 
 // Selects the retained terminal for a journal's exact target and abort round.
 // OperationID provenance is checked against the immutable journal by callers.
-func (n *Node) retainedMembershipTerminal(operation membershipOperation) (quepaxa.DecidedValue, error) {
+func (n *Node) retainedMembershipTerminal(ctx context.Context, operation membershipOperation) (quepaxa.DecidedValue, error) {
 	history, err := n.core.MembershipHistory()
 	if err != nil {
 		return quepaxa.DecidedValue{}, fmt.Errorf("membership completion history: %w", err)
@@ -257,24 +258,19 @@ func (n *Node) retainedMembershipTerminal(operation membershipOperation) (quepax
 		if terminal != nil {
 			return quepaxa.DecidedValue{}, fmt.Errorf("ambiguous membership terminal")
 		}
-		if previous < n.core.CompactionFloor() {
-			return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history compacted")
+		revisions, err := n.membershipAbortRevisions(ctx, operation, previous, transition.Freeze.Slot)
+		if err != nil {
+			return quepaxa.DecidedValue{}, err
 		}
-		var revision quepaxa.Slot
-		for slot := previous + 1; slot < transition.Freeze.Slot; slot++ {
-			value, ok := n.core.CertifiedValue(slot)
-			if !ok {
-				return quepaxa.DecidedValue{}, fmt.Errorf("membership revision history unavailable")
+		if operation.Request.ExpectedAbortSlot != 0 {
+			matched := false
+			for _, revision := range revisions {
+				matched = matched || revision == operation.Request.ExpectedAbortSlot
 			}
-			control, err := quepaxa.DecodeReconfiguration(value.Value)
-			if err != nil {
-				return quepaxa.DecidedValue{}, fmt.Errorf("invalid membership revision history: %w", err)
+			if !matched {
+				return quepaxa.DecidedValue{}, network.ErrRequestConflict
 			}
-			if control {
-				revision = slot
-			}
-		}
-		if revision != operation.Request.ExpectedAbortSlot {
+		} else if len(revisions) != 0 {
 			return quepaxa.DecidedValue{}, network.ErrRequestConflict
 		}
 		decision := transition.Terminal
@@ -284,6 +280,50 @@ func (n *Node) retainedMembershipTerminal(operation membershipOperation) (quepax
 		return quepaxa.DecidedValue{}, fmt.Errorf("membership terminal unavailable")
 	}
 	return *terminal, nil
+}
+
+// membershipAbortRevisions reads the bounded immutable journal range for one
+// target. Unlike the old cold-WAL scan, it does not require pre-compaction
+// decisions and never derives authority from a slot number alone.
+func (n *Node) membershipAbortRevisions(ctx context.Context, operation membershipOperation, after, before quepaxa.Slot) ([]quepaxa.Slot, error) {
+	if n == nil || n.bucket == nil || before <= after {
+		return nil, network.ErrRequestConflict
+	}
+	expected := operation.Request.ExpectedAbortSlot
+	if expected != 0 {
+		change := operation.Request
+		data, err := readVoterRegistration(ctx, n.bucket, n.membershipOperationKey(change))
+		if err != nil {
+			return nil, fmt.Errorf("read membership abort revision: %w", err)
+		}
+		var abort membershipOperation
+		if len(data) == 0 || json.Unmarshal(data, &abort) != nil || abort.Request.ExpectedAbortSlot != expected || abort.Request.ClusterID != operation.Request.ClusterID || abort.Request.ExpectedConfigID != operation.Request.ExpectedConfigID || !reflect.DeepEqual(abort.Target, operation.Target) || expected <= after || expected >= before {
+			return nil, network.ErrRequestConflict
+		}
+		return []quepaxa.Slot{expected}, nil
+	}
+	dir := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "membership")
+	prefix := fmt.Sprintf("%d-abort-", operation.Request.ExpectedConfigID)
+	var revisions []quepaxa.Slot
+	err := n.bucket.Iter(ctx, dir, func(name string) error {
+		if !strings.HasPrefix(path.Base(name), prefix) {
+			return nil
+		}
+		data, err := readVoterRegistration(ctx, n.bucket, name)
+		if err != nil {
+			return err
+		}
+		var abort membershipOperation
+		if json.Unmarshal(data, &abort) != nil || abort.Request.ExpectedAbortSlot <= after || abort.Request.ExpectedAbortSlot >= before || abort.Request.ClusterID != operation.Request.ClusterID || abort.Request.ExpectedConfigID != operation.Request.ExpectedConfigID || !reflect.DeepEqual(abort.Target, operation.Target) {
+			return nil
+		}
+		revisions = append(revisions, abort.Request.ExpectedAbortSlot)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read membership abort history: %w", err)
+	}
+	return revisions, nil
 }
 
 func (n *Node) membershipOperationKey(request network.MembershipChange) string {

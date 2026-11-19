@@ -98,9 +98,9 @@ func openReadOnlyViewAtHeadForPolicy(ctx context.Context, bucket objstore.Bucket
 	if bucket == nil || len(capturedHead) == 0 || len(capturedHead) > maxArchiveHeadSize {
 		return nil, fmt.Errorf("invalid captured archive head")
 	}
-	// A request-profile captured HEAD with no selected locator means the
-	// original archive-only selection, not permission to discover a later CURRENT.
-	discoverLocator := expected != sqlpolicy.ManagedRequestMaterializationPolicy
+	// Discovery is bounded by capturedHead.Tip. A later CURRENT cannot move the
+	// selected base, while an older verified QCKP may still bound replay.
+	discoverLocator := expected == sqlpolicy.ManagedRequestMaterializationPolicy || expected == sqlpolicy.ManagedGraphRequestMaterializationPolicy
 	return openReadOnlyView(ctx, &capturedHeadBucket{Bucket: bucket, name: path.Join(prefix, "archive/head.bin"), head: bytes.Clone(capturedHead)}, prefix, configID, bootstrap, expected, window, selected, trustedReconfiguration, applicationProtocol, discoverLocator)
 }
 
@@ -160,7 +160,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	}
 	v := &ReadOnlyView{headHash: sha256.Sum256(encoded), headBytes: encoded, base: head.Base, tip: head.Tip, expectedPolicy: expectedPolicy, idempotencyWindow: window, applicationProtocol: applicationProtocol}
 	var cp *checkpoint.Manager
-	if expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+	if expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy || expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 		cp, err = checkpoint.NewAppendOnlyManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
 	} else {
 		cp, err = checkpoint.NewManagerForPolicy(bucket, prefix, "", expectedPolicy, configID)
@@ -172,34 +172,23 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 	snapshot := &RecoverySnapshot{manager: m, head: head, refs: m.extents}
 	seal, decision, hasCheckpoint := snapshot.RecoveryBase()
 	graphPolicy := expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy
-	var graphLocator checkpoint.ManagedGraphLocator
-	if graphPolicy {
+	if graphPolicy || expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
+		var locator checkpoint.ManagedAppendOnlyLocator
+		var found bool
 		if selected != nil {
-			graphLocator = *selected
-		} else {
-			var found bool
-			graphLocator, found, err = cp.LoadManagedGraphLocator(ctx)
+			locator, found = checkpoint.ManagedAppendOnlyLocator(*selected), true
+		} else if discoverLocator {
+			locator, found, err = discoverManagedAppendOnlyLocator(ctx, snapshot, cp, expectedPolicy, snapshot.Tip())
 			if err != nil {
-				return nil, fmt.Errorf("managed Graph restore requires a producer checkpoint locator: %w", err)
-			}
-			if !found {
-				return nil, fmt.Errorf("managed Graph restore requires a producer checkpoint locator")
+				return nil, fmt.Errorf("discover managed checkpoint locator: %w", err)
 			}
 		}
-		v.graphLocator = &graphLocator
-	} else if expectedPolicy == sqlpolicy.ManagedRequestMaterializationPolicy {
-		if selected != nil {
-			locator := *selected
-			v.graphLocator = &locator
-		} else if discoverLocator {
-			locator, found, err := cp.LoadManagedAppendOnlyLocator(ctx, expectedPolicy)
-			if err != nil {
-				return nil, fmt.Errorf("load managed request checkpoint locator: %w", err)
-			}
-			if found {
-				selected := checkpoint.ManagedGraphLocator(locator)
-				v.graphLocator = &selected
-			}
+		if found {
+			selected := checkpoint.ManagedGraphLocator(locator)
+			v.graphLocator = &selected
+		}
+		if graphPolicy && !found {
+			return nil, fmt.Errorf("managed Graph restore requires a producer checkpoint locator")
 		}
 	}
 	if hasCheckpoint {
@@ -339,7 +328,7 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, err
 		}
 	}
-	bytes := 0
+	bytes, decisions := 0, 0
 	for core.Tip() < head.Tip {
 		values, _, err := snapshot.DecisionsFrom(ctx, core.Tip()+1, 256)
 		if err != nil {
@@ -349,6 +338,10 @@ func openReadOnlyView(ctx context.Context, bucket objstore.Bucket, prefix string
 			return nil, fmt.Errorf("archive suffix ends before head")
 		}
 		for _, value := range values {
+			decisions++
+			if decisions > maxReadOnlyDecisions {
+				return nil, fmt.Errorf("read-only archive suffix exceeds decision limit")
+			}
 			if expectedPolicy == sqlpolicy.ManagedGraphRequestMaterializationPolicy {
 				if err := types.ValidateManagedGraphExecutionPolicy(value.Value); err != nil {
 					return nil, err

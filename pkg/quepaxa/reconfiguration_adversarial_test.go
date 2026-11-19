@@ -3,12 +3,35 @@ package quepaxa
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
+
+type mismatchedReconfigurationTransport struct{}
+
+func (mismatchedReconfigurationTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+	return Summary{RecorderID: to, ReconfigurationID: ValueHash{0xff}, Step: request.Step}, nil
+}
+
+func (mismatchedReconfigurationTransport) SendDecision(context.Context, Decision) error {
+	return errors.New("unexpected decision")
+}
+
+func (mismatchedReconfigurationTransport) ReadTip(context.Context, NodeID) (Slot, error) {
+	return 0, errors.New("unexpected read")
+}
+
+func (mismatchedReconfigurationTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("unexpected stage")
+}
+
+func (mismatchedReconfigurationTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("unexpected fetch")
+}
 
 // TestReconfigurationSparseFreezeCertificates keeps the normal sparse
 // pipeline intact: a later certified freeze is buffered until the first
@@ -121,6 +144,18 @@ func TestReconfigurationTerminalUsesFreezeQuorumNotTargetIntersection(t *testing
 	}
 	if len(decision.Summaries) != 2 || decision.Summaries[0].RecorderID != "a" || decision.Summaries[1].RecorderID != "b" {
 		t.Fatalf("terminal quorum=%v want freeze quorum [a b]", summarySources(decision.Summaries))
+	}
+}
+
+func TestRecordQuorumRejectsMismatchedReconfigurationID(t *testing.T) {
+	cores, _ := reconfigCluster(t)
+	core := cores["a"]
+	core.transport = mismatchedReconfigurationTransport{}
+	proposal := newProposal(highestPriority, "a", []byte("reconfiguration-id-regression"))
+	request := RecordRequest{Slot: 1, Step: 4, ConfigID: 1, ReconfigurationID: ValueHash{1}, Proposal: proposal}
+	requests := map[NodeID]RecordRequest{"a": request, "b": request, "c": request}
+	if summaries, err := core.recordQuorum(context.Background(), requests); !errors.Is(err, ErrQuorumUnavailable) || len(summaries) != 0 {
+		t.Fatalf("mismatched summaries summaries=%d err=%v", len(summaries), err)
 	}
 }
 

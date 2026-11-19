@@ -29,7 +29,6 @@ func (n *Node) startManagedGraphCheckpointPublisher(ctx context.Context) {
 	if interval <= 0 {
 		interval = 15 * time.Minute
 	}
-	period := min(interval, time.Minute)
 	tail := n.config.CheckpointTailBytes
 	if tail <= 0 {
 		tail = 512 << 20
@@ -37,8 +36,6 @@ func (n *Node) startManagedGraphCheckpointPublisher(ctx context.Context) {
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		ticker := time.NewTicker(period)
-		defer ticker.Stop()
 		var last time.Time
 		for {
 			// First publication/recovery is attempted immediately. A failed
@@ -52,10 +49,17 @@ func (n *Node) startManagedGraphCheckpointPublisher(ctx context.Context) {
 					last = time.Now()
 				}
 			}
+			timer := time.NewTimer(n.managedCheckpointPublisherDelay(interval))
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
@@ -248,8 +252,13 @@ func (n *Node) advanceManagedGraphCheckpointCut(ctx context.Context) error {
 	op := &managedGraphControlOperation{value: append([]byte(nil), value...), hash: sha256.Sum256(value), binding: ownerBinding, done: make(chan struct{})}
 	n.managedGraphControlMu.Lock()
 	if n.managedGraphControl != nil {
-		n.managedGraphControlMu.Unlock()
-		return fmt.Errorf("managed Graph checkpoint control already active")
+		select {
+		case <-n.managedGraphControl.done:
+			n.managedGraphControl = nil
+		default:
+			n.managedGraphControlMu.Unlock()
+			return fmt.Errorf("managed Graph checkpoint control already active")
+		}
 	}
 	n.managedGraphControl = op
 	n.managedGraphControlMu.Unlock()
@@ -326,7 +335,7 @@ func (n *Node) waitManagedAppendOnlyControlProof(ctx context.Context, binding *i
 	n.managedGraphControl = op
 	n.wg.Add(1) // Shutdown drains the caller binding borrower before Wait.
 	n.managedGraphControlMu.Unlock()
-	go n.runManagedAppendOnlyBarrier(ctx, binding, op)
+	go n.runManagedAppendOnlyBarrier(binding, op)
 	return n.waitManagedAppendOnlyBarrierProof(ctx, target, op, op.done)
 }
 
@@ -352,18 +361,14 @@ func managedGraphControlCertificateMatches(core *quepaxa.Core, op *managedGraphC
 	return core != nil
 }
 
-func (n *Node) runManagedAppendOnlyBarrier(startCtx context.Context, binding *internalApplicationBinding, op *managedGraphControlOperation) {
+func (n *Node) runManagedAppendOnlyBarrier(binding *internalApplicationBinding, op *managedGraphControlOperation) {
 	defer n.wg.Done()
-	ctx, cancel := context.WithCancel(startCtx)
-	stopLifetime := context.AfterFunc(binding.lifetime, cancel)
-	defer func() {
-		stopLifetime()
-		cancel()
-	}()
+	// A waiter may time out or disconnect. The shared barrier belongs to the
+	// application binding lifetime, not to whichever caller started it first.
+	ctx, cancel := context.WithCancel(binding.lifetime)
+	defer cancel()
 	started := false
-	if startCtx.Err() != nil {
-		op.err = startCtx.Err()
-	} else if ctx.Err() != nil {
+	if ctx.Err() != nil {
 		op.err = ctx.Err()
 	} else {
 		started = true
