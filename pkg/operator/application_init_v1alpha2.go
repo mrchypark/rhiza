@@ -49,6 +49,13 @@ func (s V1Alpha2ApplicationInitSnapshot) EverApplicationReserved() bool {
 	return s.status.EverApplicationReserved()
 }
 
+// Admission parses the live admission view from the same Kubernetes status
+// snapshot loaded by LoadV1Alpha2ApplicationInit, avoiding a second API GET
+// and split-read resourceVersion skew.
+func (s V1Alpha2ApplicationInitSnapshot) Admission() (V1Alpha2AdmissionSnapshot, error) {
+	return parseV1Alpha2Admission(s.status)
+}
+
 // NewV1Alpha2ApplicationInitPlan binds caller-supplied physical and bootstrap
 // digests to the canonical genesis recipe. It does not verify physical storage.
 func NewV1Alpha2ApplicationInitPlan(ref V1Alpha2ClusterRef, logicalID, deploymentUID, assignmentID, physicalBinding, bootstrapPlanDigest, evidenceFormat string) (V1Alpha2ApplicationInitPlan, error) {

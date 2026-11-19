@@ -326,12 +326,11 @@ func evidenceHash(raw json.RawMessage) string {
 	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
-func (h *Host) live(ctx context.Context) (operator.V1Alpha2AdmissionSnapshot, error) {
-	initial, err := operator.LoadV1Alpha2ApplicationInit(ctx, h.cfg.Store, h.cfg.Ref)
-	if err != nil || initial.Assignment().Plan != h.cfg.Plan || initial.Assignment().State != "Consumed" {
-		return operator.V1Alpha2AdmissionSnapshot{}, errors.Join(fmt.Errorf("current consumed initialization binding changed"), err)
+func (h *Host) admissionFromInit(initial operator.V1Alpha2ApplicationInitSnapshot) (operator.V1Alpha2AdmissionSnapshot, error) {
+	if initial.Assignment().Plan != h.cfg.Plan || initial.Assignment().State != "Consumed" {
+		return operator.V1Alpha2AdmissionSnapshot{}, fmt.Errorf("current consumed initialization binding changed")
 	}
-	a, err := operator.LoadV1Alpha2Admission(ctx, h.cfg.Store, h.cfg.Ref)
+	a, err := initial.Admission()
 	if err != nil {
 		return a, err
 	}
@@ -339,6 +338,14 @@ func (h *Host) live(ctx context.Context) (operator.V1Alpha2AdmissionSnapshot, er
 		return a, fmt.Errorf("managed authority or transition changed")
 	}
 	return a, nil
+}
+
+func (h *Host) live(ctx context.Context) (operator.V1Alpha2AdmissionSnapshot, error) {
+	initial, err := operator.LoadV1Alpha2ApplicationInit(ctx, h.cfg.Store, h.cfg.Ref)
+	if err != nil {
+		return operator.V1Alpha2AdmissionSnapshot{}, errors.Join(fmt.Errorf("current consumed initialization binding changed"), err)
+	}
+	return h.admissionFromInit(initial)
 }
 
 // ValidateManagedGraphBootstrapControl verifies live authority for an exact
@@ -376,7 +383,7 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 		}
 		return nil
 	}
-	a, err := h.live(ctx)
+	a, err := h.admissionFromInit(s)
 	if err != nil {
 		return err
 	}
@@ -396,10 +403,6 @@ func (h *Host) ValidateManagedStartup(ctx context.Context, i node.ManagedStartup
 		return h.node.VerifyManagedSQLFreshSource(ctx, i)
 	}
 	if h.cfg.Runtime.Learner != nil && h.cfg.Prepared != nil {
-		a, err := h.live(ctx)
-		if err != nil {
-			return err
-		}
 		r, ok := a.Repair()
 		if !ok && len(h.cfg.RepairOrigin) == 0 {
 			// Trusted prepared startup is also used outside managed replacement.

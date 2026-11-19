@@ -1698,6 +1698,12 @@ func (n *Node) Ready() bool {
 	if err != nil {
 		return false
 	}
+	if readChecker, ok := n.managedStartup.Checker.(ManagedSQLReadChecker); ok {
+		if !n.core.IsVoter() {
+			return false
+		}
+		return readChecker.ValidateManagedSQLRead(ctx, n.managedStartup.Identity, state) == nil
+	}
 	return n.managedStartup.Checker.ValidateManagedAdmission(ctx, n.managedStartup.Identity, state) == nil
 }
 

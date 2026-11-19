@@ -172,3 +172,56 @@ func TestManagedBootstrapPlanIsCommonButBindsActualStorageAndMembership(t *testi
 		t.Fatal("actual bootstrap member address not bound")
 	}
 }
+
+type managedReadTestChecker struct {
+	*managedTestChecker
+	readCalls atomic.Int64
+	denyRead  atomic.Bool
+}
+
+func (c *managedReadTestChecker) ValidateManagedSQLRead(context.Context, ManagedStartupIdentity, ManagedRuntimeState) error {
+	c.readCalls.Add(1)
+	if c.denyRead.Load() {
+		return errors.New("read denied")
+	}
+	return nil
+}
+
+func TestManagedReadinessUsesReadCheckerWithoutAdmissionCalls(t *testing.T) {
+	checker := &managedReadTestChecker{managedTestChecker: &managedTestChecker{}}
+	n := New(&types.ExecutionConfig{
+		NodeID:    "managed",
+		ClusterID: "cluster",
+		DataDir:   t.TempDir(),
+		PeerAddr:  "127.0.0.1:0",
+		Members:   []types.NodeConfig{{ID: "managed", PeerURL: "quic://127.0.0.1:1"}},
+	})
+	n.managedStartup = &ManagedStartupConfig{Checker: checker}
+	if err := n.open(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := n.Shutdown(); err != nil {
+			t.Error(err)
+		}
+	})
+	n.observeCatchUp(nil)
+	if err := n.AdmitManaged(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	beforeAdmissionCalls := checker.admissionCalls.Load()
+	beforeReadCalls := checker.readCalls.Load()
+	if !n.Ready() {
+		t.Fatal("admitted voter with read checker is not ready")
+	}
+	if checker.admissionCalls.Load() != beforeAdmissionCalls {
+		t.Fatalf("Ready() invoked ValidateManagedAdmission %d extra times with ManagedSQLReadChecker", checker.admissionCalls.Load()-beforeAdmissionCalls)
+	}
+	if checker.readCalls.Load() <= beforeReadCalls {
+		t.Fatal("Ready() did not consult ValidateManagedSQLRead")
+	}
+	checker.denyRead.Store(true)
+	if n.Ready() {
+		t.Fatal("Ready() ignored read checker denial")
+	}
+}
