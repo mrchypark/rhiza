@@ -59,13 +59,9 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 		if err := verifier.validateDecisionForRecovery(terminal, true); err != nil {
 			return nil, fmt.Errorf("transition %d terminal quorum: %w", i, err)
 		}
-		safe := make(map[NodeID]bool, len(freeze.Summaries))
-		for _, summary := range freeze.Summaries {
-			safe[summary.RecorderID] = true
-		}
 		for _, summary := range terminal.Summaries {
-			if !safe[summary.RecorderID] || summary.ReconfigurationID != freeze.Proposal.Hash {
-				return nil, fmt.Errorf("terminal recorder is outside its freeze quorum")
+			if summary.ReconfigurationID != freeze.Proposal.Hash {
+				return nil, fmt.Errorf("terminal recorder does not bind its freeze")
 			}
 		}
 		nextMembers := f.Target.MemberSet()
@@ -116,13 +112,9 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 		if err := verifier.validateDecisionForRecovery(terminal, true); err != nil {
 			return nil, fmt.Errorf("abort terminal quorum: %w", err)
 		}
-		safe := make(map[NodeID]bool, len(freeze.Summaries))
-		for _, summary := range freeze.Summaries {
-			safe[summary.RecorderID] = true
-		}
 		for _, summary := range terminal.Summaries {
-			if !safe[summary.RecorderID] || summary.ReconfigurationID != freeze.Proposal.Hash {
-				return nil, fmt.Errorf("abort terminal recorder is outside its freeze quorum")
+			if summary.ReconfigurationID != freeze.Proposal.Hash {
+				return nil, fmt.Errorf("abort terminal recorder does not bind its freeze")
 			}
 		}
 		verifier.decided[terminal.Slot] = abort.Terminal

@@ -467,11 +467,165 @@ func TestCoreColdEvictionPrunesSupersededSealedRoots(t *testing.T) {
 	if hasSeal1 {
 		t.Fatalf("superseded evicted seal1 root %x remained in sealedRoots", seal1.RootHash[:8])
 	}
+	if _, hasPrefix1 := core.prefixes[seal1.Index]; hasPrefix1 {
+		t.Fatalf("superseded evicted seal1 retained orphaned prefix at slot %d", seal1.Index)
+	}
 	if !hasSeal2 {
 		t.Fatalf("latest seal2 root %x missing from sealedRoots", seal2.RootHash[:8])
 	}
 	selected, found, err := core.LatestManagedCheckpointSeal()
 	if err != nil || !found || selected.RootHash != seal2.RootHash || selected.DecisionSlot != 4 {
 		t.Fatalf("LatestManagedCheckpointSeal got (%+v, %t, %v), want seal2", selected, found, err)
+	}
+}
+
+func TestPruneDeadValuesPreservesRecentStagedAndPinned(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := New(Config{NodeID: "n1", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentValue := []byte("recently-staged")
+	recentHash := ValueHash(sha256.Sum256(recentValue))
+	if err := core.StageValue(recentHash, recentValue); err != nil {
+		t.Fatal(err)
+	}
+	pinnedValue := []byte("actively-recorded")
+	pinnedHash := ValueHash(sha256.Sum256(pinnedValue))
+	if err := core.StageValue(pinnedHash, pinnedValue); err != nil {
+		t.Fatal(err)
+	}
+	core.pinValue(pinnedHash)
+	defer core.unpinValue(pinnedHash)
+
+	core.mu.Lock()
+	for i := 0; i < 300; i++ {
+		value := []byte{byte(i), byte(i >> 8)}
+		core.values[ValueHash(sha256.Sum256(value))] = value
+	}
+	core.pruneDeadValuesLocked(map[ValueHash]struct{}{recentHash: {}, pinnedHash: {}})
+	_, hasRecent := core.values[recentHash]
+	_, hasPinned := core.values[pinnedHash]
+	core.mu.Unlock()
+	if !hasRecent || !hasPinned {
+		t.Fatalf("prune removed in-flight values recent=%t pinned=%t", hasRecent, hasPinned)
+	}
+}
+
+func TestPruneDeadValuesSuppressesFullSweepDuringRecovery(t *testing.T) {
+	core := &Core{
+		values:           map[ValueHash][]byte{},
+		valueDurable:     map[ValueHash]bool{},
+		recorders:        map[Slot]ISR{},
+		decided:          map[Slot]DecidedValue{},
+		recovering:       true,
+		maxRetainedSlots: 8,
+	}
+	sentinel := []byte("scan-still-references")
+	sentinelHash := ValueHash(sha256.Sum256(sentinel))
+	core.values[sentinelHash] = sentinel
+	for i := 0; i < 300; i++ {
+		value := []byte{0x80, byte(i), byte(i >> 8)}
+		core.values[ValueHash(sha256.Sum256(value))] = value
+	}
+	core.pruneDeadValuesLocked(nil)
+	if _, ok := core.values[sentinelHash]; !ok {
+		t.Fatal("mid-recovery prune performed a full values sweep")
+	}
+}
+
+func TestColdEvictionIgnoresFutureSealWhenPruningSupersededRoots(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := New(Config{
+		NodeID: "n1", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}}, WAL: wal,
+		MaxRetainedDecisionSlots: 100, MaxRetainedDecisionBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 12; i++ {
+		if _, _, err := core.Propose(context.Background(), numberedTestPayload(i, 128)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRoot := sha256.Sum256([]byte("old-active-seal"))
+	futureRoot := sha256.Sum256([]byte("future-sparse-seal"))
+	core.mu.Lock()
+	core.sealedRoots[oldRoot] = SealedCheckpoint{CheckpointSeal: CheckpointSeal{Index: 2, RootHash: oldRoot}, DecisionSlot: 2}
+	core.sealedRoots[futureRoot] = SealedCheckpoint{CheckpointSeal: CheckpointSeal{Index: 99, RootHash: futureRoot}, DecisionSlot: 100}
+	core.durable[100] = true
+	core.maxRetainedSlots = 4
+	core.evictColdDecisionsLocked()
+	_, hasOld := core.sealedRoots[oldRoot]
+	core.mu.Unlock()
+	if !hasOld {
+		t.Fatal("future seal beyond tip pruned a durable active seal")
+	}
+}
+
+func TestColdEvictionCachesLeaderScheduleForDiskFreeLookup(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := New(Config{
+		NodeID: "n1", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}}, WAL: wal,
+		MaxRetainedDecisionSlots: 2, MaxRetainedDecisionBytes: 1 << 20, EnableReconfiguration: true,
+	})
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := core.RecoverThrough(ctx, 49); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	core.mu.RLock()
+	_, cached := core.coldLeaderSchedules[33]
+	core.mu.RUnlock()
+	if !cached {
+		_ = wal.Close()
+		t.Fatal("leader-schedule control slot was not cached during cold eviction")
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	order, err := core.LeaderOrder(49)
+	if err != nil || len(order) != 1 || order[0] != "n1" {
+		t.Fatalf("LeaderOrder after WAL close order=%v err=%v", order, err)
+	}
+}
+
+func TestInstallBasePrunesEpochStartsBehindBase(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := New(Config{NodeID: "n1", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.mu.Lock()
+	core.epochStart[1] = core.now()
+	core.epochStart[2] = core.now()
+	core.epochStart[3] = core.now()
+	core.installBaseLocked(consensusBase{ClosedThrough: 2, LeaderEpoch: 2, PrefixHash: [32]byte{1}})
+	_, has1 := core.epochStart[1]
+	_, has2 := core.epochStart[2]
+	_, has3 := core.epochStart[3]
+	core.mu.Unlock()
+	if has1 || !has2 || !has3 {
+		t.Fatalf("epoch starts after base installation: 1=%t 2=%t 3=%t", has1, has2, has3)
 	}
 }
