@@ -888,7 +888,7 @@ func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.F
 		if len(files) != 2 || files[0].Role != checkpoint.RoleSQLite || files[1].Role != checkpoint.RoleGraphData {
 			return fmt.Errorf("managed Graph checkpoint requires exact SQLite and Graph roles")
 		}
-		stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-graph-checkpoint-validation-*")
+		stage, err := os.MkdirTemp("", "rhiza-graph-checkpoint-validation-*")
 		if err != nil {
 			return err
 		}
@@ -920,7 +920,7 @@ func (n *Node) validateCheckpointFiles(ctx context.Context, files []checkpoint.F
 	// database and retains its .rhiza-checkpoint-* name until publication ends.
 	// Validate it through production restore in an isolated stage, just like the
 	// Graph branch, without relaxing the live startup artifact guard.
-	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-checkpoint-validation-*")
+	stage, err := os.MkdirTemp("", "rhiza-managed-checkpoint-validation-*")
 	if err != nil {
 		return err
 	}
