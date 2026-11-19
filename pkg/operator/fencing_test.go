@@ -43,6 +43,50 @@ func TestFenceCapacityMatchesCRD(t *testing.T) {
 	}
 }
 
+func TestCapturedFenceIdentityReadsNodeUID(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path != "/api/v1/nodes/node-a" {
+			http.NotFound(w, q)
+			return
+		}
+		_, _ = w.Write([]byte(`{"metadata":{"uid":"node-uid-a"}}`))
+	}))
+	defer server.Close()
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kube := &Kubernetes{BaseURL: server.URL, Namespace: "test", TokenFile: token, Client: server.Client()}
+	pod := object{
+		"spec":   map[string]any{"nodeName": "node-a"},
+		"status": map[string]any{"containerStatuses": []any{map[string]any{"containerID": "containerd://c0", "imageID": "sha256:img"}}},
+	}
+	got, err := capturedFenceIdentity(context.Background(), kube, FenceTarget{NodeID: "n1", Pod: "p1", PodUID: "uid"}, pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeUID != "node-uid-a" || got.NodeName != "node-a" || got.ContainerID != "containerd://c0" {
+		t.Fatalf("captured identity = %+v", got)
+	}
+}
+
+func TestCapturedFenceIdentityFailsClosedOnNodeRead(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "denied", http.StatusForbidden)
+	}))
+	defer server.Close()
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kube := &Kubernetes{BaseURL: server.URL, Namespace: "test", TokenFile: token, Client: server.Client()}
+	pod := object{"spec": map[string]any{"nodeName": "node-a"}}
+	got, err := capturedFenceIdentity(context.Background(), kube, FenceTarget{NodeID: "n1", Pod: "p1", PodUID: "uid"}, pod)
+	if err == nil || got.NodeUID != "" {
+		t.Fatalf("missing Node UID was accepted: identity=%+v err=%v", got, err)
+	}
+}
+
 // One fence must carry every voter plus the retained learner history.
 func TestFenceCapacityBoundary(t *testing.T) {
 	for _, tc := range []struct {
@@ -480,6 +524,7 @@ func TestFenceRequestValidation(t *testing.T) {
 		{"missing sourceClusterID", FenceRequest{OperationID: "o", BindingUID: "b", Scope: ScopeGeneration}, "sourceClusterID"},
 		{"missing bindingUID", FenceRequest{OperationID: "o", SourceClusterID: "s", Scope: ScopeGeneration}, "bindingUID"},
 		{"invalid scope", FenceRequest{OperationID: "o", SourceClusterID: "s", BindingUID: "b", Scope: "Bad"}, "scope"},
+		{"empty target nodeID", FenceRequest{OperationID: "o", SourceClusterID: "s", BindingUID: "b", Scope: ScopeGeneration, Targets: []FenceTarget{{Pod: "pod"}}}, "target nodeID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -503,6 +548,12 @@ func TestCloneClientTimeout(t *testing.T) {
 	cd := cloneClient(&http.Client{Timeout: 5 * time.Second})
 	if cd.Timeout != 5*time.Second {
 		t.Errorf("under-limit: timeout = %v, want 5s", cd.Timeout)
+	}
+}
+
+func TestFencingClientRejectsNegativeTimeout(t *testing.T) {
+	if _, err := (&FencingClient{Client: &http.Client{Timeout: -time.Second}}).Fence(t.Context(), FenceRequest{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative timeout accepted: %v", err)
 	}
 }
 

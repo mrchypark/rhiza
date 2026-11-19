@@ -169,6 +169,32 @@ func TestNewHandler_ActivateRoundtrip(t *testing.T) {
 	}
 }
 
+func TestNewHandler_ReleasePendingTransition(t *testing.T) {
+	b := newTestBackend()
+	seed(b, "anc")
+	coord := &Coordinator{Backend: b, EvidenceFormat: "test-schema", Verifier: func(context.Context, Request, Record) (Binding, []byte, error) {
+		return Binding{}, nil, fmt.Errorf("proof pending")
+	}}
+	server := httptest.NewServer(NewHandler(coord, "tok"))
+	defer server.Close()
+
+	resp := doAction(t, server.URL, "tok", "activate", testReq(), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("pending verifier status = %d, want 503", resp.StatusCode)
+	}
+	resp = doAction(t, server.URL, "tok", "release", testReq(), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("release status = %d, want 200", resp.StatusCode)
+	}
+	resp = doAction(t, server.URL, "tok", "release", testReq(), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second release status = %d, want 409", resp.StatusCode)
+	}
+}
+
 func TestNewHandler_VerifyRoundtrip(t *testing.T) {
 	coord, _ := testCoord(t)
 	handler := NewHandler(coord, "tok")
