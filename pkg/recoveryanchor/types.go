@@ -5,12 +5,27 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 const Version1 = 1
+
+var (
+	ErrInvalidRequest   = errors.New("recovery anchor: invalid request")
+	ErrReceiptMismatch  = errors.New("recovery anchor: receipt mismatch")
+	ErrNoTransition     = errors.New("recovery anchor: no pending transition")
+	ErrAlreadyCommitted = errors.New("recovery anchor: transition already committed")
+)
+
+type requestError struct{ err error }
+
+func (e requestError) Error() string { return e.err.Error() }
+func (e requestError) Unwrap() error { return ErrInvalidRequest }
+
+func invalidRequest(err error) error { return requestError{err: err} }
 
 type Binding struct {
 	ClusterID string `json:"cluster_id"`

@@ -250,6 +250,21 @@ func TestV1Alpha2ReplicasOptInPresenceIsImmutable(t *testing.T) {
 	}
 }
 
+func TestV1Alpha2ApplicationProtocolIsImmutable(t *testing.T) {
+	old, next := phase1Cluster(), phase1Cluster()
+	create := "Create"
+	old.Spec.GenesisIntent, next.Spec.GenesisIntent = &create, &create
+	old.Spec.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	next.Spec.ApplicationProtocol = types.ManagedApplicationProtocolSQLKV
+	if err := ValidateV1Alpha2ClusterUpdate(old, next); err != nil {
+		t.Fatalf("stable protocol update: %v", err)
+	}
+	next.Spec.ApplicationProtocol = ""
+	if err := ValidateV1Alpha2ClusterUpdate(old, next); err == nil {
+		t.Fatal("accepted application protocol removal")
+	}
+}
+
 func TestPhase1StrictDecode(t *testing.T) {
 	valid := `{"apiVersion":"rhiza.mrchypark.dev/v1alpha2","kind":"RhizaRecovery","metadata":{"name":"r","namespace":"ns","uid":"r-uid"},"spec":{"target":{"name":"cluster","uid":"cluster-uid"},"expectedGeneration":1}}`
 	if _, err := DecodeV1Alpha2Recovery([]byte(valid)); err != nil {

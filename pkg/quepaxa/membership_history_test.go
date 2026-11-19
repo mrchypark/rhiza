@@ -58,3 +58,21 @@ func TestMembershipHistoryExport(t *testing.T) {
 		t.Fatal("exported unavailable freeze")
 	}
 }
+
+func TestMembershipHistoryThroughExcludesFutureAbort(t *testing.T) {
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}}}
+	core := &Core{
+		configHistory: []configEpoch{{start: 1, cluster: initial}},
+		lastAbort: &ConfigTransition{
+			Freeze:   DecidedValue{Slot: 20},
+			Terminal: DecidedValue{Slot: 36},
+		},
+	}
+	record, err := core.membershipHistoryLocked(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Abort != nil {
+		t.Fatalf("membership cut at slot 10 leaked abort terminal %d", record.Abort.Terminal.Slot)
+	}
+}

@@ -2,8 +2,11 @@ package operator
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
+
+const maxPolicySeconds = int64(math.MaxInt64 / int64(time.Second))
 
 // AutoDecision is a string enum for automatic recovery decisions.
 type AutoDecision string
@@ -49,6 +52,9 @@ func DecideAutoRecovery(
 	// Validate policy fields.
 	if policy.FailureGraceSeconds <= 0 || policy.CooldownSeconds <= 0 || policy.MaxRecoveriesPerDay <= 0 {
 		return AutoBlocked, "policy fields FailureGraceSeconds, CooldownSeconds, MaxRecoveriesPerDay must be positive"
+	}
+	if policy.FailureGraceSeconds > maxPolicySeconds || policy.CooldownSeconds > maxPolicySeconds {
+		return AutoBlocked, "policy duration exceeds time.Duration"
 	}
 
 	// Unknown observation — cannot decide.

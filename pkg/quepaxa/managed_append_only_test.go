@@ -247,6 +247,48 @@ func TestManagedAppendOnlyRejectsLocallyWrongCutMembership(t *testing.T) {
 	}
 }
 
+func TestManagedCheckpointMembershipErrorsFailClosedAtRetainedCut(t *testing.T) {
+	config, wal := managedAppendOnlyTestConfig(t, "rhiza-managed-request-append-only/v1", func(context.Context, ManagedCheckpointCandidate) error { return nil })
+	config.EnableReconfiguration = true
+	core, err := New(config)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	if _, _, err := core.Propose(context.Background(), []byte("retained-cut")); err != nil {
+		t.Fatal(err)
+	}
+	cut := core.Tip()
+	prefix, _ := core.PrefixHash(cut)
+	next, following, err := core.CheckpointLeaderOrders(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := core.CheckpointMembership(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := managedAppendOnlyTestSeal()
+	seal.Index, seal.PrefixHash = cut, prefix
+	seal.NextLeaderOrder, seal.FollowingLeaderOrder = next, following
+	seal.Membership = &membership
+	value, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := ManagedCheckpointCandidate{Value: value, Hash: ValueHash(sha256.Sum256(value)), Seal: seal, DecisionSlot: cut + 1, ConfigID: 1}
+	core.mu.Lock()
+	core.configHistory = nil
+	core.mu.Unlock()
+	if err := core.validateManagedCheckpointRootLocal(candidate); err == nil {
+		t.Fatal("managed checkpoint root ignored a retained-cut membership error")
+	}
+	if err := core.validateManagedCandidateLocal(candidate); err == nil {
+		t.Fatal("managed checkpoint candidate ignored a retained-cut membership error")
+	}
+}
+
 func TestManagedRecoveryDoesNotPromoteLegacyPreparedMarker(t *testing.T) {
 	dir := t.TempDir()
 	identity := bytes.Repeat([]byte{0x5a}, 32)

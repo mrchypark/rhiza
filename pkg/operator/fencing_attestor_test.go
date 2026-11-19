@@ -39,7 +39,7 @@ func independentEvidenceFor(req AttestationRequest) *AttestationResponse {
 			ClosedOperationID: req.Request.OperationID,
 			ClosedRequestHash: req.RequestHash,
 			CurrentPodUIDs:    append([]string(nil), req.CurrentPodUIDs...),
-			DeniedAt:          "2026-10-19T00:00:30Z",
+			DeniedAt:          "2026-10-18T23:59:30Z",
 		},
 		Storage: EvidenceStorage{
 			Provider:               req.StorageScope.Provider,
@@ -88,7 +88,7 @@ func independentFixture(t *testing.T) (FenceRequest, independentScope) {
 	}}}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "op", Scope: ScopeGeneration, Targets: []FenceTarget{
 		{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"},
-		{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1", NodeName: "node-b", ContainerID: "containerd://c1", ImageID: "sha256:img-1"},
+		{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-1", WALIdentity: "wal-1", NodeName: "node-b", NodeUID: "node-uid-b", ContainerID: "containerd://c1", ImageID: "sha256:img-1"},
 	}}
 	hash, err := requestHash(&request)
 	if err != nil {
@@ -120,13 +120,16 @@ func TestIndependentEvidenceMustBindTheClosedScope(t *testing.T) {
 		"other closed request":     func(r *AttestationResponse) { r.Independent.Barrier.ClosedRequestHash = "other" },
 		"changed pod inventory":    func(r *AttestationResponse) { r.Independent.Barrier.CurrentPodUIDs = []string{"pod-0"} },
 		"missing barrier denial":   func(r *AttestationResponse) { r.Independent.Barrier.DeniedAt = "" },
-		"foreign pod uid":          func(r *AttestationResponse) { r.Independent.Runtimes[0].PodUID = "remote-pod" },
-		"foreign pod name":         func(r *AttestationResponse) { r.Independent.Runtimes[0].PodName = "rhiza-9" },
-		"foreign node name":        func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeName = "node-z" },
-		"foreign node uid":         func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "node-uid-z" },
-		"missing node uid":         func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "" },
-		"missing instance id":      func(r *AttestationResponse) { r.Independent.Runtimes[0].InstanceID = "" },
-		"foreign container":        func(r *AttestationResponse) { r.Independent.Runtimes[0].ContainerIDs = []string{"containerd://other"} },
+		"barrier denial after observation": func(r *AttestationResponse) {
+			r.Independent.Barrier.DeniedAt = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+		},
+		"foreign pod uid":     func(r *AttestationResponse) { r.Independent.Runtimes[0].PodUID = "remote-pod" },
+		"foreign pod name":    func(r *AttestationResponse) { r.Independent.Runtimes[0].PodName = "rhiza-9" },
+		"foreign node name":   func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeName = "node-z" },
+		"foreign node uid":    func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "node-uid-z" },
+		"missing node uid":    func(r *AttestationResponse) { r.Independent.Runtimes[0].NodeUID = "" },
+		"missing instance id": func(r *AttestationResponse) { r.Independent.Runtimes[0].InstanceID = "" },
+		"foreign container":   func(r *AttestationResponse) { r.Independent.Runtimes[0].ContainerIDs = []string{"containerd://other"} },
 		"extra container": func(r *AttestationResponse) {
 			r.Independent.Runtimes[0].ContainerIDs = append(r.Independent.Runtimes[0].ContainerIDs, "containerd://new")
 		},
@@ -221,7 +224,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 	state := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source", Runs: map[string]fencing.Run{
 		"run-0": {Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "pod-0", RunID: "run-0", WALIdentity: "wal-0"}},
 	}}}
-	captured := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"}
+	captured := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "op", Scope: ScopeVoter, Targets: []FenceTarget{captured}}
 	storage := AttestationStoreScope{Provider: "gcs", Bucket: "rhiza-archive", Prefix: "root/source"}
 	if _, err := buildIndependentScope(state, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
@@ -234,6 +237,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 		"missing container id": func(t *FenceTarget) { t.ContainerID = "" },
 		"missing image id":     func(t *FenceTarget) { t.ImageID = "" },
 		"missing node name":    func(t *FenceTarget) { t.NodeName = "" },
+		"missing node uid":     func(t *FenceTarget) { t.NodeUID = "" },
 		"missing pod uid":      func(t *FenceTarget) { t.PodUID = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -476,4 +480,11 @@ func (s *stubAttestor) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+func TestHTTPSAttestorRejectsNegativeTimeout(t *testing.T) {
+	a := &HTTPSAttestor{Client: &http.Client{Timeout: -time.Second}}
+	if _, err := a.Attest(t.Context(), AttestationRequest{}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative timeout accepted: %v", err)
+	}
 }

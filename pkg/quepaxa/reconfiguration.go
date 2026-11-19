@@ -222,7 +222,7 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	c.mu.RUnlock()
 	if state == nil {
 		c.releasePipeline()
-		if previousTerminal != 0 {
+		if !abort && previousTerminal != 0 {
 			_, err := c.completeDecision(ctx, previousTerminal, true)
 			return err
 		}

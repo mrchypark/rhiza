@@ -90,6 +90,9 @@ func (a *HTTPSAttestor) Attest(ctx context.Context, req AttestationRequest) (*At
 	if a == nil {
 		return nil, fmt.Errorf("fencing: attestor is not configured")
 	}
+	if a.Client != nil && a.Client.Timeout < 0 {
+		return nil, fmt.Errorf("fencing: negative attestor timeout")
+	}
 	if err := validateURL(a.URL); err != nil {
 		return nil, err
 	}
@@ -161,7 +164,7 @@ type independentScope struct {
 func buildIndependentScope(state fenceLedger, request FenceRequest, nodes []string, requestHash, ledgerHash string, current []string, storage AttestationStoreScope) (independentScope, error) {
 	scope := independentScope{request: request, requestHash: requestHash, ledgerHash: ledgerHash, currentPodUIDs: append([]string(nil), current...), targets: append([]FenceTarget(nil), request.Targets...), storage: storage}
 	for _, target := range scope.targets {
-		if target.NodeName == "" || target.ContainerID == "" || target.ImageID == "" || target.PodUID == "" {
+		if target.NodeName == "" || target.NodeUID == "" || target.ContainerID == "" || target.ImageID == "" || target.PodUID == "" {
 			return scope, fmt.Errorf("fencing: target %q has no captured runtime identity", target.NodeID)
 		}
 	}
@@ -228,11 +231,19 @@ func validateIndependentEvidence(scope independentScope, ev *IndependentEvidence
 	if ev.Provider == "" || ev.Mode == "" || ev.ObservedAt == "" || ev.BarrierID == "" {
 		return fmt.Errorf("fencing: independent evidence is incomplete")
 	}
+	observedAt, err := time.Parse(time.RFC3339, ev.ObservedAt)
+	if err != nil || observedAt.After(time.Now().Add(attestationClockSkew)) {
+		return fmt.Errorf("fencing: independent evidence observation time is invalid")
+	}
 	if ev.RequestHash != scope.requestHash || ev.LedgerHash != scope.ledgerHash {
 		return fmt.Errorf("fencing: independent evidence is bound to another request or ledger")
 	}
 	if ev.Barrier.Kind == "" || ev.Barrier.DeniedAt == "" || ev.Barrier.ClosedOperationID != scope.request.OperationID || ev.Barrier.ClosedRequestHash != scope.requestHash {
 		return fmt.Errorf("fencing: independent barrier evidence differs from the closed operation")
+	}
+	deniedAt, err := time.Parse(time.RFC3339, ev.Barrier.DeniedAt)
+	if err != nil || deniedAt.After(observedAt) {
+		return fmt.Errorf("fencing: barrier denial time is invalid")
 	}
 	if !sameStrings(ev.Barrier.CurrentPodUIDs, scope.currentPodUIDs) {
 		return fmt.Errorf("fencing: independent barrier names a different Pod inventory")
@@ -306,7 +317,7 @@ func validateEvidenceStorage(want AttestationStoreScope, got *EvidenceStorage) e
 	if got.scope() != want {
 		return fmt.Errorf("fencing: storage evidence is bound to another location")
 	}
-	if got.QuietWindowSeconds < minIndependentQuietWindowSeconds {
+	if got.QuietWindowSeconds < minIndependentQuietWindowSeconds || int64(got.QuietWindowSeconds) > maxPolicySeconds {
 		return fmt.Errorf("fencing: storage quiet window is too short")
 	}
 	for _, snapshot := range []StorageSnapshot{got.Before, got.After} {

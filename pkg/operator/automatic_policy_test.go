@@ -74,6 +74,21 @@ func TestBlockedNegativePolicyFields(t *testing.T) {
 	}
 }
 
+func TestBlockedOverflowingPolicyDurations(t *testing.T) {
+	for name, mutate := range map[string]func(*AutoPolicy){
+		"grace":    func(p *AutoPolicy) { p.FailureGraceSeconds = maxPolicySeconds + 1 },
+		"cooldown": func(p *AutoPolicy) { p.CooldownSeconds = maxPolicySeconds + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := goodPolicy
+			mutate(&p)
+			if d, _ := DecideAutoRecovery(p, healthyObs, tBase, tBase, nil); d != AutoBlocked {
+				t.Fatalf("got %v, want Blocked", d)
+			}
+		})
+	}
+}
+
 func TestBlockedUnknownObservation(t *testing.T) {
 	obs := AutoObservation{Known: false}
 	d, _ := DecideAutoRecovery(goodPolicy, obs, tBase, tBase, nil)

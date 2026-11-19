@@ -31,9 +31,9 @@ func ManagedConfig(ctx context.Context, kube *operator.Kubernetes, ref operator.
 	if err != nil {
 		return result, errors.New("invalid public handoff")
 	}
-	data, readErr := io.ReadAll(io.LimitReader(f, 65537))
+	data, readErr := io.ReadAll(io.LimitReader(f, operator.V1Alpha2BootstrapHandoffLimit+1))
 	err = errors.Join(readErr, f.Close())
-	if err != nil || len(data) > 65536 {
+	if err != nil || len(data) > operator.V1Alpha2BootstrapHandoffLimit {
 		return result, errors.New("invalid public handoff")
 	}
 	var handoff operator.V1Alpha2BootstrapPlan

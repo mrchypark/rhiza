@@ -28,8 +28,8 @@ func TestManagedPodObservationsNativeListAndLiveChain(t *testing.T) {
 		t.Fatalf("actual owner-chain observation: %v, %v", result, err)
 	}
 	listUID = "recreated"
-	if _, err := ObserveV1Alpha2ManagedPods(context.Background(), f.store, phase2Ref, 9090); err == nil {
-		t.Fatal("accepted list/GET UID race")
+	if result, err := ObserveV1Alpha2ManagedPods(context.Background(), f.store, phase2Ref, 9090); err != nil || len(result) != 0 {
+		t.Fatalf("recreated Pod blocked healthy observation: %v, %v", result, err)
 	}
 	listUID, listKind = "replacement-uid", "Pod"
 	if _, err := ObserveV1Alpha2ManagedPods(context.Background(), f.store, phase2Ref, 9090); err == nil {
@@ -53,5 +53,32 @@ func TestManagedPodObservationsNativeListAndLiveChain(t *testing.T) {
 	}
 	if calls == 0 || f.puts != 0 {
 		t.Fatalf("discovery wrote status or omitted list: lists=%d puts=%d", calls, f.puts)
+	}
+}
+
+func TestManagedPodObservationsSkipStartingAndFailedPods(t *testing.T) {
+	f, _ := repairTestSetup(t)
+	original := f.store.Kube.Client.Transport
+	starting := map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": "starting", "namespace": phase2Ref.Namespace, "uid": "starting-uid", "resourceVersion": "3"}, "status": map[string]any{"phase": "Pending"}}
+	failed := map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": "failed", "namespace": phase2Ref.Namespace, "uid": "failed-uid", "resourceVersion": "4"}, "status": map[string]any{"phase": "Failed", "podIP": "10.0.0.9"}}
+	f.store.Kube.Client.Transport = escalationProbeTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/pods") {
+			return phase2Response(200, string(mustManagedJSON(map[string]any{"apiVersion": "v1", "kind": "PodList", "metadata": map[string]any{"resourceVersion": "9"}, "items": []any{
+				map[string]any{"metadata": map[string]any{"name": "replacement", "namespace": phase2Ref.Namespace, "uid": "replacement-uid"}},
+				map[string]any{"metadata": map[string]any{"name": "starting", "namespace": phase2Ref.Namespace, "uid": "starting-uid"}},
+				map[string]any{"metadata": map[string]any{"name": "failed", "namespace": phase2Ref.Namespace, "uid": "failed-uid"}},
+			}}))), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/pods/starting") {
+			return phase2Response(200, string(mustManagedJSON(starting))), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/pods/failed") {
+			return phase2Response(200, string(mustManagedJSON(failed))), nil
+		}
+		return original.RoundTrip(r)
+	})
+	result, err := ObserveV1Alpha2ManagedPods(context.Background(), f.store, phase2Ref, 9090)
+	if err != nil || len(result) != 1 || result[0].Member != f.plan.Replacement {
+		t.Fatalf("transient Pods blocked healthy voters: result=%+v err=%v", result, err)
 	}
 }

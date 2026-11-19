@@ -122,8 +122,8 @@ func TestPlanVoterReplacementActualBootstrapNonceAndClosedPrecedence(t *testing.
 		}
 		return transport.RoundTrip(request)
 	})
-	if _, err := h.PlanVoterReplacement(ctx, other, nil); err == nil {
-		t.Fatal("lost Closed candidate was silently retargeted")
+	if got, err := h.PlanVoterReplacement(ctx, other, nil); err != nil || !reflect.DeepEqual(got, plan) {
+		t.Fatalf("lost Closed candidate was retargeted: plan=%+v err=%v", got, err)
 	}
 	live, err := operator.LoadV1Alpha2Admission(ctx, writer, configs[0].Ref)
 	if err != nil {

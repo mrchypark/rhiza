@@ -588,6 +588,33 @@ func (m *Manager) loadAll(ctx context.Context) error {
 	return nil
 }
 
+// ManagedAppendOnlyRootsThrough returns immutable root candidates at or below
+// the captured cut. Roots remain untrusted hints until an archived seal is
+// authenticated; this method only bounds discovery after CURRENT has advanced.
+func (m *Manager) ManagedAppendOnlyRootsThrough(ctx context.Context, policy sqlpolicy.MaterializationPolicy, through uint64) ([]Checkpoint, error) {
+	if !m.appendOnly || m.expectedPolicy != policy || policy != sqlpolicy.ManagedRequestMaterializationPolicy && policy != sqlpolicy.ManagedGraphRequestMaterializationPolicy {
+		return nil, sqlpolicy.ErrIncompatible
+	}
+	if err := m.loadAll(ctx); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	roots := make([]Checkpoint, 0)
+	for _, root := range m.checkpoints {
+		if root.Index != 0 && root.Index <= through && root.Generation == root.Index && root.SQLExecutionPolicy == int(policy) {
+			roots = append(roots, root)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		if roots[i].Index != roots[j].Index {
+			return roots[i].Index > roots[j].Index
+		}
+		return bytes.Compare(roots[i].RootHash[:], roots[j].RootHash[:]) < 0
+	})
+	return roots, nil
+}
+
 func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64) (*Checkpoint, error) {
 	return m.createFilesWithScanObserver(ctx, claim, sources, index, nil)
 }

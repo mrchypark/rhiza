@@ -357,28 +357,46 @@ func TestManagedGraphReadOnlyLocatorCapturedCut(t *testing.T) {
 		t.Fatal("captured suffix is not C+1..HEAD")
 	}
 	key := "mixed/checkpoint/CURRENT"
-	for _, change := range []func(*checkpoint.ManagedGraphLocator){
-		func(l *checkpoint.ManagedGraphLocator) { l.SealDecisionHash[0] ^= 1 },
-		func(l *checkpoint.ManagedGraphLocator) { l.SealDecisionSlot = uint64(view.Tip() + 1) },
+	for _, tc := range []struct {
+		name    string
+		change  func(*checkpoint.ManagedGraphLocator)
+		wantErr bool
+	}{
+		{"bad-seal", func(l *checkpoint.ManagedGraphLocator) { l.SealDecisionHash[0] ^= 1 }, true},
+		{"current-ahead", func(l *checkpoint.ManagedGraphLocator) { l.SealDecisionSlot = uint64(view.Tip() + 1) }, false},
 	} {
-		bad := locator
-		change(&bad)
-		data, err := json.Marshal(bad)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := f.bucket.Upload(f.ctx, key, bytes.NewReader(data)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := OpenReadOnlyViewAtHeadForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, view.CapturedHead(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
-			t.Fatal("unbound locator accepted against captured HEAD")
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			bad := locator
+			tc.change(&bad)
+			data, err := json.Marshal(bad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.bucket.Upload(f.ctx, key, bytes.NewReader(data)); err != nil {
+				t.Fatal(err)
+			}
+			fixed, err := OpenReadOnlyViewAtHeadForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, view.CapturedHead(), sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("bad CURRENT seal accepted against captured HEAD")
+				}
+				return
+			}
+			if err != nil || fixed.Base() != quepaxa.Slot(locator.Index) {
+				t.Fatalf("older bound locator was not recovered from ahead CURRENT: base=%d err=%v", fixed.Base(), err)
+			}
+		})
 	}
 	if err := f.bucket.Delete(f.ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true); err == nil {
-		t.Fatal("missing locator fell back to genesis or archive Base0")
+	withoutCurrent, err := OpenReadOnlyViewForApplicationProtocol(f.ctx, f.bucket, "mixed", 1, f.bootstrap, sqlpolicy.ManagedGraphRequestMaterializationPolicy, preparedGraphWindow, preparedGraphApplicationProtocol, true)
+	if err != nil || withoutCurrent == nil || withoutCurrent.Base() != quepaxa.Slot(locator.Index) {
+		base := quepaxa.Slot(0)
+		if withoutCurrent != nil {
+			base = withoutCurrent.Base()
+		}
+		t.Fatalf("verified checkpoint was not discovered without CURRENT: base=%d err=%v", base, err)
 	}
 	if f.archive.head.Base != 0 {
 		t.Fatal("reader mutated source archive base")

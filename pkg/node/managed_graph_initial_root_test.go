@@ -35,3 +35,14 @@ func TestManagedGraphInitialRootWaitCancellation(t *testing.T) {
 		t.Fatal("already canceled caller lost its cause", err)
 	}
 }
+
+func TestManagedGraphInitialRootPublisherUsesShortRetry(t *testing.T) {
+	n := New(&types.ExecutionConfig{})
+	if got := n.managedCheckpointPublisherDelay(time.Minute); got != 3*time.Second {
+		t.Fatalf("incomplete initial-root retry delay=%s, want 3s", got)
+	}
+	n.markManagedGraphInitialRootComplete()
+	if got := n.managedCheckpointPublisherDelay(time.Minute); got != time.Minute {
+		t.Fatalf("normal publisher delay=%s, want one minute", got)
+	}
+}

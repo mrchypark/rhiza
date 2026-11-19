@@ -2,10 +2,54 @@ package quepaxa
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"testing"
 	"time"
 )
+
+func TestMembershipHistoryAcceptsTerminalRecorderOutsideFreezeQuorum(t *testing.T) {
+	initial := Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	freezeValue, err := encodeReconfiguration(reconfigurationValue{Freeze: 1, TerminalSlot: 17, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	freezeProposal := newProposal(highestPriority, "a", freezeValue)
+	freezeHash := freezeProposal.Hash
+	freezeDecision := Decision{ConfigID: 1, Slot: 1, Step: 4, Proposal: freezeProposal, Summaries: []Summary{
+		{RecorderID: "a", Step: 4, ReconfigurationID: freezeHash, FirstCurrent: cloneProposal(&freezeProposal)},
+		{RecorderID: "b", Step: 4, ReconfigurationID: freezeHash, FirstCurrent: cloneProposal(&freezeProposal)},
+	}}
+	freezeCertificate, err := encodeCertificate(1, freezeDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalValue, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Freeze: 1, TerminalSlot: 17, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalProposal := newProposal(highestPriority, "b", terminalValue)
+	terminalDecision := Decision{ConfigID: 1, Slot: 17, Step: 4, Proposal: terminalProposal, Summaries: []Summary{
+		{RecorderID: "a", Step: 4, ReconfigurationID: freezeHash, FirstCurrent: cloneProposal(&terminalProposal)},
+		{RecorderID: "c", Step: 4, ReconfigurationID: freezeHash, FirstCurrent: cloneProposal(&terminalProposal)},
+	}}
+	terminalCertificate, err := encodeCertificate(1, terminalDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := MembershipRecord{Genesis: initial, Transitions: []ConfigTransition{{
+		Freeze:   DecidedValue{Slot: 1, Hash: sha256.Sum256(freezeValue), Value: freezeValue, Certificate: freezeCertificate},
+		Terminal: DecidedValue{Slot: 17, Hash: sha256.Sum256(terminalValue), Value: terminalValue, Certificate: terminalCertificate},
+	}}}
+	verified, err := validateMembershipHistory(initial, record)
+	if err != nil {
+		t.Fatalf("terminal recorder outside the local freeze quorum was rejected: %v", err)
+	}
+	if verified.clusterForSlot(18).ConfigID != 2 {
+		t.Fatal("validated transition did not activate its target")
+	}
+}
 
 func TestMembershipHistoryValidation(t *testing.T) {
 	cores, _ := reconfigCluster(t)

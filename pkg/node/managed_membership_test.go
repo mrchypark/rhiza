@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -279,4 +280,36 @@ func TestManagedMembershipPrivateRemoveAndRetry(t *testing.T) {
 		t.Fatalf("retry tip/checks: %d/%d", n.core.Tip(), checker.calls)
 	}
 	assertDurableArchivedMembership(t, ctx, n, bucket, tip)
+}
+
+func TestAbortManagedRepairAdditionReturnsRetainedAbort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, identities, bucket, _ := newMembershipOperationNode(t)
+	learner := registerMembershipLearner(t, bucket, "fresh")
+	source, _, err := n.preparedBindingDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.managedStartup = &ManagedStartupConfig{Checker: preparedRepairCaptureChecker{}, Identity: ManagedStartupIdentity{PhysicalBinding: source, Member: recovery.PreparedStartupIdentity{NodeID: "a", SourceBinding: source, ClusterUID: "uid", DeploymentUID: "deployment"}}}
+	n.opened.Store(true)
+	n.server = network.NewServer(n.core, nil, "cluster", true, nil)
+	n.server.SetMembershipChange(n.changeMembership)
+	n.server.SetMembershipAbort(n.abortMembership)
+	t.Cleanup(n.server.Close)
+	request := ManagedMembershipRequest{RepairOperationID: "abort-managed-add", Action: ManagedMembershipAdd, ExpectedConfigID: 1, OldNodeID: "c", OldWALIdentity: identities["c"], Addition: &learner, HandoffHeadHash: strings.Repeat("a", 64)}
+	if err := n.ChangeManagedMembership(ctx, request); err == nil {
+		t.Fatal("addition without learner participation unexpectedly completed")
+	}
+	if _, pending := n.core.PendingReconfiguration(); !pending {
+		t.Fatal("failed addition did not retain the frozen target")
+	}
+	abort, err := n.AbortManagedRepairAddition(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, aborted := n.core.LastReconfigurationAbort()
+	if !aborted || abort.Slot != slot || abort.ConfigID != 1 || abort.Hash == "" || n.core.ConfigID() != 1 {
+		t.Fatalf("abort proof=%+v slot=%d aborted=%t config=%d", abort, slot, aborted, n.core.ConfigID())
+	}
 }

@@ -2,7 +2,9 @@ package recoveryanchor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -198,6 +200,70 @@ func TestActivateIdempotent(t *testing.T) {
 	}
 	if r1 != r2 {
 		t.Fatal("idempotent re-activate should return same receipt")
+	}
+}
+
+func TestActivateCommitOnFinalAttemptSucceeds(t *testing.T) {
+	be := newInMemoryBackend()
+	seedRecord(be, "a1", seededRecord(Binding{ClusterID: "src", StorageID: "src/pfx"}, 0, []byte("ev")))
+	backend := &finalCommitBackend{inMemoryBackend: be, failures: 6}
+	co := &Coordinator{Backend: backend, EvidenceFormat: "test/v1", Verifier: goodVerifier}
+	receipt, err := co.Activate(t.Context(), makeRequest("a1", "op1"))
+	if err != nil || receipt.Generation != 1 || backend.failures != 0 {
+		t.Fatalf("final CAS success was reported as failure: receipt=%+v err=%v failures=%d", receipt, err, backend.failures)
+	}
+}
+
+type finalCommitBackend struct {
+	*inMemoryBackend
+	failures int
+}
+
+func (b *finalCommitBackend) CAS(ctx context.Context, id, version string, rec Record) error {
+	if rec.Transition == nil && b.failures > 0 {
+		b.failures--
+		return fmt.Errorf("injected commit conflict")
+	}
+	return b.inMemoryBackend.CAS(ctx, id, version, rec)
+}
+
+func TestValidateHex64RequiresCanonicalLowercase(t *testing.T) {
+	if !validateHex64(testHex64) {
+		t.Fatal("canonical lowercase hex rejected")
+	}
+	if validateHex64(strings.ToUpper(testHex64)) {
+		t.Fatal("uppercase hex accepted")
+	}
+}
+
+func TestReleaseAbortsOnlyExactFrozenTransition(t *testing.T) {
+	be := newInMemoryBackend()
+	seedRecord(be, "a1", seededRecord(Binding{ClusterID: "src", StorageID: "src/pfx"}, 0, []byte("ev")))
+	co := &Coordinator{Backend: be, EvidenceFormat: "test/v1", Verifier: func(context.Context, Request, Record) (Binding, []byte, error) {
+		return Binding{}, nil, fmt.Errorf("proof not ready")
+	}}
+	req := makeRequest("a1", "op1")
+	if _, err := co.Activate(t.Context(), req); err == nil {
+		t.Fatal("expected verifier failure")
+	}
+	other := req
+	other.OperationID = "other"
+	if err := co.Release(t.Context(), other); err == nil {
+		t.Fatal("different operation released the frozen transition")
+	}
+	if err := co.Release(t.Context(), req); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	record, _, err := be.Read(t.Context(), "a1")
+	if err != nil || record.Transition != nil || record.Binding.ClusterID != "src" {
+		t.Fatalf("release did not restore frozen state: %+v err=%v", record, err)
+	}
+	co.Verifier = goodVerifier
+	if _, err := co.Activate(t.Context(), req); err != nil {
+		t.Fatalf("activate after release: %v", err)
+	}
+	if err := co.Release(t.Context(), req); !errors.Is(err, ErrAlreadyCommitted) {
+		t.Fatalf("committed transition released: %v", err)
 	}
 }
 

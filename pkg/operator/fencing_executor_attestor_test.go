@@ -19,7 +19,7 @@ const fenceEndpoint = "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhi
 
 func independentRequest() FenceRequest {
 	return FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "auto-1", Scope: ScopeVoter, Targets: []FenceTarget{
-		{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"},
+		{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"},
 	}}
 }
 

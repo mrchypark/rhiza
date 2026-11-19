@@ -39,7 +39,7 @@ func run(args []string) error {
 	crUID := flags.String("cr-uid", "", "")
 	generation := flags.Int64("generation", -1, "")
 	podUID := flags.String("pod-uid", "", "")
-	identityPath := flags.String("identity-file", "/var/run/rhiza/identity.json", "")
+	identityPath := flags.String("identity-file", operator.V1Alpha2BootstrapIdentityPath, "")
 	messagePath := flags.String("termination-message", "/dev/termination-log", "")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
 		return errors.New("invalid prepare-identity arguments")
@@ -146,9 +146,9 @@ func runCheckReady(args []string) error {
 	if err != nil {
 		return errors.New("invalid managed profile")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return checkReady(ctx, client, "http://127.0.0.1:8080/readyz", profile.Storage.AdminToken)
 }
 
@@ -161,7 +161,7 @@ func runAwait(args []string) error {
 	ns := flags.String("namespace", os.Getenv("POD_NAMESPACE"), "")
 	name := flags.String("cluster-name", os.Getenv("RHIZA_CLUSTER_NAME"), "")
 	pod := flags.String("pod-name", os.Getenv("POD_NAME"), "")
-	identity := flags.String("identity-file", "/var/lib/rhiza/identity.json", "")
+	identity := flags.String("identity-file", operator.V1Alpha2BootstrapIdentityPath, "")
 	output := flags.String("handoff-file", "/var/lib/rhiza/bootstrap.json", "")
 	repairOutput := flags.String("repair-handoff-file", repairHandoffPath, "")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *ns == "" || *name == "" || *pod == "" || *identity == "" || *output == "" || filepath.Clean(*identity) == filepath.Clean(*output) {

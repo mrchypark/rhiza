@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,11 +68,19 @@ func NewHandler(coord *Coordinator, token string) http.Handler {
 		case "activate":
 			receipt, err := coord.Activate(r.Context(), ar.Request)
 			if err != nil {
-				http.Error(w, "bad request", http.StatusBadRequest)
+				writeActionError(w, err)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(receipt)
+
+		case "release":
+			if err := coord.Release(r.Context(), ar.Request); err != nil {
+				writeActionError(w, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(struct{}{})
 
 		case "verify":
 			if ar.Receipt == nil {
@@ -79,7 +88,7 @@ func NewHandler(coord *Coordinator, token string) http.Handler {
 				return
 			}
 			if err := coord.Verify(r.Context(), ar.Request, *ar.Receipt); err != nil {
-				http.Error(w, "bad request", http.StatusBadRequest)
+				writeActionError(w, err)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -89,6 +98,17 @@ func NewHandler(coord *Coordinator, token string) http.Handler {
 			http.Error(w, "bad request", http.StatusBadRequest)
 		}
 	})
+}
+
+func writeActionError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrInvalidRequest), errors.Is(err, ErrReceiptMismatch):
+		http.Error(w, "invalid request", http.StatusBadRequest)
+	case errors.Is(err, ErrNoTransition), errors.Is(err, ErrAlreadyCommitted):
+		http.Error(w, "transition conflict", http.StatusConflict)
+	default:
+		http.Error(w, "recovery anchor unavailable", http.StatusServiceUnavailable)
+	}
 }
 
 func authConstantTime(r *http.Request, token string) bool {

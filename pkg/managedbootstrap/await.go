@@ -188,7 +188,7 @@ func AwaitBootstrapWithRepair(ctx context.Context, kube *operator.Kubernetes, re
 			return err
 		}
 		var original operator.V1Alpha2BootstrapPlan
-		if err := ReadGateFile(output, &original, 65536, false); err != nil || !reflect.DeepEqual(original, plan) {
+		if err := ReadGateFile(output, &original, operator.V1Alpha2BootstrapHandoffLimit, false); err != nil || !reflect.DeepEqual(original, plan) {
 			return errors.New("original bootstrap handoff missing or changed")
 		}
 		return nil
