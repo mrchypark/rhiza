@@ -38,7 +38,11 @@ disposable namespace and an in-namespace S3 emulator, not live GCS or Azure:
 - `candidate-direct-host` uses the exact protected-main source and matching
   `managed-ffi-contract` candidate image in a pre-created host namespace. It
   requires the preinstalled v1alpha2 RhizaCluster API and does not install CRDs
-  or use vcluster. It is not qualification of the published operator image.
+  or use vcluster. The administrator also preinstalls the cluster-scoped
+  `rhiza-operator-node-identity` ClusterRole and a ClusterRoleBinding for the
+  namespace's `rhiza-operator` ServiceAccount; the namespace-only runner
+  credential never creates or reads cluster-scoped RBAC. It is not
+  qualification of the published operator image.
 
 The vcluster modes check reference-host SQL, not Rust/C ABI. The direct-host
 mode retains its Rust/C ABI checks. Manual modes use scoped Chaos records and

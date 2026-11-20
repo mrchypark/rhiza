@@ -12,8 +12,9 @@ if [ "${1-}" = --overlay-self-test ]; then
     [ -n "$definition" ]
     eval "$definition"
   done
-  jq -n '{items:(["Role","RoleBinding","ServiceAccount"] | map(. as $k | ["rhiza-operator","rhiza-managed-host"][] | {kind:$k,metadata:{name:.},rules:[{resources:["pods"],verbs:["get"]}]+(if $k=="Role" and .=="rhiza-operator" then [{resources:["rhizarecoveries"],verbs:["create"]},{resources:["rhizarecoveries/status"],verbs:["update"]}] else [] end)}) + [{kind:"Deployment",metadata:{name:"rhiza-operator"}}])}' > "$scratch/overlay.json"
+  jq -n '{items:(["Role","RoleBinding","ServiceAccount"] | map(. as $k | ["rhiza-operator","rhiza-managed-host"][] | {kind:$k,metadata:{name:.},rules:[{resources:["pods"],verbs:["get"]}]+(if $k=="Role" and .=="rhiza-operator" then [{resources:["rhizarecoveries"],verbs:["create"]},{resources:["rhizarecoveries/status"],verbs:["update"]}] else [] end)}) + [{kind:"Deployment",metadata:{name:"rhiza-operator"}},{kind:"ClusterRole",metadata:{name:"rhiza-operator-node-identity"},rules:[{apiGroups:[""],resources:["nodes"],verbs:["get"]}]},{kind:"ClusterRoleBinding",metadata:{name:"rhiza-operator-node-identity"},roleRef:{kind:"ClusterRole",name:"rhiza-operator-node-identity"}}])}' > "$scratch/overlay.json"
   project_direct_overlay "$scratch/overlay.json" | jq -e '[.items[]|select(.kind=="Role")|.rules[]]==[{resources:["pods"],verbs:["get"]},{resources:["pods"],verbs:["get"]}]' >/dev/null
+  project_direct_overlay "$scratch/overlay.json" | jq -e '([.items[]|.kind]|length)==7 and ([.items[]|select(.kind=="ClusterRole" or .kind=="ClusterRoleBinding")]|length)==0' >/dev/null
   calls=0
   hn() {
     calls=$((calls+1))
