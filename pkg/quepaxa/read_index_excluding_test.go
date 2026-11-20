@@ -676,3 +676,31 @@ func TestReadIndexIgnoresTipWakeupsUntilResponse(t *testing.T) {
 		t.Fatalf("read after ordinary tip wakeups: slot=%d id=%s err=%v", slot, id, err)
 	}
 }
+
+// A peer that has applied its activation terminal but not yet synced it must
+// wait for its own fsync rather than fail a concurrent leader read quorum.
+func TestAwaitReadIndexParticipationPersistsPeerTerminal(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	peer := fixture.cores["b"]
+	dropTerminalDurability(peer, fixture.terminal)
+	if peer.IsVoter() {
+		t.Fatal("fixture unexpectedly had durable peer activation")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := peer.AwaitReadIndexParticipation(ctx); err != nil {
+		t.Fatalf("peer participation across terminal durability: %v", err)
+	}
+	if !peer.IsVoter() {
+		t.Fatal("peer terminal durability was not established")
+	}
+}
+
+func TestAwaitReadIndexParticipationRefusesRemovedVoter(t *testing.T) {
+	fixture := newTerminalDurabilityFixture(t)
+	removed := fixture.cores["c"]
+	dropTerminalDurability(removed, fixture.terminal)
+	if err := removed.AwaitReadIndexParticipation(context.Background()); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("removed voter participation: %v", err)
+	}
+}
