@@ -64,6 +64,8 @@ assert_names_absent() {
 }
 project_direct_overlay() {
   jq -e '
+    # Cluster-scoped RBAC is administrator-installed; this credential is namespace-only.
+    .items |= map(select(.kind!="ClusterRole" and .kind!="ClusterRoleBinding")) |
     ([.items[] | [.kind,.metadata.name] | join("/")] | sort) as $names |
     if $names != (["Deployment/rhiza-operator","Role/rhiza-operator","Role/rhiza-managed-host","RoleBinding/rhiza-operator","RoleBinding/rhiza-managed-host","ServiceAccount/rhiza-operator","ServiceAccount/rhiza-managed-host"]|sort) then error("unexpected direct-host overlay scope") else . end |
     (.items[] | select(.kind=="Role" and .metadata.name=="rhiza-operator") | .rules) |= map(select(.resources!=["rhizarecoveries"] and .resources!=["rhizarecoveries/status"])) |
