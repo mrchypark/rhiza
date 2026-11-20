@@ -282,6 +282,37 @@ func (c *Core) CanParticipateReadIndex() bool {
 	return c.reconfiguration == nil
 }
 
+// AwaitReadIndexParticipation applies the retained-voter activation gate on a
+// peer, which must wait for its own terminal fsync instead of failing a
+// concurrent read quorum. It never admits a removed, learner, or frozen member.
+func (c *Core) AwaitReadIndexParticipation(ctx context.Context) error {
+	if c.CanParticipateReadIndex() {
+		return nil
+	}
+	c.mu.RLock()
+	terminal, pending := c.retainedTerminalPendingLocked(c.clusterForSlotLocked(c.tip + 1))
+	c.mu.RUnlock()
+	if !pending {
+		return ErrQuorumUnavailable
+	}
+	bounded, cancel := context.WithTimeout(ctx, readIndexMembershipWait)
+	defer cancel()
+	err := c.EnsureDurableThrough(bounded, terminal)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		if errors.Is(bounded.Err(), context.DeadlineExceeded) {
+			return ErrQuorumUnavailable
+		}
+		return err
+	}
+	if !c.CanParticipateReadIndex() {
+		return ErrQuorumUnavailable
+	}
+	return nil
+}
+
 // PendingReconfiguration returns the frozen target while its old-configuration
 // drain is active. The returned cluster is safe for management retries to edit.
 func (c *Core) PendingReconfiguration() (Cluster, bool) {
