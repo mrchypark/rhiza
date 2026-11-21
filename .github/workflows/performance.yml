@@ -1,21 +1,6 @@
 name: Performance
 
 on:
-  pull_request:
-    paths:
-      - "**/*.go"
-      - go.mod
-      - go.sum
-      - benchmarks/**
-      - .github/workflows/performance.yml
-  push:
-    branches: [main]
-    paths:
-      - "**/*.go"
-      - go.mod
-      - go.sum
-      - benchmarks/**
-      - .github/workflows/performance.yml
   workflow_dispatch:
     inputs:
       refresh_hiqlite_reference:
@@ -112,6 +97,10 @@ jobs:
             baseline_mode=workflow-dispatch
           fi
           git cat-file -e "$base_sha^{commit}"
+          if [[ "$base_sha" != "$candidate_sha" ]]; then
+            echo 'The batch-delay experiment requires identical base and candidate revisions.' >&2
+            exit 1
+          fi
           {
             printf 'base_sha=%s\n' "$base_sha"
             printf 'candidate_sha=%s\n' "$candidate_sha"
@@ -183,7 +172,7 @@ jobs:
           RHIZA_SERVER_BENCH_CONCURRENCY: 16
         run: |
           git worktree add --detach "$RUNNER_TEMP/rhiza-server-candidate" "${{ steps.revisions.outputs.candidate_sha }}"
-          git worktree add --detach "$RUNNER_TEMP/rhiza-server-base" "${{ steps.revisions.outputs.base_sha }}"
+          git worktree add --detach "$RUNNER_TEMP/rhiza-server-base" "${{ steps.revisions.outputs.candidate_sha }}"
           benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
@@ -198,17 +187,17 @@ jobs:
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n2-failed.json"
           for sample in 1 2 3; do
             if (( sample % 2 )); then
-              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+              RHIZA_OBJSTORE_BATCH_DELAY=2ms RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
                 "$RUNNER_TEMP/rhiza-server-base" \
                 "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-$sample.json"
-              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+              RHIZA_OBJSTORE_BATCH_DELAY=4ms RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
                 "$RUNNER_TEMP/rhiza-server-candidate" \
                 "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-$sample.json"
             else
-              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+              RHIZA_OBJSTORE_BATCH_DELAY=4ms RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
                 "$RUNNER_TEMP/rhiza-server-candidate" \
                 "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-$sample.json"
-              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+              RHIZA_OBJSTORE_BATCH_DELAY=2ms RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
                 "$RUNNER_TEMP/rhiza-server-base" \
                 "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-$sample.json"
             fi
@@ -238,7 +227,7 @@ jobs:
             printf 'QuePaxa has no stable leader role, so failures are reported by peer identity. Fault lanes require the same sent, unfinished logical request across probes bracketing SIGKILL during `-c 16 -n 100000`; missing overlap does not qualify. The client validates INSERT receipts and a linearizable query checks the exact expected primary-key set. This does not prove the failed voter was processing the witness request.\n'
             printf 'Base and candidate servers use the same candidate client; its revision, binary SHA, receipt oracle and fault-only instrumentation are recorded in each result. Receipt parsing and trace/control overhead are part of this workload, so old uninstrumented results are not equivalent comparisons.\n'
             printf '\n## Rhiza before-ack durability qualification\n\n'
-            printf 'Three interleaved healthy HTTP/QUIC samples (`-c 16 -n 10000`) wait for object-store durability before each acknowledgement. Median base: `%s ops/s`, p99 `%s ms`; candidate: `%s ops/s`, p99 `%s ms`.\n\n' "$before_ack_base_ops" "$before_ack_base_p99" "$before_ack_candidate_ops" "$before_ack_candidate_p99"
+            printf 'Three interleaved healthy HTTP/QUIC samples (`-c 16 -n 10000`) wait for object-store durability before each acknowledgement. Base batch delay: `2ms`; candidate: `4ms`. Median base: `%s ops/s`, p99 `%s ms`; candidate: `%s ops/s`, p99 `%s ms`.\n\n' "$before_ack_base_ops" "$before_ack_base_p99" "$before_ack_candidate_ops" "$before_ack_candidate_p99"
             printf 'Base object-store HTTP request delta: `%s`.\n\n' "$before_ack_base_http"
             printf 'Candidate object-store delta from post-schema setup through final linearizable verification: `%s` HTTP requests, `%s` PUT requests. Full logical and HTTP method counters are retained in the JSON artifacts.\n' "$before_ack_candidate_http" "$before_ack_candidate_put"
           } >>"$GITHUB_STEP_SUMMARY"
