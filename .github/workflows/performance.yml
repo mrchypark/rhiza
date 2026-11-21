@@ -320,7 +320,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f2c61893166ad92cee0fd0ff4380022ab7724359
           fetch-depth: 0
           persist-credentials: false
 
@@ -335,14 +334,15 @@ jobs:
           RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC: 1
           RHIZA_SERVER_BENCH_SYNC_INTERVAL: 2s
           RHIZA_SERVER_BENCH_DURABILITY: async
+          RHIZA_SERVER_BENCH_LATENCY_TIMELINE: 1
         run: |
           set -o pipefail
           evidence_dir="$RUNNER_TEMP/async-publication"
           mkdir -p "$evidence_dir"
           base_sha=f660cf9d157ff9eb9a625fb946ed25ada4811196
           candidate_sha=f2c61893166ad92cee0fd0ff4380022ab7724359
-          test "$(git rev-parse HEAD)" = "$candidate_sha"
           git worktree add --detach "$RUNNER_TEMP/async-publication-base" "$base_sha"
+          git worktree add --detach "$RUNNER_TEMP/async-publication-candidate" "$candidate_sha"
           printf 'base=%s\ncandidate=%s\nharness=%s\n' "$base_sha" "$candidate_sha" "$(git rev-parse HEAD)" > "$evidence_dir/revisions.txt"
           { uname -a; go version; lscpu; } > "$evidence_dir/host.txt" 2>&1
           capture_udp() {
@@ -383,16 +383,28 @@ jobs:
           trap 'stop_samplers || true' EXIT
           trap 'exit 143' TERM
           trap 'exit 130' INT
+          sample_sequence=0
+          previous_ticks=
           capture_host() {
-            local phase=$1 file
+            local phase=$1 file ticks gap
+            ticks=$(awk 'NR == 1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ { printf "%.0f", $1 * 100; found = 1 } END { if (!found) exit 1 }' /proc/uptime) || ticks=
+            gap=unavailable
+            if [[ -n $ticks && -n $previous_ticks ]]; then gap=$((ticks - previous_ticks)); fi
+            previous_ticks=$ticks
+            sample_sequence=$((sample_sequence + 1))
             printf '\n=== %s %s ===\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+            if [[ $phase == after ]]; then
+              printf 'sequence=unavailable boottime_centiseconds=%s gap_centiseconds=unavailable\n' "${ticks:-unavailable}"
+            else
+              printf 'sequence=%s boottime_centiseconds=%s gap_centiseconds=%s\n' "$sample_sequence" "${ticks:-unavailable}" "$gap"
+            fi
             printf '/proc/uptime at snapshot start (boot-relative seconds, idle seconds):\n'
             if [[ -r /proc/uptime ]]; then cat /proc/uptime || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable\n'; fi
             for file in /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/stat /proc/diskstats /proc/loadavg; do
               printf '%s (host):\n' "$file"
               if [[ -r $file ]]; then cat "$file" || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable\n'; fi
             done
-            printf 'cpu.stat (runner shell cgroup v2 %s):\n' "${cgroup_path:-unavailable}"
+            printf 'cpu.stat (runner shell cgroup v2):\n'
             file="/sys/fs/cgroup${cgroup_path}/cpu.stat"
             if [[ -n $cgroup_path && -r $file ]]; then cat "$file" || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable or no cgroup v2\n'; fi
             printf '/proc/uptime at snapshot end (boot-relative seconds, idle seconds):\n'
@@ -404,9 +416,11 @@ jobs:
             for revision in $order; do
               run="$evidence_dir/$revision-$sample"
               mkdir -p "$run"
+              sample_sequence=0
+              previous_ticks=
               capture_udp "$run/udp-before.txt"
               printf 'Host-wide /proc and vmstat; /proc/stat CPU counters include steal in ticks. cpu.stat is the runner shell cgroup v2, not necessarily each container. Samples cover setup, workload and cleanup; sampling itself adds overhead.\n' > "$run/host-scope.txt"
-              printf '/proc/uptime first field is boot-relative seconds including suspend, rounded by the kernel; start/end readings bracket each snapshot. Compare with result.last_request_completion_boottime_ns / 1e9. Subtracting result.duration_ms / 1000 estimates the workload start only: duration brackets worker setup and completion bookkeeping and uses a monotonic clock that can differ across suspend. Client latency covers each request including retries, receipt verification and profiling bookkeeping; p99 is an aggregate without per-request timestamps, so these samples cannot locate slow requests precisely.\n' >> "$run/host-scope.txt"
+              printf '/proc/uptime first field is boot-relative seconds including suspend, rounded by the kernel; sequence and gap_centiseconds show actual snapshot spacing. The final after snapshot runs in the parent shell and has no sequence or gap. Start/end readings bracket each snapshot. Compare with result.last_request_completion_boottime_ns / 1e9. Subtracting result.duration_ms / 1000 estimates the workload start only: duration brackets worker setup and completion bookkeeping and uses a monotonic clock that can differ across suspend. Client latency covers each request including retries, receipt verification and profiling bookkeeping; p99 is an aggregate without per-request timestamps, so these samples cannot locate slow requests precisely.\n' >> "$run/host-scope.txt"
               capture_host before > "$run/host-timeseries.txt"
               (
                 delay_pid=
@@ -424,7 +438,7 @@ jobs:
               else
                 printf 'vmstat or line buffering unavailable\n' > "$run/sampler-status.txt"
               fi
-              source_dir="$GITHUB_WORKSPACE"
+              source_dir="$RUNNER_TEMP/async-publication-candidate"
               [[ $revision != base ]] || source_dir="$RUNNER_TEMP/async-publication-base"
               run_status=0
               timeout --signal=TERM --kill-after=30s 4m benchmarks/run-server-reference.sh \

@@ -107,6 +107,7 @@ failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 publication_diagnostic=${RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC:-0}
+latency_timeline=${RHIZA_SERVER_BENCH_LATENCY_TIMELINE:-0}
 sync_interval=${RHIZA_SERVER_BENCH_SYNC_INTERVAL:-}
 if [[ -z $sync_interval ]]; then
 	if [[ $publication_diagnostic == 1 ]]; then sync_interval=1s; else sync_interval=1h; fi
@@ -137,6 +138,10 @@ if [[ $durability != async && $durability != before-ack ]]; then
 fi
 if [[ $publication_diagnostic != 0 && $publication_diagnostic != 1 ]] || [[ ! $drain_timeout =~ ^[1-9][0-9]*$ ]] || [[ $drain_timeout -gt 3600 ]] || [[ -z $sync_interval ]]; then
 	printf 'invalid publication diagnostic, sync interval, or drain timeout (1-3600 seconds)\n' >&2
+	exit 2
+fi
+if [[ $latency_timeline != 0 && $latency_timeline != 1 ]] || [[ $latency_timeline == 1 && $publication_diagnostic != 1 ]]; then
+	printf 'latency timeline requires publication diagnostic mode\n' >&2
 	exit 2
 fi
 if [[ $publication_diagnostic == 1 ]] && { [[ ! $profile_seconds =~ ^[1-9][0-9]*$ || $profile_seconds -lt 10 || $profile_seconds -gt 3600 ]] || [[ ! $base_profile_port =~ ^[1-9][0-9]*$ || $base_profile_port -gt 65533 ]]; }; then
@@ -351,6 +356,7 @@ fi
 result_file="$run_dir/result.json"
 control_args=()
 if [[ $publication_diagnostic == 1 ]]; then control_args=(-profile-control-file "$run_dir/profile-control.url"); fi
+if [[ $latency_timeline == 1 ]]; then control_args+=(-latency-timeline); fi
 if [[ $failed_node != none ]]; then
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
@@ -396,6 +402,14 @@ if [[ $failed_node == none ]]; then
 		jobs -pr | grep -qx "$pid" || { printf 'server n%s is not a running child\n' "$i" >&2; exit 1; }
 		server_resource_snapshot "$pid" > "$run_dir/node-$i-resource-before" || { printf 'server n%s resource snapshot unavailable\n' "$i" >&2; exit 1; }
 	done
+fi
+if [[ $latency_timeline == 1 ]]; then
+	timeline_start_ticks=$(monotonic_ticks) || timeline_start_ticks=
+	if [[ ! $timeline_start_ticks =~ ^[0-9]+$ ]]; then
+		jq -nc --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{publication_diagnostic:{outcome:"incomplete",reason:"latency_timeline_unavailable",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+		printf 'latency timeline start clock unavailable\n' >&2
+		exit 1
+	fi
 fi
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
@@ -494,6 +508,35 @@ if [[ $publication_diagnostic == 1 ]]; then
 	fi
 	# One conservative tick also covers JSON number rounding at large uptimes.
 	workload_end_ticks=$((completion_ns / 10000000 - 1))
+	logical_completion_ns=
+	if [[ $latency_timeline == 1 ]]; then
+		logical_completion_ns=$(jq -er '.last_logical_request_completion_boottime_ns | select(type == "number" and . > 0 and floor == .)' <<<"$result") || logical_completion_ns=
+	fi
+	if [[ $latency_timeline == 1 ]] && { [[ ! $logical_completion_ns =~ ^[1-9][0-9]* || ${#logical_completion_ns} -gt 19 || ( ${#logical_completion_ns} == 19 && $logical_completion_ns > 9223372036854775807 ) ]] || (( logical_completion_ns / 10000000 > now_ticks + 1 )); }; then
+		jq -nc --argjson result "$result" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"latency_timeline_unavailable",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+		printf 'logical completion clock unavailable or invalid\n' >&2
+		exit 1
+	fi
+	if [[ $latency_timeline == 1 ]] && ! jq -e --argjson requests "$requests" --argjson start "$timeline_start_ticks" --argjson end "$((logical_completion_ns / 1000000000))" '
+		def count: type == "number" and . >= 0 and floor == .;
+		$end >= ($start / 100 | floor) and .requests == $requests and (.successes | count) and (.errors | count) and
+		(.latency_buckets | type == "array" and length > 0 and all(.[ ];
+			type == "object" and (.start_boottime_ns | count and . % 1000000000 == 0) and
+			(.start_boottime_ns >= (($start / 100 | floor) * 1000000000)) and
+			(.start_boottime_ns <= ($end * 1000000000)) and
+			(.successes | count) and (.errors | count) and (.successes + .errors > 0) and
+			(.success_p99_nearest_rank_ms | type == "number" and . >= 0) and
+			(.error_p99_nearest_rank_ms | type == "number" and . >= 0))) and
+		(.latency_buckets as $b | all(range(1; $b | length); . as $i | $b[$i - 1].start_boottime_ns < $b[$i].start_boottime_ns)) and
+		.latency_buckets[-1].start_boottime_ns == ($end * 1000000000) and
+		([.latency_buckets[].successes] | add) == .successes and
+		([.latency_buckets[].errors] | add) == .errors and
+		(.successes + .errors) == .requests
+	' <<<"$result" >/dev/null; then
+		jq -nc --argjson result "$result" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"latency_timeline_unavailable",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+		printf 'latency timeline unavailable or invalid\n' >&2
+		exit 1
+	fi
 fi
 if [[ $publication_diagnostic == 1 ]] && ! jq -e '.profile_window.overlap == true and .profile_window.incomplete == false and (.profile_window.successes | type == "number" and . >= 1 and floor == .)' <<<"$result" >/dev/null; then
 	jq -nc --argjson result "$result" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"cpu_profile_overlap_unconfirmed",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"

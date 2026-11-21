@@ -44,7 +44,11 @@ type result struct {
 	FaultWindow                 *faultWindow      `json:"fault_window,omitempty"`
 	ProfileWindow               *profileWindow    `json:"profile_window,omitempty"`
 	LastRequestCompletionBootNS int64             `json:"last_request_completion_boottime_ns,omitempty"`
+	LastLogicalCompletionBootNS int64             `json:"last_logical_request_completion_boottime_ns,omitempty"`
+	LatencyBuckets              []latencyBucket   `json:"latency_buckets,omitempty"`
 }
+
+var timelineClock = bootTimeNS
 
 func main() {
 	baseURL := flag.String("url", "http://127.0.0.1:18090", "Rhiza HTTP base URL")
@@ -55,6 +59,7 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
 	commitUnknownRetries := flag.Int("commit-unknown-retries", 0, "maximum same-request retries after commit_unknown")
 	verifyInsert := flag.Bool("verify-insert-receipt", false, "verify benchmark INSERT committed receipt and exact id")
+	timelineEnabled := flag.Bool("latency-timeline", false, "record logical request latency in CLOCK_BOOTTIME second buckets")
 	faultControlFile := flag.String("fault-control-file", "", "optional owned file for loopback fault overlap control URL")
 	profileControlFile := flag.String("profile-control-file", "", "optional owned file for non-destructive profile overlap control URL")
 	faultPID := flag.Int("fault-pid", 0, "fixed owned fault target PID, bound before requests (Linux pidfd required)")
@@ -63,6 +68,16 @@ func main() {
 	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
 		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
 		os.Exit(2)
+	}
+	if *timelineEnabled {
+		if *requests > maxTimelineRequests {
+			fmt.Fprintln(os.Stderr, "latency timeline request count exceeds maximum", maxTimelineRequests)
+			os.Exit(2)
+		}
+		if err := checkTimelineClock(timelineClock); err != nil {
+			fmt.Fprintln(os.Stderr, "latency timeline clock unavailable:", err)
+			os.Exit(1)
+		}
 	}
 
 	client := &http.Client{Timeout: *timeout, Transport: &http.Transport{
@@ -80,6 +95,10 @@ func main() {
 	errorSamples := make(map[int]string)
 	var errorSamplesMu sync.Mutex
 	var workers sync.WaitGroup
+	var timeline *latencyTimeline
+	if *timelineEnabled {
+		timeline = &latencyTimeline{samples: make([]latencySample, *requests), clock: timelineClock}
+	}
 	ctx := context.Background()
 	var progress *faultProgress
 	var control *http.Server
@@ -150,7 +169,7 @@ func main() {
 				if progress != nil && progress.profile {
 					eligible = progress.profileStart()
 				}
-				status, sample, retryCount, requestErr := doRequest(ctx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert, progress, id)
+				status, sample, retryCount, requestErr := doRequest(ctx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert, progress, id, timeline, begin)
 				if eligible && requestErr == nil && status >= 200 && status < 300 {
 					progress.profileSuccess()
 				}
@@ -204,6 +223,10 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if timeline != nil && timeline.failed.Load() {
+		fmt.Fprintln(os.Stderr, "latency timeline completion clock unavailable")
+		os.Exit(1)
+	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	sort.Slice(errorLatencies, func(i, j int) bool { return errorLatencies[i] < errorLatencies[j] })
 	quantile := func(values []time.Duration, q float64) float64 {
@@ -253,6 +276,10 @@ func main() {
 	if *verifyInsert {
 		output.ReceiptOracle = "sql-insert-id-v1"
 	}
+	if timeline != nil {
+		output.LastLogicalCompletionBootNS = timeline.lastCompletion()
+		output.LatencyBuckets = makeLatencyBuckets(timeline.samples)
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -263,11 +290,16 @@ func main() {
 	}
 }
 
-func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool, progress *faultProgress, id int) (int, []byte, int, error) {
+func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool, progress *faultProgress, id int, timeline *latencyTimeline, begin time.Time) (status int, sample []byte, retries int, requestErr error) {
 	if progress != nil && !progress.profile {
 		var finish func(time.Time)
 		ctx, finish = progress.traceRequest(ctx, id)
 		defer func() { finish(time.Now()) }()
+	}
+	if timeline != nil {
+		defer func() {
+			timeline.record(id, time.Since(begin), requestErr == nil && status >= 200 && status < 300)
+		}()
 	}
 	for retries := 0; ; retries++ {
 		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))

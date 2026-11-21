@@ -44,7 +44,7 @@ func TestDoRequestRetriesCommitUnknownWithSamePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0, nil, time.Time{})
 	if err != nil || status != http.StatusOK || retries != 3 || attempts != 4 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
 	}
@@ -59,7 +59,7 @@ func TestDoRequestStopsWhenRetriesAreExhausted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, true, nil, 0)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, true, nil, 0, nil, time.Time{})
 	if err != nil || status != http.StatusServiceUnavailable || retries != 2 || attempts != 3 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
 	}
@@ -78,7 +78,7 @@ func TestFaultErrorResponseDoesNotWaitPast4096Bytes(t *testing.T) {
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval)}
 	done := make(chan error, 1)
 	go func() {
-		status, body, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL, "", 0, false, p, 0)
+		status, body, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL, "", 0, false, p, 0, nil, time.Time{})
 		if err == nil && (status != 500 || len(body) != 4096) {
 			err = errors.New("unexpected response")
 		}
@@ -114,7 +114,7 @@ func TestDoRequestChecksSQLInsertReceipt(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls++; _, _ = io.WriteString(w, tc.body) }))
 			defer server.Close()
-			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0)
+			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0, nil, time.Time{})
 			if status != 200 || calls != 1 || retries != 0 || (err == nil) != tc.valid || (!tc.valid && !errors.Is(err, errInvalidInsertReceipt)) {
 				t.Fatalf("status=%d calls=%d retries=%d err=%v", status, calls, retries, err)
 			}
@@ -221,7 +221,7 @@ func TestProfileCountsOnlySuccessfulRequestsStartedAndCompletedInside(t *testing
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true, completionClock: func() (int64, error) { return 123, nil }}
 	request := func(path string) {
 		eligible := p.profileStart()
-		status, _, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL+path, "", 0, false, p, 0)
+		status, _, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL+path, "", 0, false, p, 0, nil, time.Time{})
 		if eligible && err == nil && status >= 200 && status < 300 {
 			p.profileSuccess()
 		}
@@ -309,7 +309,7 @@ func TestProfileSuccessfulRetryInsideBracket(t *testing.T) {
 	}
 	post("begin")
 	eligible := p.profileStart()
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 1, false, p, 0)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 1, false, p, 0, nil, time.Time{})
 	if eligible && err == nil && status >= 200 && status < 300 {
 		p.profileSuccess()
 	}
@@ -397,7 +397,7 @@ func TestFaultProgressActualHTTPTraceLifecycle(t *testing.T) {
 	var requestErr error
 	go func() {
 		defer close(done)
-		status, _, retries, requestErr = doRequest(base, server.Client(), http.MethodPost, server.URL, payload, 1, true, p, 7)
+		status, _, retries, requestErr = doRequest(base, server.Client(), http.MethodPost, server.URL, payload, 1, true, p, 7, nil, time.Time{})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -447,7 +447,7 @@ func TestFaultFastHTTPCompletionCannotQualify(t *testing.T) {
 	defer server.Close()
 	calls := 0
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), signal: func() (time.Time, time.Time, error) { calls++; return time.Now(), time.Now(), nil }}
-	status, _, _, err := doRequest(deadline, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true, p, 0)
+	status, _, _, err := doRequest(deadline, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true, p, 0, nil, time.Time{})
 	if status != 200 || err != nil {
 		t.Fatal(status, err)
 	}
