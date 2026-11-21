@@ -42,7 +42,7 @@ on:
         type: boolean
         default: false
       async_publication_diagnostic:
-        description: Run one async background publication and CPU diagnostic
+        description: Run pinned paired async publication and CPU diagnostics
         type: boolean
         default: false
 
@@ -316,11 +316,12 @@ jobs:
   async-publication-diagnostic:
     if: ${{ inputs.async_publication_diagnostic }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_ref || github.sha }}
+          ref: f2c61893166ad92cee0fd0ff4380022ab7724359
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-go@v6
@@ -329,45 +330,100 @@ jobs:
           cache: true
 
       - name: Run async publication diagnostic
+        timeout-minutes: 30
         env:
           RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC: 1
           RHIZA_SERVER_BENCH_SYNC_INTERVAL: 2s
           RHIZA_SERVER_BENCH_DURABILITY: async
         run: |
           set -o pipefail
-          mkdir -p "$RUNNER_TEMP/async-publication"
-          git rev-parse HEAD | tee "$RUNNER_TEMP/async-publication/candidate-sha.txt"
-          timeout --signal=TERM --kill-after=30s 20m benchmarks/run-server-reference.sh \
-            "$GITHUB_WORKSPACE" "$RUNNER_TEMP/async-publication/diagnostic.json" \
-            2>&1 | tee "$RUNNER_TEMP/async-publication/output.txt"
-          jq -e '.publication_diagnostic.outcome == "complete" and .publication_diagnostic.sync_interval == "2s"' \
-            "$RUNNER_TEMP/async-publication/diagnostic.json" >/dev/null
-          evidence_dir=$(realpath "$RUNNER_TEMP/async-publication")
-          profile_dir=$(jq -er '.publication_diagnostic.profile_directory | select(type == "string")' "$evidence_dir/diagnostic.json")
-          test ! -L "$profile_dir"
-          profile_dir=$(realpath "$profile_dir")
-          test -d "$profile_dir"
-          test "$(dirname "$profile_dir")" = "$evidence_dir"
-          case "$profile_dir" in
-            "$evidence_dir"/diagnostic-profiles.*) ;;
-            *) printf 'Invalid profile directory: %s\n' "$profile_dir" >&2; exit 1 ;;
-          esac
-          test -f "$profile_dir/server-binary"
-          test -s "$profile_dir/server-binary"
-          test ! -L "$profile_dir/server-binary"
-          for node in 0 1 2; do
-            test -f "$profile_dir/node-$node.cpu.pprof"
-            test -s "$profile_dir/node-$node.cpu.pprof"
-            test ! -L "$profile_dir/node-$node.cpu.pprof"
+          evidence_dir="$RUNNER_TEMP/async-publication"
+          mkdir -p "$evidence_dir"
+          base_sha=f660cf9d157ff9eb9a625fb946ed25ada4811196
+          candidate_sha=f2c61893166ad92cee0fd0ff4380022ab7724359
+          test "$(git rev-parse HEAD)" = "$candidate_sha"
+          git worktree add --detach "$RUNNER_TEMP/async-publication-base" "$base_sha"
+          printf 'base=%s\ncandidate=%s\nharness=%s\n' "$base_sha" "$candidate_sha" "$(git rev-parse HEAD)" > "$evidence_dir/revisions.txt"
+          { uname -a; go version; lscpu; } > "$evidence_dir/host.txt" 2>&1
+          capture_udp() {
+            { sysctl net.core.rmem_default net.core.rmem_max net.core.wmem_default net.core.wmem_max net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min 2>&1 || true
+              grep -E '^(Udp:|Udp6)' /proc/net/snmp /proc/net/snmp6 2>&1 || true
+              cat /proc/net/softnet_stat 2>&1 || true
+              if command -v nstat >/dev/null; then nstat -az 2>&1 || true; fi
+            } > "$1"
+          }
+          status=0
+          for sample in 1 2 3; do
+            if (( sample % 2 )); then order='base candidate'; else order='candidate base'; fi
+            for revision in $order; do
+              run="$evidence_dir/$revision-$sample"
+              mkdir -p "$run"
+              capture_udp "$run/udp-before.txt"
+              source_dir="$GITHUB_WORKSPACE"
+              [[ $revision != base ]] || source_dir="$RUNNER_TEMP/async-publication-base"
+              run_status=0
+              timeout --signal=TERM --kill-after=30s 4m benchmarks/run-server-reference.sh \
+                "$source_dir" "$run/diagnostic.json" > "$run/output.txt" 2>&1 || run_status=$?
+              capture_udp "$run/udp-after.txt"
+              printf '%s\n' "$run_status" > "$run/exit-status.txt"
+              cat "$run/output.txt"
+              if (( run_status != 0 )); then
+                printf 'Run failed; cleanup cannot be independently confirmed, so remaining samples are skipped.\n' >&2
+                status=1
+                break 2
+              fi
+              if ! jq -e '.publication_diagnostic.outcome == "complete" and .publication_diagnostic.reason == "archive_tip_reached"' "$run/diagnostic.json" >/dev/null; then
+                printf 'Cleanup was not confirmed; remaining samples are skipped: %s\n' "$run" >&2
+                status=1
+                break 2
+              fi
+              if ! jq -e '
+                .durability_mode == "async" and .failure_mode == "healthy" and
+                .publication_diagnostic.outcome == "complete" and .publication_diagnostic.sync_interval == "2s" and
+                (.result.p99_ms | type == "number" and . >= 0) and
+                (.result.success_ops_per_sec | type == "number" and . > 0) and
+                (.server_resources.nodes | keys == ["n0", "n1", "n2"] and
+                  all(.[]; (.cpu_seconds | type == "number" and . >= 0) and (.vm_hwm_kib | type == "number" and . > 0))) and
+                (.object_store_delta | type == "object" and
+                  all([.uploads, .gets, .lists, .heads, .deletes, .failures, .bytes_uploaded, .bytes_downloaded, .s3_http_requests, .s3_http_failures, .http_requests, .http_failures][]; type == "number" and . >= 0))
+              ' "$run/diagnostic.json" >/dev/null; then
+                printf 'Required diagnostic metrics missing: %s\n' "$run" >&2
+                status=1
+                continue
+              fi
+              if ! profile_dir=$(jq -er '.publication_diagnostic.profile_directory | select(type == "string" and length > 0)' "$run/diagnostic.json"); then
+                printf 'Missing profile directory: %s\n' "$run" >&2
+                status=1
+                continue
+              fi
+              if [[ -L $profile_dir ]] || ! profile_dir=$(realpath "$profile_dir") || [[ $(dirname "$profile_dir") != "$run" ]] || [[ $profile_dir != "$run"/diagnostic-profiles.* ]]; then
+                printf 'Invalid profile directory: %s\n' "$profile_dir" >&2
+                status=1
+                continue
+              fi
+              for file in server-binary node-0.cpu.pprof node-1.cpu.pprof node-2.cpu.pprof; do
+                if [[ ! -f $profile_dir/$file || ! -s $profile_dir/$file || -L $profile_dir/$file ]]; then
+                  printf 'Missing profile evidence: %s/%s\n' "$profile_dir" "$file" >&2
+                  status=1
+                fi
+              done
+              for node in 0 1 2; do
+                if [[ ! -s $run/diagnostic-node-$node.log ]]; then
+                  printf 'Missing node log: %s\n' "$run/diagnostic-node-$node.log" >&2
+                  status=1
+                fi
+              done
+            done
           done
+          exit "$status"
 
       - name: Describe diagnostic evidence
         if: always()
         run: |
           {
             printf '## Async publication diagnostic\n\n'
-            printf 'One healthy async run with a 2s sync interval and local S3 emulator. This is a diagnostic, not a paired performance comparison.\n\n'
-            printf 'The artifact contains the candidate SHA, raw output, JSON result, node logs, and, when collected, the server binary and CPU profiles. A timeout or early failure may leave partial evidence.\n'
+            printf 'Three alternating base/candidate pairs on one runner use the candidate harness, a 2s sync interval, and a local S3 emulator. Profiling and status reads add overhead; these are diagnostic comparisons, not uninstrumented performance results.\n\n'
+            printf 'Raw JSON, logs, CPU profiles, server binaries, revisions, exit statuses, and available host UDP counters are in the artifact. CPU is workload CPU; RSS is per-process lifetime high-water. UDP counters are host-wide snapshots and do not establish causation. Failures or timeouts may leave partial evidence.\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload async publication evidence
