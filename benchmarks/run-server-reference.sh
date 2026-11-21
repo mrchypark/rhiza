@@ -407,7 +407,7 @@ if [[ $publication_diagnostic == 1 ]]; then
 		jobs -pr | grep -qx "$bench_pid" || break
 		sleep 0.01
 	done
-	profile_control_url=$(<"$run_dir/profile-control.url") || profile_control_url=
+	profile_control_url=$(cat "$run_dir/profile-control.url" 2>/dev/null) || profile_control_url=
 	profile_success_seen() {
 		local status deadline=$((SECONDS + 5))
 		while profiles_alive && jobs -pr | grep -qx "$bench_pid" && (( SECONDS < deadline )); do

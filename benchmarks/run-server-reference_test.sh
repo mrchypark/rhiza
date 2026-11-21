@@ -54,9 +54,10 @@ wait_benchmark_child || status=$?
 sleep 60 & owned_pid=$!
 kill() { if [[ ${1:-} != -KILL ]]; then return 1; fi; builtin kill "$@"; }
 status=0
-stop_owned_child "$owned_pid" || status=$?
+stop_owned_child "$owned_pid" 2>"$scratch/expected-signal-failure.err" || status=$?
 unset -f kill
 [[ $status == 1 ]]
+grep -q 'termination not confirmed' "$scratch/expected-signal-failure.err"
 if kill -0 "$owned_pid" 2>/dev/null; then printf 'cleanup fallback left a child running\n' >&2; exit 1; fi
 
 # Exercise the actual shared wait helper, including a real non-child wait
@@ -203,7 +204,7 @@ if [[ -n $profile_control ]]; then
  if command -v gdate >/dev/null 2>&1; then now_ms=$(gdate +%s%3N); else now_ms=$(date +%s%3N); fi
  completion_ns=$((now_ms * 1000000))
  case $MOCK_MODE in
-  diag-late-serialization) sleep 1.2 ;;
+  diag-late-serialization) touch "$MOCK_HOME/profile-release"; sleep 1.2 ;;
   diag-missing-time|diag-no-witness-missing) completion_ns= ;;
   diag-invalid-time) completion_ns=-1 ;;
   diag-future-time) completion_ns=$((completion_ns + 10000000000)) ;;
@@ -225,10 +226,16 @@ case $url in
  printf '%s\n' "$$" > "$MOCK_HOME/profile-$port-pid"
  output=
  while [[ $# -gt 0 ]]; do if [[ $1 == -o ]]; then output=$2; shift; fi; shift; done
- sleep 2 & sleeper=$!
- trap 'kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; rm -f "$MOCK_HOME/profile-$port-active"; exit 143' TERM
- wait "$sleeper"
+ sleeper=
+ trap 'if [[ -n $sleeper ]]; then kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi; rm -f "$MOCK_HOME/profile-$port-active"; exit 143' TERM
+ for _ in {1..200}; do
+  [[ ! -f $MOCK_HOME/profile-release ]] || break
+  sleep 0.05 & sleeper=$!
+  wait "$sleeper"
+  sleeper=
+ done
  rm -f "$MOCK_HOME/profile-$port-active"
+ [[ -f $MOCK_HOME/profile-release ]] || { printf 'mock profile release timed out\n' >&2; exit 124; }
  touch "$MOCK_HOME/profile-finished"
  if [[ $MOCK_MODE == diag-profile-fail ]]; then exit 22; fi
  printf 'fake profile\n' > "$output" ;;
@@ -242,8 +249,9 @@ case $url in
  if [[ $MOCK_MODE == diag-ready-start || ( $MOCK_MODE == diag-ready-during && $phase == during ) || ( $MOCK_MODE == diag-ready-between && -f $MOCK_HOME/profile-begin ) ]]; then exit 22; fi
  if [[ $phase == before && $port == 20102 ]]; then touch "$MOCK_HOME/ready-before-complete"; fi ;;
 */metrics/object-store)
- if [[ $MOCK_MODE == diag-slow-snapshot && -f $MOCK_HOME/bench.pid && ! -f $MOCK_HOME/snapshot-delayed ]]; then touch "$MOCK_HOME/snapshot-delayed"; sleep 1.2; fi
- if [[ $MOCK_MODE == diag-metrics-fail && -f $MOCK_HOME/bench.pid ]]; then exit 22; fi
+ if [[ $MOCK_MODE == diag-slow-snapshot && -f $MOCK_HOME/bench.pid && ! -f $MOCK_HOME/snapshot-delayed ]]; then touch "$MOCK_HOME/snapshot-delayed" "$MOCK_HOME/profile-release"; sleep 1.2; fi
+ if [[ $MOCK_MODE == diag-metrics-fail && -f $MOCK_HOME/bench.pid ]]; then touch "$MOCK_HOME/profile-release"; exit 22; fi
+ if [[ $MOCK_MODE == diag-schema-change && -f $MOCK_HOME/bench.pid ]]; then touch "$MOCK_HOME/profile-release"; fi
  if [[ $MOCK_MODE == diag-empty ]]; then printf '{}\n'; exit; fi
  if [[ $MOCK_MODE == diag-missing-metric ]]; then printf '{"uploads":0}\n'; exit; fi
  if [[ $MOCK_MODE == diag-schema-change && ! -f $MOCK_HOME/bench.pid ]]; then printf '{"uploads":0,"gets":0,"lists":0,"heads":0,"deletes":0,"failures":0,"bytes_uploaded":0,"bytes_downloaded":0,"s3_http_requests":0,"s3_http_failures":0,"http_requests":0,"http_failures":0,"extra":0}\n'; exit; fi
@@ -253,6 +261,7 @@ case $url in
 */recovery/status)
  touch "$MOCK_HOME/status-called"
  if [[ ! -f $MOCK_HOME/profile-finished ]]; then touch "$MOCK_HOME/status-before-profile-finished"; fi
+ touch "$MOCK_HOME/profile-release"
  case $MOCK_MODE in
   diag-missing) printf '{}\n' ;;
   diag-failure) exit 22 ;;
@@ -347,6 +356,11 @@ for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missi
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC="$diagnostic" RHIZA_SERVER_BENCH_SYNC_INTERVAL="$sync_interval" RHIZA_SERVER_BENCH_DRAIN_TIMEOUT_SECONDS="$drain_timeout" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
+ if [[ $mode == diag-* && ! -f $scratch/$mode/result.json ]]; then
+  printf 'diagnostic %s produced no result (runner exit %s); runner stderr follows:\n' "$mode" "$status" >&2
+  cat "$scratch/$mode/stderr" >&2
+  exit 1
+ fi
  if [[ $mode == diag-success || $mode == diag-default || $mode == diag-status-poll ]]; then
   [[ $status == 0 ]]
   [[ $mode != diag-default ]] || sync_interval=1s
