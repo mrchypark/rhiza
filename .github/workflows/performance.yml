@@ -352,6 +352,52 @@ jobs:
               if command -v nstat >/dev/null; then nstat -az 2>&1 || true; fi
             } > "$1"
           }
+          # /proc and vmstat are host-wide; cpu.stat is the runner shell's cgroup v2.
+          cgroup_path=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' /proc/self/cgroup)
+          sampler_pid=
+          vmstat_pid=
+          stop_samplers() {
+            local pid name failed=0
+            for name in sampler vmstat; do
+              if [[ $name == sampler ]]; then pid=$sampler_pid; else pid=$vmstat_pid; fi
+              [[ -n $pid ]] || continue
+              if jobs -pr | grep -qx "$pid"; then
+                kill "$pid" 2>/dev/null || failed=1
+                wait "$pid" 2>/dev/null || true
+              else
+                wait "$pid" 2>/dev/null || true
+                printf '%s exited before stop\n' "$name" >> "$run/sampler-status.txt"
+                failed=1
+              fi
+              if jobs -pr | grep -qx "$pid"; then
+                printf '%s stop unconfirmed\n' "$name" >> "$run/sampler-status.txt"
+                failed=1
+              else
+                printf '%s waited\n' "$name" >> "$run/sampler-status.txt"
+              fi
+            done
+            sampler_pid=
+            vmstat_pid=
+            return "$failed"
+          }
+          trap 'stop_samplers || true' EXIT
+          trap 'exit 143' TERM
+          trap 'exit 130' INT
+          capture_host() {
+            local phase=$1 file
+            printf '\n=== %s %s ===\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+            printf '/proc/uptime at snapshot start (boot-relative seconds, idle seconds):\n'
+            if [[ -r /proc/uptime ]]; then cat /proc/uptime || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable\n'; fi
+            for file in /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/stat /proc/diskstats /proc/loadavg; do
+              printf '%s (host):\n' "$file"
+              if [[ -r $file ]]; then cat "$file" || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable\n'; fi
+            done
+            printf 'cpu.stat (runner shell cgroup v2 %s):\n' "${cgroup_path:-unavailable}"
+            file="/sys/fs/cgroup${cgroup_path}/cpu.stat"
+            if [[ -n $cgroup_path && -r $file ]]; then cat "$file" || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable or no cgroup v2\n'; fi
+            printf '/proc/uptime at snapshot end (boot-relative seconds, idle seconds):\n'
+            if [[ -r /proc/uptime ]]; then cat /proc/uptime || printf 'unavailable: read failed\n'; else printf 'unavailable: not readable\n'; fi
+          }
           status=0
           for sample in 1 2 3; do
             if (( sample % 2 )); then order='base candidate'; else order='candidate base'; fi
@@ -359,16 +405,38 @@ jobs:
               run="$evidence_dir/$revision-$sample"
               mkdir -p "$run"
               capture_udp "$run/udp-before.txt"
+              printf 'Host-wide /proc and vmstat; /proc/stat CPU counters include steal in ticks. cpu.stat is the runner shell cgroup v2, not necessarily each container. Samples cover setup, workload and cleanup; sampling itself adds overhead.\n' > "$run/host-scope.txt"
+              printf '/proc/uptime first field is boot-relative seconds including suspend, rounded by the kernel; start/end readings bracket each snapshot. Compare with result.last_request_completion_boottime_ns / 1e9. Subtracting result.duration_ms / 1000 estimates the workload start only: duration brackets worker setup and completion bookkeeping and uses a monotonic clock that can differ across suspend. Client latency covers each request including retries, receipt verification and profiling bookkeeping; p99 is an aggregate without per-request timestamps, so these samples cannot locate slow requests precisely.\n' >> "$run/host-scope.txt"
+              capture_host before > "$run/host-timeseries.txt"
+              (
+                delay_pid=
+                trap 'if [[ -n $delay_pid ]]; then kill "$delay_pid" 2>/dev/null || true; wait "$delay_pid" 2>/dev/null || true; fi; exit 0' TERM INT
+                while :; do
+                  sleep 1 & delay_pid=$!
+                  wait "$delay_pid" || true
+                  delay_pid=
+                  capture_host during >> "$run/host-timeseries.txt"
+                done
+              ) & sampler_pid=$!
+              if command -v vmstat >/dev/null && command -v stdbuf >/dev/null; then
+                TZ=UTC stdbuf -oL vmstat -t 1 > "$run/vmstat.txt" 2>&1 & vmstat_pid=$!
+                printf 'vmstat available; interval 1 second\n' > "$run/sampler-status.txt"
+              else
+                printf 'vmstat or line buffering unavailable\n' > "$run/sampler-status.txt"
+              fi
               source_dir="$GITHUB_WORKSPACE"
               [[ $revision != base ]] || source_dir="$RUNNER_TEMP/async-publication-base"
               run_status=0
               timeout --signal=TERM --kill-after=30s 4m benchmarks/run-server-reference.sh \
                 "$source_dir" "$run/diagnostic.json" > "$run/output.txt" 2>&1 || run_status=$?
+              sampler_status=0
+              stop_samplers || sampler_status=$?
+              capture_host after >> "$run/host-timeseries.txt"
               capture_udp "$run/udp-after.txt"
               printf '%s\n' "$run_status" > "$run/exit-status.txt"
               cat "$run/output.txt"
-              if (( run_status != 0 )); then
-                printf 'Run failed; cleanup cannot be independently confirmed, so remaining samples are skipped.\n' >&2
+              if (( run_status != 0 || sampler_status != 0 )); then
+                printf 'Run or sampler failed; remaining samples are skipped.\n' >&2
                 status=1
                 break 2
               fi
@@ -423,7 +491,7 @@ jobs:
           {
             printf '## Async publication diagnostic\n\n'
             printf 'Three alternating base/candidate pairs on one runner use the candidate harness, a 2s sync interval, and a local S3 emulator. Profiling and status reads add overhead; these are diagnostic comparisons, not uninstrumented performance results.\n\n'
-            printf 'Raw JSON, logs, CPU profiles, server binaries, revisions, exit statuses, and available host UDP counters are in the artifact. CPU is workload CPU; RSS is per-process lifetime high-water. UDP counters are host-wide snapshots and do not establish causation. Failures or timeouts may leave partial evidence.\n'
+            printf 'Raw JSON, logs, CPU profiles, server binaries, revisions, exit statuses, host UDP counters, and sampled host/cgroup diagnostics are in the artifact. CPU is workload CPU; RSS is per-process lifetime high-water. Host counters and runner-shell cgroup metrics have the scope recorded per sample and do not establish causation. Failures or timeouts may leave partial evidence.\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload async publication evidence
