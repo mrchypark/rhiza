@@ -45,6 +45,10 @@ on:
         description: Run one async background publication and CPU diagnostic
         type: boolean
         default: false
+      sql_page_memory_diagnostic:
+        description: Compare SQL page benchmark process memory for base_ref and candidate_ref
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -55,7 +59,7 @@ concurrency:
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.async_publication_diagnostic }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.async_publication_diagnostic && !inputs.sql_page_memory_diagnostic }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -313,8 +317,101 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  sql-page-memory-diagnostic:
+    if: ${{ inputs.sql_page_memory_diagnostic }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: auto
+      GOMAXPROCS: 2
+      CGO_ENABLED: 0
+    steps:
+      - name: Initialize diagnostic evidence
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sql-page-memory-diagnostic/results"
+          printf 'requested baseline: %s\nrequested candidate: %s\n' "$BASE_REF" "$CANDIDATE_REF" \
+            > "$RUNNER_TEMP/sql-page-memory-diagnostic/results/metadata.txt"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve revisions and compile identical benchmark fixture
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/sql-page-memory-diagnostic"
+          trap 'status=$?; printf "exit=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >> "$out/results/failures.txt"' ERR
+          mkdir -p "$out/base" "$out/candidate" "$out/results"
+          resolve() {
+            local ref=$1
+            if git rev-parse --verify --quiet "$ref^{commit}"; then
+              return
+            fi
+            git fetch --no-tags origin "$ref" >&2
+            git rev-parse --verify 'FETCH_HEAD^{commit}'
+          }
+          printf 'resolve baseline: %s\nresolve candidate: %s\n' "$BASE_REF" "$CANDIDATE_REF" >> "$out/results/commands.txt"
+          base_sha=$(resolve "$BASE_REF")
+          candidate_sha=$(resolve "$CANDIDATE_REF")
+          printf 'baseline: %s\ncandidate: %s\n' "$base_sha" "$candidate_sha" >> "$out/results/metadata.txt"
+          printf 'git archive %s and %s; copy candidate fixture to baseline\n' "$base_sha" "$candidate_sha" >> "$out/results/commands.txt"
+          git archive "$base_sha" | tar -x -C "$out/base"
+          git archive "$candidate_sha" | tar -x -C "$out/candidate"
+          fixture=pkg/materializer/sql_batch_cache_bench_test.go
+          cp "$out/candidate/$fixture" "$out/base/$fixture"
+          {
+            go version
+            printf 'GOTOOLCHAIN=%s GOMAXPROCS=%s CGO_ENABLED=%s\n' "$GOTOOLCHAIN" "$GOMAXPROCS" "$CGO_ENABLED"
+            sha256sum "$out/candidate/$fixture" "$out/base/$fixture"
+          } >> "$out/results/metadata.txt"
+          printf '%s\n' 'timeout 4m go test -c ./pkg/materializer (base and candidate)' >> "$out/results/commands.txt"
+          (cd "$out/base" && timeout 4m go test -c -o "$out/base.test" ./pkg/materializer) > "$out/results/base-build.log" 2>&1
+          (cd "$out/candidate" && timeout 4m go test -c -o "$out/candidate.test" ./pkg/materializer) > "$out/results/candidate-build.log" 2>&1
+
+      - name: Measure isolated benchmark processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/sql-page-memory-diagnostic"
+          trap 'status=$?; printf "exit=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >> "$out/results/failures.txt"' ERR
+          # Peak RSS includes process startup and fixture setup; it is not per-apply memory.
+          for shape in within-count over-count over-bytes replay; do
+            for sample in 1 2 3; do
+              for revision in base candidate; do
+                prefix="$out/results/$shape-$sample-$revision"
+                printf 'timeout 20s /usr/bin/time -v %s -test.run ^$ -test.bench ^BenchmarkApplySQLPage/%s$ -test.benchtime 1x -test.count 1\n' "$revision" "$shape" >> "$out/results/commands.txt"
+                timeout 20s /usr/bin/time -v -o "$prefix.time.txt" "$out/$revision.test" \
+                  -test.run '^$' -test.bench "^BenchmarkApplySQLPage/$shape$" \
+                  -test.benchtime 1x -test.count 1 > "$prefix.bench.txt" 2> "$prefix.stderr.txt"
+                grep -Eq "^BenchmarkApplySQLPage/$shape(-[0-9]+)?[[:space:]]" "$prefix.bench.txt"
+              done
+            done
+          done
+
+      - name: Upload raw diagnostic results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-page-memory-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/sql-page-memory-diagnostic/results/
+          if-no-files-found: warn
+          retention-days: 30
+
   async-publication-diagnostic:
-    if: ${{ inputs.async_publication_diagnostic }}
+    if: ${{ inputs.async_publication_diagnostic && !inputs.sql_page_memory_diagnostic }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -380,7 +477,7 @@ jobs:
           retention-days: 30
 
   issue185-cost-evidence:
-    if: ${{ inputs.issue185_cost_evidence }}
+    if: ${{ inputs.issue185_cost_evidence && !inputs.sql_page_memory_diagnostic }}
     runs-on: macos-15
     timeout-minutes: 80
     steps:
@@ -566,7 +663,7 @@ jobs:
           retention-days: 30
 
   refresh-hiqlite-reference:
-    if: ${{ inputs.refresh_hiqlite_reference }}
+    if: ${{ inputs.refresh_hiqlite_reference && !inputs.sql_page_memory_diagnostic }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
