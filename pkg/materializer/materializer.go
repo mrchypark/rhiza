@@ -1211,7 +1211,7 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 const maxRetainedSQLBatches = 64
 
 // Encoded bytes bound retained input size only; decoded heap use can be larger.
-const maxRetainedSQLSourceBytes = 1 << 20
+const maxRetainedSQLSourceBytes = 128 << 10
 
 func (m *Materializer) validateBatchPolicy(decisions []quepaxa.DecidedValue) (map[int][]types.SQLCommand, error) {
 	var sqlBatches map[int][]types.SQLCommand

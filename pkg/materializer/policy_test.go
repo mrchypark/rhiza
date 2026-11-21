@@ -166,6 +166,70 @@ func TestApplyBatchRetainedSQLLimits(t *testing.T) {
 	if err != nil || len(retained) != 1 || retained[0] == nil || retained[1] != nil {
 		t.Fatalf("cumulative byte cap: retained=%d err=%v", len(retained), err)
 	}
+	fixture, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "SELECT 1 /*" + strings.Repeat("x", 20<<10) + "*/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	largePage := make([]quepaxa.DecidedValue, 7)
+	for i := range largePage {
+		largePage[i] = quepaxa.DecidedValue{Slot: quepaxa.Slot(1000 + i), Value: fixture}
+	}
+	retained, err = m.validateBatchPolicy(largePage)
+	if err != nil || len(retained) != 6 || retained[5] == nil || retained[6] != nil {
+		t.Fatalf("large page byte cap: retained=%d err=%v", len(retained), err)
+	}
+	badLarge := append(append([]byte(nil), fixture...), []byte(" true")...)
+	largePage = append(largePage, quepaxa.DecidedValue{Slot: 1007, Value: badLarge})
+	tip := m.Tip()
+	if err := m.ApplyBatch(ctx, largePage); err == nil || !strings.Contains(err.Error(), "trailing JSON") || m.Tip() != tip {
+		t.Fatalf("malformed beyond byte limit: tip=%d err=%v", m.Tip(), err)
+	}
+}
+
+func TestApplyBatchSQLRetentionByteBoundary(t *testing.T) {
+	for _, extra := range []int{0, 1} {
+		t.Run(fmt.Sprintf("bytes-%d", maxRetainedSQLSourceBytes+extra), func(t *testing.T) {
+			ctx := context.Background()
+			m, err := Open(filepath.Join(t.TempDir(), "batch.db"), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if err := m.Apply(ctx, 1, policySQL(t, "CREATE TABLE byte_boundary(id INTEGER)")); err != nil {
+				t.Fatal(err)
+			}
+			page := make([]quepaxa.DecidedValue, 2)
+			for i := range page {
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprint(i), SQL: "INSERT INTO byte_boundary VALUES (1)"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				size := maxRetainedSQLSourceBytes / 2
+				if i == 1 {
+					size += extra
+				}
+				if len(value) > size {
+					t.Fatalf("encoded SQL size %d exceeds fixture size %d", len(value), size)
+				}
+				value = append(value, bytes.Repeat([]byte(" "), size-len(value))...)
+				page[i] = quepaxa.DecidedValue{Slot: quepaxa.Slot(i + 2), Value: value}
+			}
+			if size := len(page[0].Value) + len(page[1].Value); size != maxRetainedSQLSourceBytes+extra {
+				t.Fatalf("page bytes=%d", size)
+			}
+			retained, err := m.validateBatchPolicy(page)
+			if err != nil || retained[0] == nil || (retained[1] != nil) != (extra == 0) {
+				t.Fatalf("retained=%d second=%v err=%v", len(retained), retained[1] != nil, err)
+			}
+			if err := m.ApplyBatch(ctx, page); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := m.queryRow(ctx, "SELECT COUNT(*) FROM byte_boundary").Scan(&count); err != nil || count != 2 || m.Tip() != 3 {
+				t.Fatalf("count=%d tip=%d err=%v", count, m.Tip(), err)
+			}
+		})
+	}
 }
 
 func TestBatchPolicyTipHintDoesNotBlockOrSkipValidation(t *testing.T) {
