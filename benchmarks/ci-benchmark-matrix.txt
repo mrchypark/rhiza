@@ -38,6 +38,7 @@ none materializer BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=1/batch=8
 none materializer BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=1
 none materializer BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=8
 none materializer BenchmarkGraphQuery4096Nodes
+none materializer BenchmarkGraphReachableFanout4096
 none materializer BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB
 none materializer BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB
 none materializer BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB

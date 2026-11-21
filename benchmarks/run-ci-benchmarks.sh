@@ -68,7 +68,8 @@ for fixture in \
 	internal/types/value_benchmark_test.go \
 	pkg/quepaxa/durable_prefix_bench_test.go \
 	pkg/materializer/sql_authorizer_bench_test.go \
-	pkg/materializer/graph_prune_bench_test.go; do
+	pkg/materializer/graph_prune_bench_test.go \
+	pkg/materializer/graph_reachable_bench_test.go; do
 	git show "$head_sha:$fixture" >"$work_root/base/$fixture"
 done
 
@@ -125,7 +126,7 @@ run_revision() {
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
 			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$' '^BenchmarkCoreReadIndexThreePeers$') ;;
 			recovery) selected=('^BenchmarkArchiveMemoryPublication$' '^BenchmarkAuthenticatedMembershipCheckpointProof$' '^BenchmarkArchiveHeadEvidenceStages$') ;;
-			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' '^BenchmarkSQLAuthorizerSchemaCount$' '^BenchmarkGraphPruneSparseSlotsAndBatchSize$') ;;
+			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|GraphReachableFanout4096|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' '^BenchmarkSQLAuthorizerSchemaCount$' '^BenchmarkGraphPruneSparseSlotsAndBatchSize$') ;;
 			network) selected=("$network_benchmark") ;;
 			internal-types) selected=('^BenchmarkSQLBatchCodec$') ;;
 		esac

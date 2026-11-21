@@ -9,8 +9,9 @@ MOCK_REPO="$scratch/repo"
 MOCK_RUN_LOG="$scratch/runs.tsv"
 MOCK_BUILD_LOG="$scratch/builds.tsv"
 MOCK_PROFILE_LOG="$scratch/profiles.tsv"
+MOCK_SHOW_LOG="$scratch/shows.tsv"
 REAL_TEE=$(command -v tee)
-export MOCK_REPO MOCK_RUN_LOG MOCK_BUILD_LOG MOCK_PROFILE_LOG REAL_TEE
+export MOCK_REPO MOCK_RUN_LOG MOCK_BUILD_LOG MOCK_PROFILE_LOG MOCK_SHOW_LOG REAL_TEE
 MOCK_MATRIX="$script_dir/ci-benchmark-matrix.txt"
 export MOCK_MATRIX
 cat > "$scratch/bin/git" <<'SH'
@@ -21,7 +22,7 @@ case "$1" in
     rev-parse)
         if [ "$2" = --show-toplevel ]; then printf '%s\n' "$MOCK_REPO"; else printf '%s\n' "${3%\^\{commit\}}"; fi
         ;;
-    show) printf 'package fixture\n';;
+    show) printf '%s\n' "$2" >> "$MOCK_SHOW_LOG"; printf 'package fixture\n';;
     worktree)
         case "$2" in
             add)
@@ -44,6 +45,9 @@ case "$1" in
     tool) echo 'mock profile report';;
     test)
         [ "$#" -eq 5 ] && [ "$2" = -c ] && [ "$3" = -o ]
+        case "$4:$5" in
+            */base-materializer.test:./pkg/materializer) [ "$(cat pkg/materializer/graph_reachable_bench_test.go)" = 'package fixture' ];;
+        esac
         printf '%s\n' "$5" >> "$MOCK_BUILD_LOG"
         cat > "$4" <<'BIN'
 #!/bin/sh
@@ -141,18 +145,21 @@ run_case() {
     : > "$MOCK_RUN_LOG"
     : > "$MOCK_BUILD_LOG"
     : > "$MOCK_PROFILE_LOG"
+    : > "$MOCK_SHOW_LOG"
     if bash "$script_dir/run-ci-benchmarks.sh" base candidate "$scratch/$label" > "$scratch/$label.log" 2>&1; then actual=0; else actual=$?; fi
     [ "$actual" -eq "$expected" ] || { tail -12 "$scratch/$label.log"; echo "FAIL $label exit=$actual expected=$expected"; exit 1; }
     [ -z "$(find "$TMPDIR" -mindepth 1 -print)" ] || { echo 'FAIL retained owned worktree/capture'; exit 1; }
     printf 'PASS %s exit=%s owned_resources=0\n' "$label" "$actual"
 }
 run_case success 0
+grep -qx 'candidate:pkg/materializer/graph_reachable_bench_test.go' "$MOCK_SHOW_LOG"
 [ "$(wc -l < "$MOCK_BUILD_LOG" | tr -d ' ')" -eq 12 ]
 [ "$(wc -l < "$MOCK_PROFILE_LOG" | tr -d ' ')" -eq 2 ]
 awk -F '\t' '{block=int((NR-1)/14)%4; expected=(block==0 || block==3)?"base":"candidate"; if($1!=expected) exit 1} END {if(NR!=280) exit 1}' "$MOCK_RUN_LOG"
 for label in base candidate; do
     expected=$(awk '$1=="none" {n++} END {print n*10}' "$MOCK_MATRIX")
     awk -v expected="$expected" '/^Benchmark/ { if ($2 !~ /^[0-9]+$/ || $4!="ns/op") exit 1; n++ } END { if(n!=expected) exit 1 }' "$scratch/success/$label.txt"
+    [ "$(grep -c '^BenchmarkGraphReachableFanout4096-2[[:space:]]100[[:space:]]' "$scratch/success/$label.txt")" -eq 10 ]
     for name in small-head duplicate-head-boundary near-max-decision-value real-large-history; do
         [ "$(grep -c "^BenchmarkAuthenticatedMembershipCheckpointProof/$name-2[[:space:]]100[[:space:]]" "$scratch/success/$label.txt")" -eq 10 ]
     done
