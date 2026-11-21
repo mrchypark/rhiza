@@ -131,6 +131,8 @@ jobs:
 
       - name: Check benchmark harnesses without compilation
         run: |
+          export TMPDIR="$RUNNER_TEMP/rhiza-performance/harness-scratch"
+          mkdir -p "$TMPDIR"
           sh benchmarks/run-ci-benchmarks_test.sh
           bash benchmarks/run-server-reference_test.sh
 
