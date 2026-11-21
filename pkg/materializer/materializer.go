@@ -1792,11 +1792,11 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 	slotValue := strconv.FormatUint(slot, 10)
 	hashValue := hex.EncodeToString(hash[:])
 	if mutatesState {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?), ('state_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue, slotValue); err != nil {
+		if _, err := execPrepared(ctx, tx, statements, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?), ('state_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue, slotValue); err != nil {
 			return fmt.Errorf("persist applied state: %w", err)
 		}
 		m.stateTip = slot
-	} else if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue); err != nil {
+	} else if _, err := execPrepared(ctx, tx, statements, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue); err != nil {
 		return fmt.Errorf("persist applied position: %w", err)
 	}
 	if publish {

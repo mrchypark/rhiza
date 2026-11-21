@@ -2,6 +2,7 @@ package materializer
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1955,7 +1956,8 @@ func TestPublicSQLCannotAccessInternalTables(t *testing.T) {
 }
 
 func TestApplyBatchAdvancesContiguousPage(t *testing.T) {
-	m, err := Open(t.TempDir()+"/batch.db", 1)
+	path := t.TempDir() + "/batch.db"
+	m, err := Open(path, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1963,13 +1965,51 @@ func TestApplyBatchAdvancesContiguousPage(t *testing.T) {
 	decisions := []quepaxa.DecidedValue{
 		{Slot: 1, Value: policySQL(t, `CREATE TABLE batch_page (id INTEGER)`)},
 		{Slot: 2, Value: policySQL(t, `INSERT INTO batch_page VALUES (1)`)},
+		{Slot: 3, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+		{Slot: 4, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+		{Slot: 5, Value: policySQL(t, `ALTER TABLE batch_page ADD COLUMN extra INTEGER`)},
+		{Slot: 6, Value: policySQL(t, `INSERT INTO batch_page VALUES (2, 3)`)},
+		{Slot: 7, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+		{Slot: 8, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
 	}
 	if err := m.ApplyBatch(context.Background(), decisions); err != nil {
 		t.Fatal(err)
 	}
 	var count int
-	if err := m.queryRow(context.Background(), `SELECT COUNT(*) FROM batch_page`).Scan(&count); err != nil || count != 1 || m.Tip() != 2 {
-		t.Fatalf("count=%d tip=%d err=%v", count, m.Tip(), err)
+	if err := m.queryRow(context.Background(), `SELECT COUNT(*) FROM batch_page`).Scan(&count); err != nil || count != 2 || m.Tip() != 8 || m.StateTip() != 6 {
+		t.Fatalf("count=%d tip=%d state_tip=%d err=%v", count, m.Tip(), m.StateTip(), err)
+	}
+	failed := []quepaxa.DecidedValue{
+		{Slot: 9, Value: policySQL(t, `INSERT INTO batch_page VALUES (3, 4)`)},
+		{Slot: 10, Value: policySQL(t, `INSERT INTO batch_page VALUES (4, 5)`)},
+		{Slot: 11, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+		{Slot: 12, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+		{Slot: 14, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})},
+	}
+	if err := m.ApplyBatch(context.Background(), failed); err == nil {
+		t.Fatal("batch with a gap succeeded")
+	}
+	if err := m.queryRow(context.Background(), `SELECT COUNT(*) FROM batch_page`).Scan(&count); err != nil || count != 2 || m.Tip() != 8 || m.StateTip() != 6 {
+		t.Fatalf("after rollback count=%d tip=%d state_tip=%d err=%v", count, m.Tip(), m.StateTip(), err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Tip() != 8 || reopened.StateTip() != 6 {
+		t.Fatalf("reopened tip=%d state_tip=%d", reopened.Tip(), reopened.StateTip())
+	}
+	var appliedHash string
+	if err := reopened.queryRow(context.Background(), `SELECT value FROM _rhiza_meta WHERE key = 'applied_hash'`).Scan(&appliedHash); err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256(decisions[len(decisions)-1].Value)
+	if appliedHash != fmt.Sprintf("%x", wantHash) {
+		t.Fatalf("applied hash=%s want=%x", appliedHash, wantHash)
 	}
 }
 
