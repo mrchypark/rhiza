@@ -1158,7 +1158,7 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 	incoming := request.Direction == types.GraphReachableDirectionIncoming
 	encodedBytes := 2 // JSON array brackets.
 	for depth := uint32(1); depth <= request.MaxDepth && len(current) != 0; depth++ {
-		nextSet := make(map[uint64]struct{})
+		next := make([]uint64, 0, len(current))
 		for _, source := range current {
 			if err := ctx.Err(); err != nil {
 				return types.GraphReachableResult{}, err
@@ -1191,15 +1191,11 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 					continue
 				}
 				visited[nextID] = struct{}{}
-				nextSet[nextID] = struct{}{}
+				next = append(next, nextID)
 			}
 		}
-		next := make([]uint64, 0, len(nextSet))
-		for id := range nextSet {
-			next = append(next, id)
-		}
 		slices.Sort(next)
-		current = current[:0]
+		current = next[:0]
 		for _, id := range next {
 			node, err := tx.GetNode(id)
 			if err != nil {
