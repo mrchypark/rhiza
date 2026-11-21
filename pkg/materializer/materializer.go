@@ -1208,26 +1208,43 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 	return m.ApplyBatch(ctx, []quepaxa.DecidedValue{{Slot: quepaxa.Slot(slot), Value: value}})
 }
 
-// ApplyBatch materializes a contiguous decision page with one SQLite commit.
-func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
-	var sqlBatches [][]types.SQLCommand
+const maxRetainedSQLBatches = 64
+
+// Encoded bytes bound retained input size only; decoded heap use can be larger.
+const maxRetainedSQLSourceBytes = 1 << 20
+
+func (m *Materializer) validateBatchPolicy(decisions []quepaxa.DecidedValue) (map[int][]types.SQLCommand, error) {
+	var sqlBatches map[int][]types.SQLCommand
+	retainedBytes := 0
 	for i, decision := range decisions {
 		if m.managedProtocol == "" {
 			commands, sql, err := types.DecodeSQLBatch(decision.Value)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if sql {
-				if sqlBatches == nil {
-					sqlBatches = make([][]types.SQLCommand, len(decisions))
+				if len(sqlBatches) < maxRetainedSQLBatches && len(decision.Value) <= maxRetainedSQLSourceBytes-retainedBytes {
+					if sqlBatches == nil {
+						sqlBatches = make(map[int][]types.SQLCommand)
+					}
+					sqlBatches[i] = commands
+					retainedBytes += len(decision.Value)
 				}
-				sqlBatches[i] = commands
 				continue
 			}
 		}
 		if err := m.validateExecutionPolicy(decision.Value); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	return sqlBatches, nil
+}
+
+// ApplyBatch materializes a contiguous decision page with one SQLite commit.
+func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
+	sqlBatches, err := m.validateBatchPolicy(decisions)
+	if err != nil {
+		return err
 	}
 	if len(decisions) == 0 {
 		return nil
@@ -1351,6 +1368,8 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.pendingSQLResultBytes = 0
 	}()
 	for i, decision := range decisions {
+		commands := sqlBatches[i]
+		delete(sqlBatches, i)
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
 		if slot <= m.tip {
@@ -1365,10 +1384,6 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		var commands []types.SQLCommand
-		if sqlBatches != nil {
-			commands = sqlBatches[i]
-		}
 		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, commands, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err

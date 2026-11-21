@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
@@ -106,6 +108,58 @@ func TestApplyBatchValidatesAllSQLBeforeApplying(t *testing.T) {
 	}
 	if err := m.Apply(ctx, 1, good); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestApplyBatchRetainedSQLLimits(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "batch.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	page := []quepaxa.DecidedValue{{Slot: 1, Value: policySQL(t, "CREATE TABLE cache_test(id INTEGER)")}, {Slot: 2, Value: types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})}}
+	for i := 0; i < maxRetainedSQLBatches; i++ {
+		value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprint(i), SQL: "INSERT INTO cache_test VALUES (1)"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		page = append(page, quepaxa.DecidedValue{Slot: quepaxa.Slot(len(page) + 1), Value: value})
+	}
+	retained, err := m.validateBatchPolicy(page)
+	if err != nil || len(retained) != maxRetainedSQLBatches || retained[len(page)-1] != nil || retained[1] != nil {
+		t.Fatalf("retained=%d last=%v barrier=%v err=%v", len(retained), retained[len(page)-1] != nil, retained[1] != nil, err)
+	}
+	bad := append(append([]byte(nil), page[len(page)-1].Value...), []byte(" true")...)
+	invalid := append(append([]quepaxa.DecidedValue(nil), page...), quepaxa.DecidedValue{Slot: quepaxa.Slot(len(page) + 1), Value: bad})
+	if err := m.ApplyBatch(ctx, invalid); err == nil || m.Tip() != 0 {
+		t.Fatalf("malformed beyond limit: tip=%d err=%v", m.Tip(), err)
+	}
+	if err := m.ApplyBatch(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM cache_test").Scan(&count); err != nil || count != maxRetainedSQLBatches || m.Tip() != uint64(len(page)) {
+		t.Fatalf("count=%d tip=%d err=%v", count, m.Tip(), err)
+	}
+	large, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "SELECT 1 /*" + strings.Repeat("x", maxRetainedSQLSourceBytes) + "*/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Value: large}, {Value: page[0].Value}})
+	if err != nil || len(retained) != 1 || retained[0] != nil || retained[1] == nil {
+		t.Fatalf("byte cap: retained=%d err=%v", len(retained), err)
+	}
+	medium, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: "SELECT 1 /*" + strings.Repeat("x", maxRetainedSQLSourceBytes/2) + "*/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Value: medium}, {Value: medium}})
+	if err != nil || len(retained) != 1 || retained[0] == nil || retained[1] != nil {
+		t.Fatalf("cumulative byte cap: retained=%d err=%v", len(retained), err)
 	}
 }
 
