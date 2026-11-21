@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -138,6 +139,10 @@ func TestApplyBatchRetainedSQLLimits(t *testing.T) {
 	if err := m.ApplyBatch(ctx, page); err != nil {
 		t.Fatal(err)
 	}
+	retained, err = m.validateBatchPolicy(page)
+	if err != nil || len(retained) != 0 {
+		t.Fatalf("replay retained=%d err=%v", len(retained), err)
+	}
 	if err := m.ApplyBatch(ctx, page); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +154,7 @@ func TestApplyBatchRetainedSQLLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Value: large}, {Value: page[0].Value}})
+	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Slot: 1000, Value: large}, {Slot: 1001, Value: page[0].Value}})
 	if err != nil || len(retained) != 1 || retained[0] != nil || retained[1] == nil {
 		t.Fatalf("byte cap: retained=%d err=%v", len(retained), err)
 	}
@@ -157,9 +162,47 @@ func TestApplyBatchRetainedSQLLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Value: medium}, {Value: medium}})
+	retained, err = m.validateBatchPolicy([]quepaxa.DecidedValue{{Slot: 1000, Value: medium}, {Slot: 1001, Value: medium}})
 	if err != nil || len(retained) != 1 || retained[0] == nil || retained[1] != nil {
 		t.Fatalf("cumulative byte cap: retained=%d err=%v", len(retained), err)
+	}
+}
+
+func TestBatchPolicyTipHintDoesNotBlockOrSkipValidation(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "batch.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	value := policySQL(t, "CREATE TABLE hint_test(id INTEGER)")
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	page := []quepaxa.DecidedValue{{Slot: 1, Value: value}, {Slot: 2, Value: value}}
+	retained, err := m.validateBatchPolicy(page)
+	if err != nil || retained[0] != nil || retained[1] == nil {
+		t.Fatalf("mixed replay: retained=%v err=%v", retained, err)
+	}
+	bad := append(append([]byte(nil), value...), []byte(" true")...)
+	if _, err := m.validateBatchPolicy([]quepaxa.DecidedValue{{Slot: 1, Value: bad}}); err == nil {
+		t.Fatal("skipped validation for replayed slot")
+	}
+	m.mu.Lock()
+	done := make(chan map[int][]types.SQLCommand, 1)
+	go func() {
+		retained, _ := m.validateBatchPolicy(page)
+		done <- retained
+	}()
+	select {
+	case retained = <-done:
+		m.mu.Unlock()
+		if retained[0] == nil || retained[1] == nil {
+			t.Fatal("contended hint did not fall back to retention")
+		}
+	case <-time.After(5 * time.Second):
+		m.mu.Unlock()
+		<-done
+		t.Fatal("preflight blocked on tip hint")
 	}
 }
 

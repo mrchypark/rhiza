@@ -1216,6 +1216,13 @@ const maxRetainedSQLSourceBytes = 1 << 20
 func (m *Materializer) validateBatchPolicy(decisions []quepaxa.DecidedValue) (map[int][]types.SQLCommand, error) {
 	var sqlBatches map[int][]types.SQLCommand
 	retainedBytes := 0
+	var tip uint64
+	// This hint only controls retention; application re-decodes any cache miss.
+	knownTip := m.mu.TryRLock()
+	if knownTip {
+		tip = m.tip
+		m.mu.RUnlock()
+	}
 	for i, decision := range decisions {
 		if m.managedProtocol == "" {
 			commands, sql, err := types.DecodeSQLBatch(decision.Value)
@@ -1223,7 +1230,7 @@ func (m *Materializer) validateBatchPolicy(decisions []quepaxa.DecidedValue) (ma
 				return nil, err
 			}
 			if sql {
-				if len(sqlBatches) < maxRetainedSQLBatches && len(decision.Value) <= maxRetainedSQLSourceBytes-retainedBytes {
+				if (!knownTip || uint64(decision.Slot) > tip) && len(sqlBatches) < maxRetainedSQLBatches && len(decision.Value) <= maxRetainedSQLSourceBytes-retainedBytes {
 					if sqlBatches == nil {
 						sqlBatches = make(map[int][]types.SQLCommand)
 					}
