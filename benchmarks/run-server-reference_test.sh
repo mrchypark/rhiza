@@ -13,6 +13,15 @@ cleanup_test() {
 }
 trap 'test_status=$?; trap - EXIT; cleanup_test; exit "$test_status"' EXIT
 
+# A one-second deadline remains open just before the deadline, regardless of
+# the wall-clock second boundary, and closes exactly at the deadline.
+deadline=100100
+monotonic_ticks() { printf '%s\n' "$fake_ticks"; }
+fake_ticks=100099
+if deadline_expired; then printf 'deadline expired before elapsed second\n' >&2; exit 1; fi
+fake_ticks=100100
+deadline_expired
+
 mkdir -p "$scratch/proc/42"
 printf '42 (name with ) parentheses) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123\n' > "$scratch/proc/42/stat"
 printf 'Name: test\nVmHWM: 456 kB\n' > "$scratch/proc/42/status"
@@ -39,6 +48,16 @@ wait_benchmark_child
 status=0
 wait_benchmark_child || status=$?
 [[ $status == 19 && -z $bench_pid ]]
+
+# A failed termination signal cannot be reported as successful cleanup, even
+# when the fallback kills and reaps the owned child.
+sleep 60 & owned_pid=$!
+kill() { if [[ ${1:-} != -KILL ]]; then return 1; fi; builtin kill "$@"; }
+status=0
+stop_owned_child "$owned_pid" || status=$?
+unset -f kill
+[[ $status == 1 ]]
+if kill -0 "$owned_pid" 2>/dev/null; then printf 'cleanup fallback left a child running\n' >&2; exit 1; fi
 
 # Exercise the actual shared wait helper, including a real non-child wait
 # error. Bash deliberately cannot distinguish explicit exit 137 from SIGKILL.
@@ -102,6 +121,7 @@ cat > "$scratch/bin/go" <<'MOCK'
 #!/usr/bin/env bash
 set -eu
 printf '%s|%s\n' "$PWD" "$*" >> "$MOCK_HOME/builds"
+if [[ ${1:-} == tool ]]; then [[ $MOCK_MODE != diag-profile-invalid ]]; exit; fi
 while [[ $1 != -o ]]; do shift; done
 output=$2
 case $output in
@@ -114,13 +134,28 @@ cat > "$scratch/bin/git" <<'MOCK'
 #!/usr/bin/env bash
 case "$*" in *rev-parse*) printf '%040d\n' 1 ;; *grep*) exit 0 ;; *) exit 92 ;; esac
 MOCK
+cat > "$scratch/bin/cp" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ( ${MOCK_MODE:-} == diag-log-copy-fail || ${MOCK_MODE:-} == diag-log-copy-preserve ) && ${1:-} == */rhiza-server-bench.*/node-0.log ]]; then exit 1; fi
+exec /bin/cp "$@"
+MOCK
 cat > "$scratch/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
+case $1 in
+ run) if [[ ${3:-} == -d ]]; then
+  if [[ $MOCK_MODE == launch-fail ]]; then exit 47; fi
+  touch "$MOCK_HOME/container"
+  if [[ $MOCK_MODE == launch-bad-id ]]; then printf 'invalid\n'; else printf '%064d\n' 1; fi
+ fi ;;
+ rm) if [[ $MOCK_MODE == healthy-cleanup-fail || $MOCK_MODE == diag-cleanup-preserve || $MOCK_MODE == diag-cleanup-success ]]; then exit 1; fi; rm -f "$MOCK_HOME/container" ;;
+ ps) if [[ -f $MOCK_HOME/container ]]; then printf '%064d\n' 1; fi ;;
+esac
 exit 0
 MOCK
 cat > "$scratch/node" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$$" >> "$MOCK_HOME/nodes"
+printf '%s\n' "${RHIZA_CI_CPU_PROFILE_PORT:-disabled}" >> "$MOCK_HOME/profile-ports"
 exec sleep 60
 MOCK
 cat > "$scratch/bench" <<'MOCK'
@@ -129,11 +164,18 @@ set -eu
 printf '%s\n' "$$" > "$MOCK_HOME/bench.pid"
 printf '%s\n' "$*" > "$MOCK_HOME/bench.args"
 control=
+profile_control=
 pid=
 while [[ $# -gt 0 ]]; do
- case $1 in -fault-control-file) control=$2; shift ;; -fault-pid) pid=$2; shift ;; esac
+ case $1 in -fault-control-file) control=$2; shift ;; -fault-pid) pid=$2; shift ;; -profile-control-file) profile_control=$2; shift ;; esac
  shift
 done
+if [[ -n $profile_control && $MOCK_MODE != diag-fast ]]; then
+ printf 'http://127.0.0.1:1234/0123456789abcdef0123456789abcdef' > "$profile_control"
+ while [[ ! -f $MOCK_HOME/profile-end ]]; do sleep 0.01; done
+ sleep 1
+fi
+if [[ $MOCK_MODE == diag-client-fail || $MOCK_MODE == diag-cleanup-preserve || $MOCK_MODE == diag-log-copy-preserve ]]; then exit 19; fi
 if [[ -n $control ]]; then
  printf '%s\n' "$pid" > "$MOCK_HOME/fault.pid"
  printf 'http://127.0.0.1:1234/0123456789abcdef0123456789abcdef' > "$control"
@@ -147,21 +189,83 @@ if [[ -n $control ]]; then
   window='{"attempted":true,"signal_succeeded":true,"overlap":true,"witnesses":1,"reason":"qualified"}'
  fi
 fi
-printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+profile_window=null
+completion_ns=0
+if [[ -n $profile_control ]]; then
+ if [[ $MOCK_MODE == diag-no-witness ]]; then profile_window='{"overlap":false,"witnesses":0}'; else profile_window='{"overlap":true,"witnesses":1}'; fi
+ if command -v gdate >/dev/null 2>&1; then now_ms=$(gdate +%s%3N); else now_ms=$(date +%s%3N); fi
+ completion_ns=$((now_ms * 1000000))
+ case $MOCK_MODE in
+  diag-late-serialization) sleep 1.2 ;;
+  diag-missing-time) completion_ns= ;;
+  diag-invalid-time) completion_ns=-1 ;;
+  diag-future-time) completion_ns=$((completion_ns + 10000000000)) ;;
+ esac
+fi
+completion_field=
+[[ -z $completion_ns ]] || completion_field=",\"last_request_completion_boottime_ns\":$completion_ns"
+printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s,"profile_window":%s%s}\n' "$window" "$profile_window" "$completion_field"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
 set -eu
 for url in "$@"; do :; done
 case $url in
-*/metrics/object-store) printf '{"puts":0}\n' ;;
+*/debug/pprof/profile\?*)
+ port=${url#http://127.0.0.1:}; port=${port%%/*}
+ touch "$MOCK_HOME/profile-$port-active"
+ output=
+ while [[ $# -gt 0 ]]; do if [[ $1 == -o ]]; then output=$2; shift; fi; shift; done
+ sleep 2 & sleeper=$!
+ trap 'kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; rm -f "$MOCK_HOME/profile-$port-active"; exit 143' TERM
+ wait "$sleeper"
+ rm -f "$MOCK_HOME/profile-$port-active"
+ touch "$MOCK_HOME/profile-finished"
+ if [[ $MOCK_MODE == diag-profile-fail ]]; then exit 22; fi
+ printf 'fake profile\n' > "$output" ;;
+*/debug/pprof/ready)
+ port=${url#http://127.0.0.1:}; port=${port%%/*}
+ phase=before
+ [[ ! -f $MOCK_HOME/ready-before-complete ]] || phase=during
+ printf '%s %s\n' "$phase" "$port" >> "$MOCK_HOME/ready-calls"
+ [[ -f $MOCK_HOME/profile-$port-active ]] || exit 22
+ if [[ $MOCK_MODE == diag-ready-start || ( $MOCK_MODE == diag-ready-during && $phase == during ) ]]; then exit 22; fi
+ if [[ $phase == before && $port == 20102 ]]; then touch "$MOCK_HOME/ready-before-complete"; fi ;;
+*/metrics/object-store)
+ if [[ $MOCK_MODE == diag-slow-snapshot && -f $MOCK_HOME/bench.pid && ! -f $MOCK_HOME/snapshot-delayed ]]; then touch "$MOCK_HOME/snapshot-delayed"; sleep 1.2; fi
+ if [[ $MOCK_MODE == diag-metrics-fail && -f $MOCK_HOME/bench.pid ]]; then exit 22; fi
+ if [[ $MOCK_MODE == diag-empty ]]; then printf '{}\n'; exit; fi
+ if [[ $MOCK_MODE == diag-missing-metric ]]; then printf '{"uploads":0}\n'; exit; fi
+ if [[ $MOCK_MODE == diag-schema-change && ! -f $MOCK_HOME/bench.pid ]]; then printf '{"uploads":0,"gets":0,"lists":0,"heads":0,"deletes":0,"failures":0,"bytes_uploaded":0,"bytes_downloaded":0,"s3_http_requests":0,"s3_http_failures":0,"http_requests":0,"http_failures":0,"extra":0}\n'; exit; fi
+ uploads=0
+ [[ ! -f $MOCK_HOME/query-done ]] || uploads=7
+ printf '{"uploads":%s,"gets":0,"lists":0,"heads":0,"deletes":0,"failures":0,"bytes_uploaded":0,"bytes_downloaded":0,"s3_http_requests":0,"s3_http_failures":0,"http_requests":0,"http_failures":0}\n' "$uploads" ;;
+*/recovery/status)
+ touch "$MOCK_HOME/status-called"
+ if [[ ! -f $MOCK_HOME/profile-finished ]]; then touch "$MOCK_HOME/status-before-profile-finished"; fi
+ case $MOCK_MODE in
+  diag-missing) printf '{}\n' ;;
+  diag-failure) exit 22 ;;
+  diag-timeout) printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":2}\n' ;;
+  diag-late-status) sleep 1.2; printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":4}\n' ;;
+  diag-success|diag-default|diag-cleanup-success|diag-log-copy-fail)
+   if [[ -f $MOCK_HOME/polled ]]; then archive=4; else archive=2; touch "$MOCK_HOME/polled"; fi
+   printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":%s}\n' "$archive" ;;
+ esac ;;
 */fault)
  case $MOCK_MODE in before-first) exit 22 ;; signal-failure) exit 47 ;; esac
  kill -KILL "$(cat "$MOCK_HOME/fault.pid")"
  touch "$MOCK_HOME/release"
  printf '{"attempted":true,"signal_succeeded":true}\n' ;;
+*/profile/begin)
+ [[ $MOCK_MODE != diag-control-fail ]] || exit 22
+ touch "$MOCK_HOME/profile-begin" ;;
+*/profile/end)
+ [[ -f $MOCK_HOME/profile-begin ]] || exit 22
+ touch "$MOCK_HOME/profile-end" ;;
 */sql/query)
- if [[ $MOCK_MODE == shifted ]]; then printf '{"rows":[[4,3]]}\n'; else printf '{"rows":[[4,4]]}\n'; fi ;;
+ touch "$MOCK_HOME/query-done"
+ if [[ $MOCK_MODE == shifted || $MOCK_MODE == diag-shifted ]]; then printf '{"rows":[[4,3]]}\n'; else printf '{"rows":[[4,4]]}\n'; fi ;;
 esac
 MOCK
 cat > "$scratch/bin/cat" <<'MOCK'
@@ -180,6 +284,9 @@ MOCK
 cat > "$scratch/bin/awk" <<'MOCK'
 #!/usr/bin/env bash
 case ${2:-} in
+/proc/uptime)
+ if command -v gdate >/dev/null 2>&1; then ticks=$(gdate +%s%3N); else ticks=$(date +%s%3N); fi
+ printf '%s\n' "$((ticks / 10))" ;;
 /proc/*/status)
  if [[ $MOCK_MODE == missing || ( $MOCK_MODE == missing-after && -f $MOCK_HOME/bench.pid ) ]]; then exit 1; fi
  printf '456\n' ;;
@@ -198,17 +305,62 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in healthy missing missing-after changed normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missing-after changed normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error diag-success diag-default diag-cleanup-success diag-log-copy-fail diag-log-copy-preserve diag-timeout diag-slow-snapshot diag-late-status diag-late-serialization diag-missing-time diag-invalid-time diag-future-time diag-missing diag-failure diag-metrics-fail diag-client-fail diag-cleanup-preserve diag-profile-fail diag-profile-invalid diag-empty diag-missing-metric diag-schema-change diag-shifted diag-ready-start diag-ready-during diag-fast diag-control-fail diag-no-witness; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
- case $mode in healthy|missing|missing-after|changed|shifted) fault=none ;; esac
+ case $mode in healthy|healthy-cleanup-fail|launch-fail|launch-bad-id|missing|missing-after|changed|shifted|diag-*) fault=none ;; esac
+ diagnostic=0
+ [[ $mode != diag-* ]] || diagnostic=1
+ drain_timeout=1
+ [[ $mode != diag-success && $mode != diag-default && $mode != diag-cleanup-success && $mode != diag-log-copy-fail ]] || drain_timeout=3
+ sync_interval=50ms
+ [[ $mode != diag-default ]] || sync_interval=
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC="$diagnostic" RHIZA_SERVER_BENCH_SYNC_INTERVAL="$sync_interval" RHIZA_SERVER_BENCH_DRAIN_TIMEOUT_SECONDS="$drain_timeout" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == healthy ]]; then
+ if [[ $mode == diag-success || $mode == diag-default ]]; then
+  [[ $status == 0 ]]
+  [[ $mode != diag-default ]] || sync_interval=1s
+  jq -e --arg interval "$sync_interval" '.publication_diagnostic | .outcome == "complete" and .fixed_certified_tip == 4 and .last_status.archive_tip == 4 and .sync_interval == $interval and (.workload_end | keys == ["n0","n1","n2"]) and (.drain_end | keys == ["n0","n1","n2"]) and (.observation | contains("ReadIndex"))' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.object_measurement | contains("publication drain and final linearizable verification")' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.object_store_delta.uploads == 21 and .result.profile_window.overlap == true and (.publication_diagnostic.cpu_profile_readiness | contains("completed request"))' "$scratch/$mode/result.json" >/dev/null
+  [[ -f $scratch/$mode/profile-begin && -f $scratch/$mode/profile-end ]]
+  for port in 20100 20101 20102; do grep -qx "before $port" "$scratch/$mode/ready-calls"; grep -qx "during $port" "$scratch/$mode/ready-calls"; done
+  [[ -f $scratch/$mode/status-before-profile-finished ]]
+  grep -q -- '-tags ci_profile' "$scratch/$mode/builds"
+  [[ $(sort "$scratch/$mode/profile-ports" | tr '\n' ' ') == '20100 20101 20102 ' ]]
+  profile_dir=$(jq -r '.publication_diagnostic.profile_directory' "$scratch/$mode/result.json")
+  [[ -s $profile_dir/server-binary ]]
+  for i in 0 1 2; do [[ -s $profile_dir/node-$i.cpu.pprof ]]; done
+ elif [[ $mode == diag-cleanup-success || $mode == diag-log-copy-fail ]]; then
+  [[ $status == 1 ]]
+  jq -e '.publication_diagnostic.outcome == "incomplete" and .publication_diagnostic.reason == "cleanup_unconfirmed" and .result.successes == 4' "$scratch/$mode/result.json" >/dev/null
+  grep -q 'cleanup: retained run directory' "$scratch/$mode/stderr"
+  if [[ $mode == diag-cleanup-success ]]; then
+   grep -q 'container .* removal not confirmed' "$scratch/$mode/stderr"
+  else
+   grep -q 'cleanup: could not preserve log' "$scratch/$mode/stderr"
+   retained=$(sed -n 's/^cleanup: retained run directory //p' "$scratch/$mode/stderr")
+   [[ -f $retained/node-0.log ]]
+  fi
+ elif [[ $mode == diag-* ]]; then
+  [[ $status != 0 ]]
+  case $mode in diag-timeout|diag-slow-snapshot|diag-late-status|diag-late-serialization) outcome=timeout; reason=archive_tip_timeout ;; diag-missing-time|diag-invalid-time|diag-future-time) outcome=incomplete; reason=workload_completion_time_unavailable ;; diag-metrics-fail|diag-schema-change) outcome=incomplete; reason=workload_metrics_unavailable ;; diag-client-fail|diag-cleanup-preserve|diag-log-copy-preserve) outcome=incomplete; reason=workload_failed ;; diag-profile-fail|diag-profile-invalid) outcome=incomplete; reason=cpu_profile_unavailable ;; diag-empty|diag-missing-metric) outcome=incomplete; reason=baseline_metrics_unavailable ;; diag-shifted) outcome=incomplete; reason=workload_verification_failed ;; diag-ready-start) outcome=incomplete; reason=cpu_profile_start_unconfirmed ;; diag-ready-during|diag-fast|diag-control-fail|diag-no-witness) outcome=incomplete; reason=cpu_profile_overlap_unconfirmed ;; *) outcome=incomplete; reason=status_unavailable ;; esac
+  jq -e --arg outcome "$outcome" --arg reason "$reason" '.publication_diagnostic.outcome == $outcome and .publication_diagnostic.reason == $reason' "$scratch/$mode/result.json" >/dev/null
+  if [[ $mode == diag-slow-snapshot ]]; then [[ ! -f $scratch/$mode/status-before-profile-finished ]]; fi
+  if [[ $mode == diag-late-status ]]; then jq -e '.publication_diagnostic.last_status.archive_tip == 4' "$scratch/$mode/result.json" >/dev/null; fi
+  if [[ $mode == diag-late-serialization ]]; then [[ ! -e $scratch/$mode/status-called ]]; fi
+  if [[ $mode == diag-client-fail || $mode == diag-cleanup-preserve || $mode == diag-log-copy-preserve ]]; then [[ $status == 19 ]]; elif [[ $mode != diag-empty && $mode != diag-missing-metric && $mode != diag-ready-start && $mode != diag-ready-during && $mode != diag-fast && $mode != diag-control-fail && $mode != diag-no-witness && $mode != diag-missing-time && $mode != diag-invalid-time && $mode != diag-future-time ]]; then jq -e '.successes == 4' "$scratch/$mode/result.json" >/dev/null; fi
+  if [[ $mode == diag-log-copy-preserve ]]; then
+   grep -q 'cleanup: could not preserve log' "$scratch/$mode/stderr"
+   retained=$(sed -n 's/^cleanup: retained run directory //p' "$scratch/$mode/stderr")
+   [[ -f $retained/node-0.log ]]
+  fi
+ elif [[ $mode == healthy ]]; then
   [[ $status == 0 ]]
   jq -e --argjson hz "$(getconf CLK_TCK)" '.server_resources.nodes | keys == ["n0","n1","n2"] and all(.[]; .cpu_seconds == (5 / $hz) and .vm_hwm_kib == 456)' "$scratch/$mode/result.json" >/dev/null
   jq -e '.server_resources.scope | contains("sequential snapshots bracketing the client workload")' "$scratch/$mode/result.json" >/dev/null
@@ -218,7 +370,14 @@ for mode in healthy missing missing-after changed normal shifted before-first af
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
  else
   [[ $status != 0 ]]
-  if [[ $mode == wait-* ]]; then
+  if [[ $mode == launch-fail || $mode == launch-bad-id ]]; then
+   if [[ $mode == launch-fail ]]; then [[ $status == 47 ]]; fi
+   grep -q 'cleanup cannot be verified' "$scratch/$mode/stderr"
+   grep -q 'cleanup: retained run directory' "$scratch/$mode/stderr"
+  elif [[ $mode == healthy-cleanup-fail ]]; then
+   [[ $status == 1 ]]
+   jq -e '.result.successes == 4' "$scratch/$mode/result.json" >/dev/null
+  elif [[ $mode == wait-* ]]; then
    case $mode in wait-normal) raw=0; want=1 ;; wait-crash) raw=139; want=139 ;; wait-error) raw=127; want=127 ;; esac
    [[ $status == "$want" ]]
    grep -qx "fault_exit_status=$raw" "$scratch/$mode/result-fault-metadata.txt"
@@ -229,12 +388,34 @@ for mode in healthy missing missing-after changed normal shifted before-first af
    if [[ $mode != missing ]]; then jq -e '.successes == 4 and .fault_exit_status == null' "$scratch/$mode/result.json" >/dev/null; fi
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
- if [[ $mode != missing ]]; then grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"; fi
+ if [[ $mode == healthy-cleanup-fail || $mode == diag-cleanup-preserve ]]; then
+  grep -q 'container .* removal not confirmed' "$scratch/$mode/stderr"
+  grep -q 'cleanup: retained run directory' "$scratch/$mode/stderr"
+ fi
+ if [[ -f $scratch/$mode/bench.args ]]; then
+  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
+ else
+  case $mode in launch-fail|launch-bad-id|missing|diag-empty|diag-missing-metric|diag-ready-start|diag-ready-during|diag-fast) ;; *) printf 'benchmark never started: %s\n' "$mode" >&2; exit 1 ;; esac
+ fi
  if [[ $fault != none ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
- grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
+ grep -Eq "^$scratch/base-server\\|build (.* )?-o " "$scratch/$mode/builds"
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <([[ ! -f $scratch/$mode/nodes ]] || cat "$scratch/$mode/nodes"; [[ ! -f $scratch/$mode/bench.pid ]] || cat "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + thirteen complete mocked runner cases PASS\n'
+first_profile_dir=$(jq -r '.publication_diagnostic.profile_directory' "$scratch/diag-success/result.json")
+printf 'previous run\n' > "$first_profile_dir/ownership-marker"
+mkdir "$scratch/reuse"
+cp "$scratch/node" "$scratch/bench" "$scratch/reuse/"
+BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/reuse" MOCK_MODE=diag-success PATH="$scratch/bin:$PATH" TMPDIR="$scratch/reuse" \
+ RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC=1 RHIZA_SERVER_BENCH_DRAIN_TIMEOUT_SECONDS=3 \
+ bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/diag-success/result.json" >"$scratch/reuse/stdout" 2>"$scratch/reuse/stderr"
+second_profile_dir=$(jq -r '.publication_diagnostic.profile_directory' "$scratch/diag-success/result.json")
+[[ $first_profile_dir != "$second_profile_dir" && -s $second_profile_dir/server-binary && -s $second_profile_dir/node-0.cpu.pprof ]]
+grep -qx 'previous run' "$first_profile_dir/ownership-marker"
+for i in 0 1 2; do [[ -s $first_profile_dir/node-$i.cpu.pprof && -s $second_profile_dir/node-$i.cpu.pprof ]]; done
+while IFS= read -r pid; do
+ if kill -0 "$pid" 2>/dev/null; then printf 'reused-output owned process survived: %s\n' "$pid" >&2; exit 1; fi
+done < <(cat "$scratch/reuse/nodes" "$scratch/reuse/bench.pid")
+printf 'server oracle helpers and mocked runner cases PASS\n'

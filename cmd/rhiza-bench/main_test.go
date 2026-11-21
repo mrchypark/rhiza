@@ -43,7 +43,7 @@ func TestDoRequestRetriesCommitUnknownWithSamePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0)
 	if err != nil || status != http.StatusOK || retries != 3 || attempts != 4 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
 	}
@@ -58,9 +58,38 @@ func TestDoRequestStopsWhenRetriesAreExhausted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, true)
+	status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{}`, 2, true, nil, 0)
 	if err != nil || status != http.StatusServiceUnavailable || retries != 2 || attempts != 3 {
 		t.Fatalf("status=%d retries=%d attempts=%d err=%v", status, retries, attempts, err)
+	}
+}
+
+func TestFaultErrorResponseDoesNotWaitPast4096Bytes(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 4096))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval)}
+	done := make(chan error, 1)
+	go func() {
+		status, body, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL, "", 0, false, p, 0)
+		if err == nil && (status != 500 || len(body) != 4096) {
+			err = errors.New("unexpected response")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fault mode waited for byte 4097")
 	}
 }
 
@@ -84,7 +113,7 @@ func TestDoRequestChecksSQLInsertReceipt(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls++; _, _ = io.WriteString(w, tc.body) }))
 			defer server.Close()
-			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true)
+			status, _, retries, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, payload, 3, true, nil, 0)
 			if status != 200 || calls != 1 || retries != 0 || (err == nil) != tc.valid || (!tc.valid && !errors.Is(err, errInvalidInsertReceipt)) {
 				t.Fatalf("status=%d calls=%d retries=%d err=%v", status, calls, retries, err)
 			}
@@ -166,11 +195,200 @@ func TestFaultCoordinatorSingleAttemptAndCompletedSnapshot(t *testing.T) {
 	})
 }
 
+func TestProfileBracket(t *testing.T) {
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true}
+	ctx, finish, _ := p.traceRequest(t.Context(), 1)
+	httptrace.ContextClientTrace(ctx).WroteRequest(httptrace.WroteRequestInfo{})
+	probe := func(path string, body io.Reader) int {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, body))
+		return w.Code
+	}
+	if probe("/wrong/profile/begin", nil) != 404 || probe("/owned/profile/begin", strings.NewReader("x")) != 400 || probe("/owned/profile/end", nil) != 409 {
+		t.Fatal("invalid control accepted")
+	}
+	if probe("/owned/profile/begin", nil) != 200 || probe("/owned/profile/begin", nil) != 409 || probe("/owned/fault", nil) != 404 || probe("/owned/profile/end", nil) != 200 || probe("/owned/profile/end", nil) != 409 {
+		t.Fatal("invalid bracket behavior")
+	}
+	if p.profileResult().Overlap {
+		t.Fatal("unfinished request qualified")
+	}
+	finish(time.Now())
+	if got := p.profileResult(); !got.Overlap || got.Witnesses != 1 || got.Reason != "qualified" {
+		t.Fatal(got)
+	}
+	empty := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true}
+	for _, path := range []string{"/owned/profile/begin", "/owned/profile/end"} {
+		w := httptest.NewRecorder()
+		empty.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+	}
+	if got := empty.profileResult(); got.Overlap || got.SnapshotRequests != 0 {
+		t.Fatal(got)
+	}
+}
+
+func TestProfileRepeatedWriteCannotQualify(t *testing.T) {
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true}
+	ctx, finish, _ := p.traceRequest(t.Context(), 1)
+	trace := httptrace.ContextClientTrace(ctx)
+	trace.WroteRequest(httptrace.WroteRequestInfo{})
+	for _, path := range []string{"/owned/profile/begin", "/owned/profile/end"} {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatal(w.Code)
+		}
+	}
+	trace.WroteRequest(httptrace.WroteRequestInfo{})
+	finish(time.Now())
+	if got := p.profileResult(); got.Overlap || got.SnapshotRequests != 1 {
+		t.Fatal(got)
+	}
+}
+
+func TestProfileCompletionClockPrecedesTrackerLock(t *testing.T) {
+	entered, release, recorded := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		_, _ = io.WriteString(w, `{"slot":1,"status":"committed","rows_affected":1,"retry_through_slot":65536}`)
+	}))
+	defer server.Close()
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), profile: true,
+		completionClock: func() (int64, error) { close(recorded); return 123, nil }}
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := doRequest(t.Context(), server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true, p, 0)
+		done <- err
+	}()
+	<-entered
+	p.mu.Lock()
+	close(release)
+	select {
+	case <-recorded:
+	case <-time.After(5 * time.Second):
+		p.mu.Unlock()
+		t.Fatal("clock blocked by tracker")
+	}
+	// recordCompletion publishes before finish tries to acquire the tracker lock.
+	deadline := time.After(5 * time.Second)
+	for p.lastCompletion.Load() != 123 {
+		select {
+		case <-deadline:
+			p.mu.Unlock()
+			t.Fatal("completion not published")
+		default:
+			runtime.Gosched()
+		}
+	}
+	select {
+	case <-done:
+		p.mu.Unlock()
+		t.Fatal("worker bypassed held tracker lock")
+	default:
+	}
+	p.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if p.lastCompletion.Load() != 123 || p.completionClockFailed.Load() {
+		t.Fatal("completion clock changed")
+	}
+}
+
+func TestProfileCompletionClockFailure(t *testing.T) {
+	p := &faultProgress{completionClock: func() (int64, error) { return 0, errors.New("clock failed") }}
+	p.recordCompletion()
+	if !p.completionClockFailed.Load() || p.lastCompletion.Load() != 0 {
+		t.Fatal("clock failure accepted")
+	}
+}
+
+func TestProfileBracketAfterBodyBeforeClockCannotQualify(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") }))
+	defer server.Close()
+	clockEntered, releaseClock := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseClock) })
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), profile: true, token: "owned",
+		completionClock: func() (int64, error) { close(clockEntered); <-releaseClock; return 123, nil }}
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := doRequest(t.Context(), server.Client(), http.MethodGet, server.URL, "", 0, false, p, 0)
+		done <- err
+	}()
+	select {
+	case <-clockEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("clock was not reached")
+	}
+	for _, path := range []string{"/owned/profile/begin", "/owned/profile/end"} {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatal(w.Code)
+		}
+	}
+	if got := p.profileResult(); got.Overlap || got.SnapshotRequests != 0 {
+		t.Fatal(got)
+	}
+	releaseOnce.Do(func() { close(releaseClock) })
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := p.profileResult(); got.Overlap {
+		t.Fatal(got)
+	}
+}
+
+func TestProfileBracketRealHTTP(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true}
+	ctx, finish, _ := p.traceRequest(t.Context(), 1)
+	done := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		if err == nil {
+			var resp *http.Response
+			resp, err = server.Client().Do(req)
+			if err == nil {
+				err = resp.Body.Close()
+			}
+		}
+		finish(time.Now())
+		done <- err
+	}()
+	<-entered
+	for _, path := range []string{"/owned/profile/begin", "/owned/profile/end"} {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != 200 {
+			t.Error(w.Code)
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := p.profileResult(); !got.Overlap || got.Witnesses != 1 {
+		t.Fatal(got)
+	}
+}
+
 func TestFaultCompletionTimestampPrecedesContendedLock(t *testing.T) {
 	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval)}
-	ctx, finish := p.traceRequest(deadline, 1)
+	ctx, finish, _ := p.traceRequest(deadline, 1)
 	httptrace.ContextClientTrace(ctx).WroteRequest(httptrace.WroteRequestInfo{})
 	interval := p.active[1]
 	done := make(chan struct{})
@@ -203,6 +421,50 @@ func TestFaultCompletionTimestampPrecedesContendedLock(t *testing.T) {
 	<-done
 	if p.window().Overlap {
 		t.Fatal("delayed tracking lock manufactured overlap", p.window())
+	}
+}
+
+type retryGateTransport struct {
+	base    http.RoundTripper
+	second  chan struct{}
+	release chan struct{}
+	calls   int
+}
+
+func (g *retryGateTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	g.calls++
+	if g.calls == 2 {
+		close(g.second)
+		<-g.release
+	}
+	return g.base.RoundTrip(r)
+}
+
+func TestProfileBracketBetweenRetriesDoesNotQualify(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"code":"commit_unknown"}`)
+	}))
+	defer server.Close()
+	gate := &retryGateTransport{base: http.DefaultTransport, second: make(chan struct{}), release: make(chan struct{})}
+	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), token: "owned", profile: true}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		doRequest(t.Context(), &http.Client{Transport: gate}, http.MethodPost, server.URL, `{}`, 1, false, p, 0)
+	}()
+	<-gate.second
+	for _, path := range []string{"/owned/profile/begin", "/owned/profile/end"} {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != 200 {
+			t.Error(w.Code)
+		}
+	}
+	close(gate.release)
+	<-done
+	if got := p.profileResult(); got.Overlap || got.SnapshotRequests != 0 {
+		t.Fatal(got)
 	}
 }
 
@@ -239,18 +501,12 @@ func TestFaultProgressActualHTTPTraceLifecycle(t *testing.T) {
 			}
 		}
 	}})
-	ctx, finish := p.traceRequest(base, 7)
-	interval := p.active[7]
-	if interval.sent.Load() != nil {
-		t.Fatal("unsent request marked sent")
-	}
 	done := make(chan struct{})
 	var status, retries int
 	var requestErr error
 	go func() {
 		defer close(done)
-		status, _, retries, requestErr = doRequest(ctx, server.Client(), http.MethodPost, server.URL, payload, 1, true)
-		finish(time.Now())
+		status, _, retries, requestErr = doRequest(base, server.Client(), http.MethodPost, server.URL, payload, 1, true, p, 7)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -267,14 +523,19 @@ func TestFaultProgressActualHTTPTraceLifecycle(t *testing.T) {
 		}
 	}
 	waitWrite()
-	originalSent := interval.sent.Load()
+	p.mu.Lock()
+	firstInterval := p.active[7]
+	p.mu.Unlock()
 	if err := p.inject(); err != nil {
 		t.Fatal(err)
 	}
 	onceFirst.Do(func() { close(first) })
 	waitWrite()
-	if interval.sent.Load() != originalSent {
-		t.Fatal("same-ID retry replaced first sent time")
+	p.mu.Lock()
+	sameInterval := p.active[7] == firstInterval
+	p.mu.Unlock()
+	if !sameInterval || firstInterval.repeated.Load() {
+		t.Fatal("fault retry changed request tracking")
 	}
 	onceSecond.Do(func() { close(second) })
 	<-done
@@ -283,10 +544,6 @@ func TestFaultProgressActualHTTPTraceLifecycle(t *testing.T) {
 	}
 	if len(p.active) != 0 || len(p.snapshot) != 1 {
 		t.Fatal("retention exceeds active/single snapshot")
-	}
-	httptrace.ContextClientTrace(ctx).WroteRequest(httptrace.WroteRequestInfo{})
-	if len(p.active) != 0 || p.active[7] != nil {
-		t.Fatal("late callback resurrected completed request")
 	}
 }
 
@@ -299,13 +556,10 @@ func TestFaultFastHTTPCompletionCannotQualify(t *testing.T) {
 	defer server.Close()
 	calls := 0
 	p := &faultProgress{epoch: time.Now(), active: make(map[int]*requestInterval), signal: func() (time.Time, time.Time, error) { calls++; return time.Now(), time.Now(), nil }}
-	ctx, finish := p.traceRequest(deadline, 0)
-	status, _, _, err := doRequest(ctx, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true)
-	finish(time.Now())
+	status, _, _, err := doRequest(deadline, server.Client(), http.MethodPost, server.URL, `{"request_id":"bench-0","sql":"INSERT INTO benchmark_writes(id) VALUES (0)"}`, 0, true, p, 0)
 	if status != 200 || err != nil {
 		t.Fatal(status, err)
 	}
-	httptrace.ContextClientTrace(ctx).WroteRequest(httptrace.WroteRequestInfo{})
 	if p.inject() == nil || calls != 0 || len(p.active) != 0 {
 		t.Fatal("completed request qualified")
 	}

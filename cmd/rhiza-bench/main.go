@@ -23,25 +23,27 @@ import (
 )
 
 type result struct {
-	Requests         int               `json:"requests"`
-	Successes        int               `json:"successes"`
-	Errors           uint64            `json:"errors"`
-	Retries          uint64            `json:"retries,omitempty"`
-	DurationMS       float64           `json:"duration_ms"`
-	OpsPerSec        float64           `json:"ops_per_sec"`
-	SuccessOpsPerSec float64           `json:"success_ops_per_sec"`
-	P50MS            float64           `json:"p50_ms"`
-	P95MS            float64           `json:"p95_ms"`
-	P99MS            float64           `json:"p99_ms"`
-	MaxMS            float64           `json:"max_ms"`
-	ErrorP50MS       float64           `json:"error_p50_ms,omitempty"`
-	ErrorP95MS       float64           `json:"error_p95_ms,omitempty"`
-	ErrorP99MS       float64           `json:"error_p99_ms,omitempty"`
-	ErrorKinds       map[string]uint64 `json:"error_kinds,omitempty"`
-	ErrorSamples     map[string]string `json:"error_samples,omitempty"`
-	ReceiptOracle    string            `json:"receipt_oracle,omitempty"`
-	FaultOverlap     bool              `json:"fault_overlap_control,omitempty"`
-	FaultWindow      *faultWindow      `json:"fault_window,omitempty"`
+	Requests                    int               `json:"requests"`
+	Successes                   int               `json:"successes"`
+	Errors                      uint64            `json:"errors"`
+	Retries                     uint64            `json:"retries,omitempty"`
+	DurationMS                  float64           `json:"duration_ms"`
+	OpsPerSec                   float64           `json:"ops_per_sec"`
+	SuccessOpsPerSec            float64           `json:"success_ops_per_sec"`
+	P50MS                       float64           `json:"p50_ms"`
+	P95MS                       float64           `json:"p95_ms"`
+	P99MS                       float64           `json:"p99_ms"`
+	MaxMS                       float64           `json:"max_ms"`
+	ErrorP50MS                  float64           `json:"error_p50_ms,omitempty"`
+	ErrorP95MS                  float64           `json:"error_p95_ms,omitempty"`
+	ErrorP99MS                  float64           `json:"error_p99_ms,omitempty"`
+	ErrorKinds                  map[string]uint64 `json:"error_kinds,omitempty"`
+	ErrorSamples                map[string]string `json:"error_samples,omitempty"`
+	ReceiptOracle               string            `json:"receipt_oracle,omitempty"`
+	FaultOverlap                bool              `json:"fault_overlap_control,omitempty"`
+	FaultWindow                 *faultWindow      `json:"fault_window,omitempty"`
+	ProfileWindow               *profileWindow    `json:"profile_window,omitempty"`
+	LastRequestCompletionBootNS int64             `json:"last_request_completion_boottime_ns,omitempty"`
 }
 
 func main() {
@@ -54,6 +56,7 @@ func main() {
 	commitUnknownRetries := flag.Int("commit-unknown-retries", 0, "maximum same-request retries after commit_unknown")
 	verifyInsert := flag.Bool("verify-insert-receipt", false, "verify benchmark INSERT committed receipt and exact id")
 	faultControlFile := flag.String("fault-control-file", "", "optional owned file for loopback fault overlap control URL")
+	profileControlFile := flag.String("profile-control-file", "", "optional owned file for non-destructive profile overlap control URL")
 	faultPID := flag.Int("fault-pid", 0, "fixed owned fault target PID, bound before requests (Linux pidfd required)")
 	faultStart := flag.String("fault-start-time", "", "Linux target start-time ticks captured by the owning parent")
 	flag.Parse()
@@ -84,14 +87,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fault control file, fixed PID and start time must be supplied together")
 		os.Exit(2)
 	}
-	if *faultControlFile != "" {
-		target, err := openFaultTarget(*faultPID, *faultStart, os.Getppid())
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "cannot bind fault target:", err)
-			os.Exit(1)
+	if *faultControlFile != "" && *profileControlFile != "" {
+		fmt.Fprintln(os.Stderr, "fault and profile controls are mutually exclusive")
+		os.Exit(2)
+	}
+	if *faultControlFile != "" || *profileControlFile != "" {
+		progress = &faultProgress{active: make(map[int]*requestInterval), epoch: time.Now(), profile: *profileControlFile != ""}
+		if *faultControlFile != "" {
+			target, err := openFaultTarget(*faultPID, *faultStart, os.Getppid())
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "cannot bind fault target:", err)
+				os.Exit(1)
+			}
+			defer target.close()
+			progress.signal = target.signal
 		}
-		defer target.close()
-		progress = &faultProgress{active: make(map[int]*requestInterval), signal: target.signal, epoch: time.Now()}
 		var nonce [16]byte
 		if _, err := rand.Read(nonce[:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -105,7 +115,11 @@ func main() {
 		}
 		control = &http.Server{Handler: progress, ReadHeaderTimeout: 2 * time.Second}
 		defer control.Close()
-		address, err := os.OpenFile(*faultControlFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		controlFile := *faultControlFile
+		if progress.profile {
+			controlFile = *profileControlFile
+		}
+		address, err := os.OpenFile(controlFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err == nil {
 			_, err = io.WriteString(address, "http://"+listener.Addr().String()+"/"+progress.token)
 			closeErr := address.Close()
@@ -132,15 +146,7 @@ func main() {
 					method = http.MethodPost
 				}
 				begin := time.Now()
-				requestCtx := ctx
-				var finish func(time.Time)
-				if progress != nil {
-					requestCtx, finish = progress.traceRequest(ctx, id)
-				}
-				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
-				if finish != nil {
-					finish(time.Now()) // capture completion BEFORE the tracking lock
-				}
+				status, sample, retryCount, requestErr := doRequest(ctx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert, progress, id)
 				retries.Add(uint64(retryCount))
 				elapsed := time.Since(begin)
 				if status < 200 || status >= 300 {
@@ -225,9 +231,15 @@ func main() {
 		OpsPerSec: float64(*requests) / elapsedSec, SuccessOpsPerSec: float64(len(latencies)) / elapsedSec, P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
 		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
 		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
-		FaultOverlap: progress != nil,
+		FaultOverlap: progress != nil && !progress.profile,
 	}
-	if progress != nil {
+	if progress != nil && progress.profile {
+		window := progress.profileResult()
+		output.ProfileWindow = &window
+		if !progress.completionClockFailed.Load() {
+			output.LastRequestCompletionBootNS = progress.lastCompletion.Load()
+		}
+	} else if progress != nil {
 		window := progress.window()
 		output.FaultWindow = &window
 	}
@@ -238,12 +250,33 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if progress != nil && progress.profile && (progress.completionClockFailed.Load() || progress.lastCompletion.Load() <= 0) {
+		fmt.Fprintln(os.Stderr, "profile completion clock unavailable")
+		os.Exit(1)
+	}
 }
 
-func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool) (int, []byte, int, error) {
+func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool, progress *faultProgress, id int) (int, []byte, int, error) {
+	if progress != nil && !progress.profile {
+		var finish func(time.Time)
+		ctx, finish, _ = progress.traceRequest(ctx, id)
+		defer func() { finish(time.Now()) }()
+	}
 	for retries := 0; ; retries++ {
-		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))
+		attemptCtx := ctx
+		var finish func(time.Time)
+		var interval *requestInterval
+		if progress != nil && progress.profile {
+			attemptCtx, finish, interval = progress.traceRequest(ctx, id)
+		}
+		request, err := http.NewRequestWithContext(attemptCtx, method, url, bytes.NewBufferString(payload))
 		if err != nil {
+			if progress != nil && progress.profile {
+				progress.completionClockFailed.Store(true)
+			}
+			if finish != nil {
+				finish(time.Now())
+			}
 			return 0, nil, retries, err
 		}
 		if payload != "" {
@@ -251,22 +284,52 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 		}
 		response, err := client.Do(request)
 		if err != nil {
+			if progress != nil && progress.profile {
+				progress.completionClockFailed.Store(true)
+			}
+			if finish != nil {
+				finish(time.Now())
+			}
 			return 0, nil, retries, err
 		}
 		var body []byte
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			if verifyInsert {
 				body, err = io.ReadAll(io.LimitReader(response.Body, 4097))
-				if err == nil {
-					err = validateInsertReceipt(payload, body)
-				}
 			} else {
 				_, err = io.Copy(io.Discard, response.Body)
 			}
 		} else {
-			body, err = io.ReadAll(io.LimitReader(response.Body, 4096))
+			limit := int64(4096)
+			if progress != nil && progress.profile {
+				limit++
+			}
+			body, err = io.ReadAll(io.LimitReader(response.Body, limit))
+		}
+		var completed time.Time
+		if interval != nil {
+			completed = time.Now()
+			interval.finished.Store(&completed)
+		}
+		if progress != nil && progress.profile {
+			if err != nil || len(body) > 4096 {
+				progress.completionClockFailed.Store(true)
+			} else {
+				progress.recordCompletion()
+			}
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			if len(body) > 4096 {
+				body = body[:4096]
+			}
 		}
 		response.Body.Close()
+		if finish != nil {
+			finish(completed)
+		}
+		if err == nil && verifyInsert && response.StatusCode >= 200 && response.StatusCode < 300 {
+			err = validateInsertReceipt(payload, body)
+		}
 		if err != nil || !isCommitUnknown(response.StatusCode, body) || retries == maxRetries {
 			return response.StatusCode, body, retries, err
 		}
@@ -306,21 +369,79 @@ func validateInsertReceipt(payload string, body []byte) error {
 // Only fault lanes enable this coordinator. Retain only the current requests
 // and one bounded fault snapshot, never the complete benchmark history.
 type faultProgress struct {
-	mu            sync.Mutex
-	token         string
-	active        map[int]*requestInterval
-	epoch         time.Time
-	signal        func() (time.Time, time.Time, error)
-	attempted     bool
-	snapshot      []*requestInterval
-	before, after time.Time
-	signalOK      bool
-	reason        string
+	mu                       sync.Mutex
+	token                    string
+	active                   map[int]*requestInterval
+	epoch                    time.Time
+	signal                   func() (time.Time, time.Time, error)
+	attempted                bool
+	snapshot                 []*requestInterval
+	before, after            time.Time
+	signalOK                 bool
+	reason                   string
+	profile                  bool
+	profileBegin, profileEnd time.Time
+	profileSnapshot          []*requestInterval
+	lastCompletion           atomic.Int64
+	completionClockFailed    atomic.Bool
+	completionClock          func() (int64, error)
+}
+
+func (p *faultProgress) recordCompletion() {
+	clock := p.completionClock
+	if clock == nil {
+		clock = bootTimeNS
+	}
+	ns, err := clock()
+	if err != nil || ns <= 0 {
+		p.completionClockFailed.Store(true)
+		return
+	}
+	for previous := p.lastCompletion.Load(); ns > previous; previous = p.lastCompletion.Load() {
+		if p.lastCompletion.CompareAndSwap(previous, ns) {
+			return
+		}
+	}
+}
+
+type profileWindow struct {
+	Overlap           bool   `json:"overlap"`
+	Witnesses         int    `json:"witnesses"`
+	SnapshotRequests  int    `json:"snapshot_requests"`
+	BeginNS           int64  `json:"begin_ns"`
+	EndNS             int64  `json:"end_ns"`
+	WitnessSentNS     int64  `json:"witness_sent_ns"`
+	WitnessFinishedNS int64  `json:"witness_finished_ns"`
+	Reason            string `json:"reason"`
+}
+
+func (p *faultProgress) profileResult() profileWindow {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := profileWindow{SnapshotRequests: len(p.profileSnapshot), Reason: "bracket_incomplete"}
+	if p.profileBegin.IsZero() || p.profileEnd.IsZero() {
+		return r
+	}
+	r.BeginNS, r.EndNS = p.profileBegin.Sub(p.epoch).Nanoseconds(), p.profileEnd.Sub(p.epoch).Nanoseconds()
+	for _, interval := range p.profileSnapshot {
+		sent, finished := interval.sent.Load(), interval.finished.Load()
+		if !interval.repeated.Load() && sent != nil && finished != nil && coversFault(*sent, *finished, p.profileBegin, p.profileEnd) {
+			r.Witnesses++
+			r.WitnessSentNS, r.WitnessFinishedNS = sent.Sub(p.epoch).Nanoseconds(), finished.Sub(p.epoch).Nanoseconds()
+		}
+	}
+	r.Overlap = r.Witnesses > 0
+	r.Reason = "no_completed_interval_spans_bracket"
+	if r.Overlap {
+		r.Reason = "qualified"
+	}
+	return r
 }
 
 type requestInterval struct {
 	sent     atomic.Pointer[time.Time]
 	finished atomic.Pointer[time.Time]
+	repeated atomic.Bool
 }
 
 type faultWindow struct {
@@ -336,15 +457,24 @@ type faultWindow struct {
 	Reason            string `json:"reason"`
 }
 
-func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time)) {
+func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time), *requestInterval) {
 	interval := &requestInterval{}
 	p.mu.Lock()
 	p.active[id] = interval
 	p.mu.Unlock()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
-		if info.Err == nil && interval.finished.Load() == nil {
+		if interval.finished.Load() == nil {
+			if p.profile && interval.sent.Load() != nil {
+				interval.repeated.Store(true)
+				return
+			}
+			if info.Err != nil {
+				return
+			}
 			now := time.Now()
-			interval.sent.CompareAndSwap(nil, &now) // first send across same-ID retries
+			if !interval.sent.CompareAndSwap(nil, &now) && p.profile {
+				interval.repeated.Store(true)
+			}
 		}
 	}})
 	return ctx, func(at time.Time) {
@@ -352,7 +482,7 @@ func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Conte
 		p.mu.Lock()
 		delete(p.active, id)
 		p.mu.Unlock()
-	}
+	}, interval
 }
 
 func (p *faultProgress) inject() error {
@@ -431,6 +561,41 @@ func (p *faultProgress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		path = "/" + strings.TrimPrefix(path, prefix)
+	}
+	if p.profile {
+		if r.ContentLength != 0 {
+			http.Error(w, "body forbidden", http.StatusBadRequest)
+			return
+		}
+		p.mu.Lock()
+		switch path {
+		case "/profile/begin":
+			if !p.profileBegin.IsZero() {
+				p.mu.Unlock()
+				http.Error(w, "bracket already begun", http.StatusConflict)
+				return
+			}
+			p.profileBegin = time.Now()
+			for _, interval := range p.active {
+				if interval.sent.Load() != nil && interval.finished.Load() == nil {
+					p.profileSnapshot = append(p.profileSnapshot, interval)
+				}
+			}
+		case "/profile/end":
+			if p.profileBegin.IsZero() || !p.profileEnd.IsZero() {
+				p.mu.Unlock()
+				http.Error(w, "bracket not open", http.StatusConflict)
+				return
+			}
+			p.profileEnd = time.Now()
+		default:
+			p.mu.Unlock()
+			http.NotFound(w, r)
+			return
+		}
+		p.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	if path != "/fault" {
 		http.NotFound(w, r)

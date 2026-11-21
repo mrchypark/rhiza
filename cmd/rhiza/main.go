@@ -49,6 +49,11 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 		}
 		return rhiza.EnrollExistingVoter(ctx, config)
 	}
+	stopProfile, err := startCPUProfile()
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, stopProfile()) }()
 	var handler http.Handler
 	var closeService func() error
 	switch role {

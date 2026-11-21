@@ -41,6 +41,10 @@ on:
         description: Run serialized local S3 checkpoint, archive-GC, Node.Open restore, and foreground cost evidence
         type: boolean
         default: false
+      async_publication_diagnostic:
+        description: Run one async background publication and CPU diagnostic
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,7 +55,7 @@ concurrency:
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.async_publication_diagnostic }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -305,6 +309,72 @@ jobs:
           name: paired-performance-${{ github.run_id }}
           path: ${{ runner.temp }}/rhiza-performance
           if-no-files-found: error
+          retention-days: 30
+
+  async-publication-diagnostic:
+    if: ${{ inputs.async_publication_diagnostic }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run async publication diagnostic
+        env:
+          RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC: 1
+          RHIZA_SERVER_BENCH_SYNC_INTERVAL: 2s
+          RHIZA_SERVER_BENCH_DURABILITY: async
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/async-publication"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/async-publication/candidate-sha.txt"
+          timeout --signal=TERM --kill-after=30s 20m benchmarks/run-server-reference.sh \
+            "$GITHUB_WORKSPACE" "$RUNNER_TEMP/async-publication/diagnostic.json" \
+            2>&1 | tee "$RUNNER_TEMP/async-publication/output.txt"
+          jq -e '.publication_diagnostic.outcome == "complete" and .publication_diagnostic.sync_interval == "2s"' \
+            "$RUNNER_TEMP/async-publication/diagnostic.json" >/dev/null
+          evidence_dir=$(realpath "$RUNNER_TEMP/async-publication")
+          profile_dir=$(jq -er '.publication_diagnostic.profile_directory | select(type == "string")' "$evidence_dir/diagnostic.json")
+          test ! -L "$profile_dir"
+          profile_dir=$(realpath "$profile_dir")
+          test -d "$profile_dir"
+          test "$(dirname "$profile_dir")" = "$evidence_dir"
+          case "$profile_dir" in
+            "$evidence_dir"/diagnostic-profiles.*) ;;
+            *) printf 'Invalid profile directory: %s\n' "$profile_dir" >&2; exit 1 ;;
+          esac
+          test -f "$profile_dir/server-binary"
+          test -s "$profile_dir/server-binary"
+          test ! -L "$profile_dir/server-binary"
+          for node in 0 1 2; do
+            test -f "$profile_dir/node-$node.cpu.pprof"
+            test -s "$profile_dir/node-$node.cpu.pprof"
+            test ! -L "$profile_dir/node-$node.cpu.pprof"
+          done
+
+      - name: Describe diagnostic evidence
+        if: always()
+        run: |
+          {
+            printf '## Async publication diagnostic\n\n'
+            printf 'One healthy async run with a 2s sync interval and local S3 emulator. This is a diagnostic, not a paired performance comparison.\n\n'
+            printf 'The artifact contains the candidate SHA, raw output, JSON result, node logs, and, when collected, the server binary and CPU profiles. A timeout or early failure may leave partial evidence.\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload async publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: async-publication-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/async-publication
+          if-no-files-found: warn
           retention-days: 30
 
   issue185-cost-evidence:
