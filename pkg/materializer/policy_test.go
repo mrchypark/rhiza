@@ -86,6 +86,29 @@ func TestLegacyPolicyCannotOpenOrReplay(t *testing.T) {
 	}
 }
 
+func TestApplyBatchValidatesAllSQLBeforeApplying(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "batch.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	good := policySQL(t, "CREATE TABLE safe(id INTEGER)")
+	malformed := append(append([]byte(nil), good...), []byte(" true")...)
+	for _, badSlot := range []quepaxa.Slot{0, 2} {
+		page := []quepaxa.DecidedValue{{Slot: 1, Value: good}, {Slot: badSlot, Value: malformed}}
+		if err := m.ApplyBatch(ctx, page); err == nil {
+			t.Fatalf("slot %d: accepted trailing JSON", badSlot)
+		}
+		if m.Tip() != 0 {
+			t.Fatalf("slot %d: advanced tip to %d", badSlot, m.Tip())
+		}
+	}
+	if err := m.Apply(ctx, 1, good); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLegacySnapshotRefusalPreservesLiveState(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(filepath.Join(t.TempDir(), "current.db"), 1)

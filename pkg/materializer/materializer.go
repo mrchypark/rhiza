@@ -1210,7 +1210,21 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
-	for _, decision := range decisions {
+	var sqlBatches [][]types.SQLCommand
+	for i, decision := range decisions {
+		if m.managedProtocol == "" {
+			commands, sql, err := types.DecodeSQLBatch(decision.Value)
+			if err != nil {
+				return err
+			}
+			if sql {
+				if sqlBatches == nil {
+					sqlBatches = make([][]types.SQLCommand, len(decisions))
+				}
+				sqlBatches[i] = commands
+				continue
+			}
+		}
 		if err := m.validateExecutionPolicy(decision.Value); err != nil {
 			return err
 		}
@@ -1336,7 +1350,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
 		m.pendingSQLResultBytes = 0
 	}()
-	for _, decision := range decisions {
+	for i, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
 		if slot <= m.tip {
@@ -1351,7 +1365,11 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		var commands []types.SQLCommand
+		if sqlBatches != nil {
+			commands = sqlBatches[i]
+		}
+		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, commands, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -1472,7 +1490,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, commands []types.SQLCommand, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if m.managedProtocol != "" {
 		application, err := managedApplicationValue(value)
 		if graphProtocol(m.managedProtocol) {
@@ -1545,9 +1563,12 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 	if err != nil {
 		return fmt.Errorf("decode KV batch: %w", err)
 	}
-	commands, batched, err := types.DecodeSQLBatch(value)
-	if err != nil {
-		return fmt.Errorf("decode SQL batch: %w", err)
+	batched := commands != nil
+	if !batched {
+		commands, batched, err = types.DecodeSQLBatch(value)
+		if err != nil {
+			return fmt.Errorf("decode SQL batch: %w", err)
+		}
 	}
 	if barrier, err := types.DecodeReadBarrier(value); err != nil {
 		return fmt.Errorf("decode read barrier: %w", err)
