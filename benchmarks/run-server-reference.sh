@@ -37,6 +37,17 @@ verify_benchmark_rows() {
 	jq -e --argjson requests "$1" '.rows == [[$requests, $requests]]' >/dev/null
 }
 
+# /proc stat's command field can contain spaces and parentheses.
+server_resource_snapshot() {
+	local pid=$1 proc_root=${2:-/proc} stat hwm
+	local -a fields
+	stat=$(cat "$proc_root/$pid/stat") || return 1
+	read -ra fields <<< "${stat##*) }"
+	[[ ${fields[11]:-} =~ ^[0-9]+$ && ${fields[12]:-} =~ ^[0-9]+$ && ${fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+	hwm=$(awk '$1 == "VmHWM:" && $2 ~ /^[0-9]+$/ && $3 == "kB" && NF == 3 { print $2; found++ } END { if (found != 1) exit 1 }' "$proc_root/$pid/status") || return 1
+	printf '%s %s %s %s\n' "${fields[19]}" "${fields[11]}" "${fields[12]}" "$hwm"
+}
+
 inject_benchmark_fault() {
 	if ! jobs -pr | grep -qx "$failed_pid"; then
 		printf 'fault target is not a current owned running child; refusing injection\n' >&2
@@ -217,6 +228,15 @@ object_stats() {
 	done | jq -sc 'reduce .[] as $item ({}; reduce ($item.stats | to_entries[]) as $entry (. ; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
 }
 object_before=$(object_stats)
+if [[ $failed_node == none ]]; then
+	clock_ticks=$(getconf CLK_TCK)
+	[[ $clock_ticks =~ ^[1-9][0-9]*$ ]] || { printf 'server CPU clock ticks unavailable\n' >&2; exit 1; }
+	for i in 0 1 2; do
+		pid=$(<"$run_dir/node-$i.pid")
+		jobs -pr | grep -qx "$pid" || { printf 'server n%s is not a running child\n' "$i" >&2; exit 1; }
+		server_resource_snapshot "$pid" > "$run_dir/node-$i-resource-before" || { printf 'server n%s resource snapshot unavailable\n' "$i" >&2; exit 1; }
+	done
+fi
 result_file="$run_dir/result.json"
 control_args=()
 if [[ $failed_node != none ]]; then
@@ -268,10 +288,22 @@ if [[ $failed_node != none ]]; then
 fi
 wait_benchmark_child
 result=$(<"$result_file")
-# Preserve the client result even when the subsequent correctness gate fails.
+# Preserve the client result even when a subsequent measurement or gate fails.
 tee "$output_file" <<<"$result" >/dev/null
 result_with_exit=$(jq --argjson status "$fault_exit_status" '. + {fault_exit_status:$status}' <<<"$result")
 tee "$output_file" <<<"$result_with_exit" >/dev/null
+if [[ $failed_node == none ]]; then
+	server_resources='{}'
+	for i in 0 1 2; do
+		pid=$(<"$run_dir/node-$i.pid")
+		jobs -pr | grep -qx "$pid" || { printf 'server n%s is not a running child\n' "$i" >&2; exit 1; }
+		read -r start_before user_before system_before _ < "$run_dir/node-$i-resource-before"
+		snapshot=$(server_resource_snapshot "$pid") || { printf 'server n%s resource snapshot unavailable\n' "$i" >&2; exit 1; }
+		read -r start_after user_after system_after hwm <<< "$snapshot"
+		[[ $start_before == "$start_after" && $user_after -ge $user_before && $system_after -ge $system_before ]] || { printf 'server n%s resource identity or CPU counters changed unexpectedly\n' "$i" >&2; exit 1; }
+		server_resources=$(jq -nc --argjson resources "$server_resources" --arg node "n$i" --argjson ticks "$((user_after - user_before + system_after - system_before))" --argjson hz "$clock_ticks" --argjson hwm "$hwm" '$resources + {($node): {cpu_seconds: ($ticks / $hz), vm_hwm_kib: $hwm}}')
+	done
+fi
 if [[ $failed_node != none ]]; then
 	overlap=$(jq -c '.fault_window' <<<"$result")
 	if ! jq -e '.attempted == true and .signal_succeeded == true and .overlap == true and .witnesses > 0' <<<"$overlap" >/dev/null; then
@@ -296,5 +328,6 @@ for log in "$run_dir"/node-*.log; do
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
 	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+	| if [[ $failed_node == none ]]; then jq --argjson resources "$server_resources" '. + {server_resources: {scope: "per server process; CPU delta between sequential snapshots bracketing the client workload; VmHWM lifetime high-water RSS", nodes: $resources}}'; else cat; fi \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null
