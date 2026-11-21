@@ -146,7 +146,14 @@ func main() {
 					method = http.MethodPost
 				}
 				begin := time.Now()
+				eligible := false
+				if progress != nil && progress.profile {
+					eligible = progress.profileStart()
+				}
 				status, sample, retryCount, requestErr := doRequest(ctx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert, progress, id)
+				if eligible && requestErr == nil && status >= 200 && status < 300 {
+					progress.profileSuccess()
+				}
 				retries.Add(uint64(retryCount))
 				elapsed := time.Since(begin)
 				if status < 200 || status >= 300 {
@@ -259,23 +266,14 @@ func main() {
 func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool, progress *faultProgress, id int) (int, []byte, int, error) {
 	if progress != nil && !progress.profile {
 		var finish func(time.Time)
-		ctx, finish, _ = progress.traceRequest(ctx, id)
+		ctx, finish = progress.traceRequest(ctx, id)
 		defer func() { finish(time.Now()) }()
 	}
 	for retries := 0; ; retries++ {
-		attemptCtx := ctx
-		var finish func(time.Time)
-		var interval *requestInterval
-		if progress != nil && progress.profile {
-			attemptCtx, finish, interval = progress.traceRequest(ctx, id)
-		}
-		request, err := http.NewRequestWithContext(attemptCtx, method, url, bytes.NewBufferString(payload))
+		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))
 		if err != nil {
 			if progress != nil && progress.profile {
 				progress.completionClockFailed.Store(true)
-			}
-			if finish != nil {
-				finish(time.Now())
 			}
 			return 0, nil, retries, err
 		}
@@ -286,9 +284,6 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 		if err != nil {
 			if progress != nil && progress.profile {
 				progress.completionClockFailed.Store(true)
-			}
-			if finish != nil {
-				finish(time.Now())
 			}
 			return 0, nil, retries, err
 		}
@@ -306,11 +301,6 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 			}
 			body, err = io.ReadAll(io.LimitReader(response.Body, limit))
 		}
-		var completed time.Time
-		if interval != nil {
-			completed = time.Now()
-			interval.finished.Store(&completed)
-		}
 		if progress != nil && progress.profile {
 			if err != nil || len(body) > 4096 {
 				progress.completionClockFailed.Store(true)
@@ -324,13 +314,11 @@ func doRequest(ctx context.Context, client *http.Client, method, url, payload st
 			}
 		}
 		response.Body.Close()
-		if finish != nil {
-			finish(completed)
-		}
 		if err == nil && verifyInsert && response.StatusCode >= 200 && response.StatusCode < 300 {
 			err = validateInsertReceipt(payload, body)
 		}
-		if err != nil || !isCommitUnknown(response.StatusCode, body) || retries == maxRetries {
+		retry := err == nil && isCommitUnknown(response.StatusCode, body) && retries != maxRetries
+		if !retry {
 			return response.StatusCode, body, retries, err
 		}
 	}
@@ -381,7 +369,7 @@ type faultProgress struct {
 	reason                   string
 	profile                  bool
 	profileBegin, profileEnd time.Time
-	profileSnapshot          []*requestInterval
+	profileSuccesses         uint64
 	lastCompletion           atomic.Int64
 	completionClockFailed    atomic.Bool
 	completionClock          func() (int64, error)
@@ -405,43 +393,48 @@ func (p *faultProgress) recordCompletion() {
 }
 
 type profileWindow struct {
-	Overlap           bool   `json:"overlap"`
-	Witnesses         int    `json:"witnesses"`
-	SnapshotRequests  int    `json:"snapshot_requests"`
-	BeginNS           int64  `json:"begin_ns"`
-	EndNS             int64  `json:"end_ns"`
-	WitnessSentNS     int64  `json:"witness_sent_ns"`
-	WitnessFinishedNS int64  `json:"witness_finished_ns"`
-	Reason            string `json:"reason"`
+	Overlap    bool   `json:"overlap"`
+	Incomplete bool   `json:"incomplete"`
+	Successes  uint64 `json:"successes"`
+	BeginNS    int64  `json:"begin_ns"`
+	EndNS      int64  `json:"end_ns"`
+	Reason     string `json:"reason"`
 }
 
 func (p *faultProgress) profileResult() profileWindow {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	r := profileWindow{SnapshotRequests: len(p.profileSnapshot), Reason: "bracket_incomplete"}
+	r := profileWindow{Successes: p.profileSuccesses, Incomplete: true, Reason: "bracket_incomplete"}
 	if p.profileBegin.IsZero() || p.profileEnd.IsZero() {
 		return r
 	}
 	r.BeginNS, r.EndNS = p.profileBegin.Sub(p.epoch).Nanoseconds(), p.profileEnd.Sub(p.epoch).Nanoseconds()
-	for _, interval := range p.profileSnapshot {
-		sent, finished := interval.sent.Load(), interval.finished.Load()
-		if !interval.repeated.Load() && sent != nil && finished != nil && coversFault(*sent, *finished, p.profileBegin, p.profileEnd) {
-			r.Witnesses++
-			r.WitnessSentNS, r.WitnessFinishedNS = sent.Sub(p.epoch).Nanoseconds(), finished.Sub(p.epoch).Nanoseconds()
-		}
-	}
-	r.Overlap = r.Witnesses > 0
-	r.Reason = "no_completed_interval_spans_bracket"
+	r.Incomplete = false
+	r.Overlap = r.Successes > 0
+	r.Reason = "no_successful_request_inside_bracket"
 	if r.Overlap {
 		r.Reason = "qualified"
 	}
 	return r
 }
 
+func (p *faultProgress) profileStart() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.profileBegin.IsZero() && p.profileEnd.IsZero()
+}
+
+func (p *faultProgress) profileSuccess() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.profileEnd.IsZero() {
+		p.profileSuccesses++
+	}
+}
+
 type requestInterval struct {
 	sent     atomic.Pointer[time.Time]
 	finished atomic.Pointer[time.Time]
-	repeated atomic.Bool
 }
 
 type faultWindow struct {
@@ -457,24 +450,18 @@ type faultWindow struct {
 	Reason            string `json:"reason"`
 }
 
-func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time), *requestInterval) {
+func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time)) {
 	interval := &requestInterval{}
 	p.mu.Lock()
 	p.active[id] = interval
 	p.mu.Unlock()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
 		if interval.finished.Load() == nil {
-			if p.profile && interval.sent.Load() != nil {
-				interval.repeated.Store(true)
-				return
-			}
 			if info.Err != nil {
 				return
 			}
 			now := time.Now()
-			if !interval.sent.CompareAndSwap(nil, &now) && p.profile {
-				interval.repeated.Store(true)
-			}
+			interval.sent.CompareAndSwap(nil, &now)
 		}
 	}})
 	return ctx, func(at time.Time) {
@@ -482,7 +469,7 @@ func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Conte
 		p.mu.Lock()
 		delete(p.active, id)
 		p.mu.Unlock()
-	}, interval
+	}
 }
 
 func (p *faultProgress) inject() error {
@@ -576,10 +563,11 @@ func (p *faultProgress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			p.profileBegin = time.Now()
-			for _, interval := range p.active {
-				if interval.sent.Load() != nil && interval.finished.Load() == nil {
-					p.profileSnapshot = append(p.profileSnapshot, interval)
-				}
+		case "/profile/status":
+			if p.profileBegin.IsZero() || !p.profileEnd.IsZero() {
+				p.mu.Unlock()
+				http.Error(w, "bracket not open", http.StatusConflict)
+				return
 			}
 		case "/profile/end":
 			if p.profileBegin.IsZero() || !p.profileEnd.IsZero() {
@@ -593,8 +581,12 @@ func (p *faultProgress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		successes := p.profileSuccesses
 		p.mu.Unlock()
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Successes uint64 `json:"successes"`
+		}{successes})
 		return
 	}
 	if path != "/fault" {

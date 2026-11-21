@@ -172,6 +172,13 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ -n $profile_control && $MOCK_MODE != diag-fast ]]; then
  printf 'http://127.0.0.1:1234/0123456789abcdef0123456789abcdef' > "$profile_control"
+ if [[ $MOCK_MODE == diag-status-client-exit || $MOCK_MODE == diag-status-client-success ]]; then
+  while [[ ! -f $MOCK_HOME/status-trigger ]]; do sleep 0.01; done
+  printf '{"profile_window":{"incomplete":true,'
+  sleep 0.1
+  printf '"reason":"client_stopped"},"marker":"complete"}\n'
+  if [[ $MOCK_MODE == diag-status-client-exit ]]; then exit 23; else exit 0; fi
+ fi
  while [[ ! -f $MOCK_HOME/profile-end ]]; do sleep 0.01; done
  sleep 1
 fi
@@ -192,12 +199,12 @@ fi
 profile_window=null
 completion_ns=0
 if [[ -n $profile_control ]]; then
- if [[ $MOCK_MODE == diag-no-witness ]]; then profile_window='{"overlap":false,"witnesses":0}'; else profile_window='{"overlap":true,"witnesses":1}'; fi
+ if [[ $MOCK_MODE == diag-no-witness || $MOCK_MODE == diag-no-witness-missing || $MOCK_MODE == diag-client-result-fail ]]; then profile_window='{"overlap":false,"incomplete":false,"successes":0,"reason":"no_successful_request_inside_bracket","begin_ns":123,"end_ns":456}'; elif [[ $MOCK_MODE == diag-incomplete ]]; then profile_window='{"overlap":true,"incomplete":true,"successes":1}'; else profile_window='{"overlap":true,"incomplete":false,"successes":1}'; fi
  if command -v gdate >/dev/null 2>&1; then now_ms=$(gdate +%s%3N); else now_ms=$(date +%s%3N); fi
  completion_ns=$((now_ms * 1000000))
  case $MOCK_MODE in
   diag-late-serialization) sleep 1.2 ;;
-  diag-missing-time) completion_ns= ;;
+  diag-missing-time|diag-no-witness-missing) completion_ns= ;;
   diag-invalid-time) completion_ns=-1 ;;
   diag-future-time) completion_ns=$((completion_ns + 10000000000)) ;;
  esac
@@ -205,6 +212,7 @@ fi
 completion_field=
 [[ -z $completion_ns ]] || completion_field=",\"last_request_completion_boottime_ns\":$completion_ns"
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s,"profile_window":%s%s}\n' "$window" "$profile_window" "$completion_field"
+if [[ $MOCK_MODE == diag-client-result-fail ]]; then exit 19; fi
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -214,6 +222,7 @@ case $url in
 */debug/pprof/profile\?*)
  port=${url#http://127.0.0.1:}; port=${port%%/*}
  touch "$MOCK_HOME/profile-$port-active"
+ printf '%s\n' "$$" > "$MOCK_HOME/profile-$port-pid"
  output=
  while [[ $# -gt 0 ]]; do if [[ $1 == -o ]]; then output=$2; shift; fi; shift; done
  sleep 2 & sleeper=$!
@@ -228,8 +237,9 @@ case $url in
  phase=before
  [[ ! -f $MOCK_HOME/ready-before-complete ]] || phase=during
  printf '%s %s\n' "$phase" "$port" >> "$MOCK_HOME/ready-calls"
+ printf 'ready %s\n' "$port" >> "$MOCK_HOME/profile-events"
  [[ -f $MOCK_HOME/profile-$port-active ]] || exit 22
- if [[ $MOCK_MODE == diag-ready-start || ( $MOCK_MODE == diag-ready-during && $phase == during ) ]]; then exit 22; fi
+ if [[ $MOCK_MODE == diag-ready-start || ( $MOCK_MODE == diag-ready-during && $phase == during ) || ( $MOCK_MODE == diag-ready-between && -f $MOCK_HOME/profile-begin ) ]]; then exit 22; fi
  if [[ $phase == before && $port == 20102 ]]; then touch "$MOCK_HOME/ready-before-complete"; fi ;;
 */metrics/object-store)
  if [[ $MOCK_MODE == diag-slow-snapshot && -f $MOCK_HOME/bench.pid && ! -f $MOCK_HOME/snapshot-delayed ]]; then touch "$MOCK_HOME/snapshot-delayed"; sleep 1.2; fi
@@ -248,7 +258,7 @@ case $url in
   diag-failure) exit 22 ;;
   diag-timeout) printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":2}\n' ;;
   diag-late-status) sleep 1.2; printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":4}\n' ;;
-  diag-success|diag-default|diag-cleanup-success|diag-log-copy-fail)
+  diag-success|diag-default|diag-status-poll|diag-cleanup-success|diag-log-copy-fail)
    if [[ -f $MOCK_HOME/polled ]]; then archive=4; else archive=2; touch "$MOCK_HOME/polled"; fi
    printf '{"node_id":"n1","quorum":true,"certified_tip":4,"archive_tip":%s}\n' "$archive" ;;
  esac ;;
@@ -258,10 +268,25 @@ case $url in
  touch "$MOCK_HOME/release"
  printf '{"attempted":true,"signal_succeeded":true}\n' ;;
 */profile/begin)
- [[ $MOCK_MODE != diag-control-fail ]] || exit 22
+ printf 'begin\n' >> "$MOCK_HOME/profile-events"
+ if [[ $MOCK_MODE == diag-control-fail ]]; then printf '%s\n' "$url" >&2; exit 22; fi
  touch "$MOCK_HOME/profile-begin" ;;
-*/profile/end)
+*/profile/status)
+ printf 'status\n' >> "$MOCK_HOME/profile-events"
  [[ -f $MOCK_HOME/profile-begin ]] || exit 22
+ case $MOCK_MODE in
+  diag-status-fail) printf '%s\n' "$url" >&2; exit 22 ;;
+  diag-status-invalid) printf '{"successes":"1"}\n' ;;
+  diag-status-zero) printf '{"successes":0}\n' ;;
+  diag-status-client-exit|diag-status-client-success) touch "$MOCK_HOME/status-trigger"; sleep 0.4; printf '{"successes":0}\n' ;;
+  diag-status-poll) if [[ ! -f $MOCK_HOME/status-seen ]]; then touch "$MOCK_HOME/status-seen"; printf '{"successes":0}\n'; else printf '{"successes":1}\n'; fi ;;
+  *) printf '{"successes":1}\n' ;;
+ esac ;;
+*/profile/end)
+ printf 'end\n' >> "$MOCK_HOME/profile-events"
+ [[ -f $MOCK_HOME/profile-begin ]] || exit 22
+ if [[ $MOCK_MODE == diag-control-end-fail ]]; then printf '%s\n' "$url" >&2; exit 22; fi
+ if [[ $MOCK_MODE == diag-profile-end-exit ]]; then kill -TERM "$(<"$MOCK_HOME/profile-20100-pid")"; sleep 0.1; fi
  touch "$MOCK_HOME/profile-end" ;;
 */sql/query)
  touch "$MOCK_HOME/query-done"
@@ -305,7 +330,7 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missing-after changed normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error diag-success diag-default diag-cleanup-success diag-log-copy-fail diag-log-copy-preserve diag-timeout diag-slow-snapshot diag-late-status diag-late-serialization diag-missing-time diag-invalid-time diag-future-time diag-missing diag-failure diag-metrics-fail diag-client-fail diag-cleanup-preserve diag-profile-fail diag-profile-invalid diag-empty diag-missing-metric diag-schema-change diag-shifted diag-ready-start diag-ready-during diag-fast diag-control-fail diag-no-witness; do
+for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missing-after changed normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error diag-success diag-default diag-status-poll diag-cleanup-success diag-log-copy-fail diag-log-copy-preserve diag-timeout diag-slow-snapshot diag-late-status diag-late-serialization diag-missing-time diag-invalid-time diag-future-time diag-missing diag-failure diag-metrics-fail diag-client-fail diag-client-result-fail diag-cleanup-preserve diag-profile-fail diag-profile-invalid diag-empty diag-missing-metric diag-schema-change diag-shifted diag-ready-start diag-ready-during diag-ready-between diag-profile-end-exit diag-fast diag-control-fail diag-control-end-fail diag-status-fail diag-status-invalid diag-status-zero diag-status-client-exit diag-status-client-success diag-incomplete diag-no-witness diag-no-witness-missing; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
@@ -314,7 +339,7 @@ for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missi
  diagnostic=0
  [[ $mode != diag-* ]] || diagnostic=1
  drain_timeout=1
- [[ $mode != diag-success && $mode != diag-default && $mode != diag-cleanup-success && $mode != diag-log-copy-fail ]] || drain_timeout=3
+ [[ $mode != diag-success && $mode != diag-default && $mode != diag-status-poll && $mode != diag-cleanup-success && $mode != diag-log-copy-fail ]] || drain_timeout=3
  sync_interval=50ms
  [[ $mode != diag-default ]] || sync_interval=
  status=0
@@ -322,12 +347,14 @@ for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missi
  RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
  RHIZA_SERVER_BENCH_PUBLICATION_DIAGNOSTIC="$diagnostic" RHIZA_SERVER_BENCH_SYNC_INTERVAL="$sync_interval" RHIZA_SERVER_BENCH_DRAIN_TIMEOUT_SECONDS="$drain_timeout" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == diag-success || $mode == diag-default ]]; then
+ if [[ $mode == diag-success || $mode == diag-default || $mode == diag-status-poll ]]; then
   [[ $status == 0 ]]
   [[ $mode != diag-default ]] || sync_interval=1s
   jq -e --arg interval "$sync_interval" '.publication_diagnostic | .outcome == "complete" and .fixed_certified_tip == 4 and .last_status.archive_tip == 4 and .sync_interval == $interval and (.workload_end | keys == ["n0","n1","n2"]) and (.drain_end | keys == ["n0","n1","n2"]) and (.observation | contains("ReadIndex"))' "$scratch/$mode/result.json" >/dev/null
   jq -e '.object_measurement | contains("publication drain and final linearizable verification")' "$scratch/$mode/result.json" >/dev/null
-  jq -e '.object_store_delta.uploads == 21 and .result.profile_window.overlap == true and (.publication_diagnostic.cpu_profile_readiness | contains("completed request"))' "$scratch/$mode/result.json" >/dev/null
+  jq -e '.object_store_delta.uploads == 21 and .result.profile_window.overlap == true and (.publication_diagnostic.cpu_profile_readiness | contains("before begin and before end"))' "$scratch/$mode/result.json" >/dev/null
+  [[ $(tail -9 "$scratch/$mode/profile-events") == $'ready 20100\nready 20101\nready 20102\nbegin\nstatus\nready 20100\nready 20101\nready 20102\nend' || $mode == diag-status-poll ]]
+  if [[ $mode == diag-status-poll ]]; then [[ $(tail -10 "$scratch/$mode/profile-events") == $'ready 20100\nready 20101\nready 20102\nbegin\nstatus\nstatus\nready 20100\nready 20101\nready 20102\nend' ]]; fi
   [[ -f $scratch/$mode/profile-begin && -f $scratch/$mode/profile-end ]]
   for port in 20100 20101 20102; do grep -qx "before $port" "$scratch/$mode/ready-calls"; grep -qx "during $port" "$scratch/$mode/ready-calls"; done
   [[ -f $scratch/$mode/status-before-profile-finished ]]
@@ -347,14 +374,28 @@ for mode in healthy healthy-cleanup-fail launch-fail launch-bad-id missing missi
    retained=$(sed -n 's/^cleanup: retained run directory //p' "$scratch/$mode/stderr")
    [[ -f $retained/node-0.log ]]
   fi
+ elif [[ $mode == diag-status-client-exit || $mode == diag-status-client-success ]]; then
+  if [[ $mode == diag-status-client-exit ]]; then [[ $status == 23 ]]; expected_client_status=23; expected_reason=workload_failed; else [[ $status == 1 ]]; expected_client_status=0; expected_reason=cpu_profile_overlap_unconfirmed; fi
+  jq -e --argjson status "$expected_client_status" --arg reason "$expected_reason" '.result.marker == "complete" and .result.profile_window.reason == "client_stopped" and .publication_diagnostic.client_exit_status == $status and .publication_diagnostic.reason == $reason' "$scratch/$mode/result.json" >/dev/null
+  [[ $(grep -c '^end$' "$scratch/$mode/profile-events" || true) == 0 ]]
  elif [[ $mode == diag-* ]]; then
   [[ $status != 0 ]]
-  case $mode in diag-timeout|diag-slow-snapshot|diag-late-status|diag-late-serialization) outcome=timeout; reason=archive_tip_timeout ;; diag-missing-time|diag-invalid-time|diag-future-time) outcome=incomplete; reason=workload_completion_time_unavailable ;; diag-metrics-fail|diag-schema-change) outcome=incomplete; reason=workload_metrics_unavailable ;; diag-client-fail|diag-cleanup-preserve|diag-log-copy-preserve) outcome=incomplete; reason=workload_failed ;; diag-profile-fail|diag-profile-invalid) outcome=incomplete; reason=cpu_profile_unavailable ;; diag-empty|diag-missing-metric) outcome=incomplete; reason=baseline_metrics_unavailable ;; diag-shifted) outcome=incomplete; reason=workload_verification_failed ;; diag-ready-start) outcome=incomplete; reason=cpu_profile_start_unconfirmed ;; diag-ready-during|diag-fast|diag-control-fail|diag-no-witness) outcome=incomplete; reason=cpu_profile_overlap_unconfirmed ;; *) outcome=incomplete; reason=status_unavailable ;; esac
+  case $mode in diag-timeout|diag-slow-snapshot|diag-late-status|diag-late-serialization) outcome=timeout; reason=archive_tip_timeout ;; diag-missing-time|diag-no-witness-missing|diag-invalid-time|diag-future-time) outcome=incomplete; reason=workload_completion_time_unavailable ;; diag-metrics-fail|diag-schema-change) outcome=incomplete; reason=workload_metrics_unavailable ;; diag-client-fail|diag-client-result-fail|diag-cleanup-preserve|diag-log-copy-preserve) outcome=incomplete; reason=workload_failed ;; diag-profile-fail|diag-profile-invalid) outcome=incomplete; reason=cpu_profile_unavailable ;; diag-empty|diag-missing-metric) outcome=incomplete; reason=baseline_metrics_unavailable ;; diag-shifted) outcome=incomplete; reason=workload_verification_failed ;; diag-ready-start) outcome=incomplete; reason=cpu_profile_start_unconfirmed ;; diag-ready-during|diag-ready-between|diag-profile-end-exit|diag-fast|diag-control-fail|diag-control-end-fail|diag-status-fail|diag-status-invalid|diag-status-zero|diag-incomplete|diag-no-witness) outcome=incomplete; reason=cpu_profile_overlap_unconfirmed ;; *) outcome=incomplete; reason=status_unavailable ;; esac
   jq -e --arg outcome "$outcome" --arg reason "$reason" '.publication_diagnostic.outcome == $outcome and .publication_diagnostic.reason == $reason' "$scratch/$mode/result.json" >/dev/null
   if [[ $mode == diag-slow-snapshot ]]; then [[ ! -f $scratch/$mode/status-before-profile-finished ]]; fi
   if [[ $mode == diag-late-status ]]; then jq -e '.publication_diagnostic.last_status.archive_tip == 4' "$scratch/$mode/result.json" >/dev/null; fi
   if [[ $mode == diag-late-serialization ]]; then [[ ! -e $scratch/$mode/status-called ]]; fi
-  if [[ $mode == diag-client-fail || $mode == diag-cleanup-preserve || $mode == diag-log-copy-preserve ]]; then [[ $status == 19 ]]; elif [[ $mode != diag-empty && $mode != diag-missing-metric && $mode != diag-ready-start && $mode != diag-ready-during && $mode != diag-fast && $mode != diag-control-fail && $mode != diag-no-witness && $mode != diag-missing-time && $mode != diag-invalid-time && $mode != diag-future-time ]]; then jq -e '.successes == 4' "$scratch/$mode/result.json" >/dev/null; fi
+  if [[ $mode == diag-no-witness || $mode == diag-no-witness-missing || $mode == diag-client-result-fail ]]; then jq -e '.result.successes == 4 and .result.profile_window == {"overlap":false,"incomplete":false,"successes":0,"reason":"no_successful_request_inside_bracket","begin_ns":123,"end_ns":456}' "$scratch/$mode/result.json" >/dev/null; fi
+  if [[ $mode == diag-control-fail || $mode == diag-control-end-fail || $mode == diag-status-fail ]]; then ! grep -q '0123456789abcdef0123456789abcdef' "$scratch/$mode/stderr"; fi
+  if [[ $mode == diag-status-invalid || $mode == diag-status-fail || $mode == diag-status-zero ]]; then [[ $(grep -c '^end$' "$scratch/$mode/profile-events" || true) == 0 ]]; fi
+  if [[ $mode == diag-control-fail || $mode == diag-control-end-fail ]]; then [[ $(grep -c '^begin$' "$scratch/$mode/profile-events") == 1 ]]; [[ $(grep -c '^end$' "$scratch/$mode/profile-events" || true) -le 1 ]]; fi
+  if [[ $mode == diag-ready-between ]]; then
+   [[ $(grep -c '^begin$' "$scratch/$mode/profile-events") == 1 ]]
+   [[ $(grep -c '^end$' "$scratch/$mode/profile-events" || true) == 0 ]]
+   [[ $(tail -1 "$scratch/$mode/profile-events") == 'ready 20100' ]]
+  fi
+  if [[ $mode == diag-incomplete ]]; then jq -e '.result.profile_window.incomplete == true' "$scratch/$mode/result.json" >/dev/null; fi
+  if [[ $mode == diag-client-fail || $mode == diag-client-result-fail || $mode == diag-cleanup-preserve || $mode == diag-log-copy-preserve ]]; then [[ $status == 19 ]]; elif [[ $mode != diag-empty && $mode != diag-missing-metric && $mode != diag-ready-start && $mode != diag-ready-during && $mode != diag-ready-between && $mode != diag-profile-end-exit && $mode != diag-fast && $mode != diag-control-fail && $mode != diag-control-end-fail && $mode != diag-status-fail && $mode != diag-status-invalid && $mode != diag-status-zero && $mode != diag-incomplete && $mode != diag-no-witness && $mode != diag-no-witness-missing && $mode != diag-missing-time && $mode != diag-invalid-time && $mode != diag-future-time ]]; then jq -e '.successes == 4' "$scratch/$mode/result.json" >/dev/null; fi
   if [[ $mode == diag-log-copy-preserve ]]; then
    grep -q 'cleanup: could not preserve log' "$scratch/$mode/stderr"
    retained=$(sed -n 's/^cleanup: retained run directory //p' "$scratch/$mode/stderr")

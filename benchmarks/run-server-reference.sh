@@ -366,13 +366,17 @@ if [[ $publication_diagnostic == 1 ]]; then
 		curl -fsS --max-time "$((profile_seconds + 5))" -o "$run_dir/node-$i.cpu.pprof" "http://127.0.0.1:$((base_profile_port + i))/debug/pprof/profile?seconds=$profile_seconds" &
 		profile_pids+=("$!")
 	done
-	profiles_ready() {
-		local i pid
+	profiles_alive() {
+		local pid
 		for pid in "${profile_pids[@]}"; do jobs -pr | grep -qx "$pid" || return 1; done
+	}
+	profiles_ready() {
+		local i
+		profiles_alive || return 1
 		for i in 0 1 2; do
 			curl -fsS --max-time 1 "http://127.0.0.1:$((base_profile_port + i))/debug/pprof/ready" >/dev/null 2>&1 || return 1
 		done
-		for pid in "${profile_pids[@]}"; do jobs -pr | grep -qx "$pid" || return 1; done
+		profiles_alive
 	}
 	ready_deadline=$((SECONDS + 5))
 	until profiles_ready; do
@@ -404,13 +408,36 @@ if [[ $publication_diagnostic == 1 ]]; then
 		sleep 0.01
 	done
 	profile_control_url=$(<"$run_dir/profile-control.url") || profile_control_url=
+	profile_success_seen() {
+		local status deadline=$((SECONDS + 5))
+		while profiles_alive && jobs -pr | grep -qx "$bench_pid" && (( SECONDS < deadline )); do
+			status=$(curl -fsS --max-time 1 -X POST "$profile_control_url/profile/status" 2>/dev/null) || return 1
+			jq -e '.successes | type == "number" and . >= 0 and floor == .' <<<"$status" >/dev/null 2>&1 || return 1
+			if jq -e '.successes >= 1' <<<"$status" >/dev/null; then return 0; fi
+			sleep 0.05
+		done
+		return 1
+	}
 	if [[ ! $profile_control_url =~ ^http://127\.0\.0\.1:[0-9]+/[a-f0-9]{32}$ ]] ||
-		! curl -fsS --max-time 2 -X POST "$profile_control_url/profile/begin" >/dev/null ||
 		! profiles_ready ||
-		! curl -fsS --max-time 2 -X POST "$profile_control_url/profile/end" >/dev/null; then
-		jq -nc --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{publication_diagnostic:{outcome:"incomplete",reason:"cpu_profile_overlap_unconfirmed",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+		! curl -fsS --max-time 2 -X POST "$profile_control_url/profile/begin" >/dev/null 2>&1 ||
+		! profile_success_seen ||
+		! profiles_ready ||
+		! curl -fsS --max-time 2 -X POST "$profile_control_url/profile/end" >/dev/null 2>&1 ||
+		! profiles_alive; then
+		client_result=null
+		client_status=null
+		failure_status=1
+		reason=cpu_profile_overlap_unconfirmed
+		if ! jobs -pr | grep -qx "$bench_pid"; then
+			client_status=0
+			wait_benchmark_child || client_status=$?
+			client_result=$(jq -ce 'select(type == "object")' "$result_file" 2>/dev/null) || client_result=null
+			if [[ $client_status != 0 ]]; then failure_status=$client_status; reason=workload_failed; fi
+		fi
+		jq -nc --argjson result "$client_result" --argjson status "$client_status" --arg reason "$reason" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:$reason,profile_directory:$profile_dir,baseline:$baseline,client_exit_status:$status}}' > "$output_file"
 		printf 'CPU profile overlap with workload not confirmed\n' >&2
-		exit 1
+		exit "$failure_status"
 	fi
 fi
 overlap='null'
@@ -450,7 +477,8 @@ benchmark_status=0
 wait_benchmark_child || benchmark_status=$?
 if [[ $benchmark_status != 0 ]]; then
 	if [[ $publication_diagnostic == 1 ]]; then
-		jq -nc --argjson baseline "$publication_before" --argjson status "$benchmark_status" --arg profile_dir "$profile_dir" '{publication_diagnostic:{outcome:"incomplete",reason:"workload_failed",profile_directory:$profile_dir,baseline:$baseline,client_exit_status:$status}}' > "$output_file"
+		client_result=$(jq -ce 'select(type == "object")' "$result_file" 2>/dev/null) || client_result=null
+		jq -nc --argjson result "$client_result" --argjson baseline "$publication_before" --argjson status "$benchmark_status" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"workload_failed",profile_directory:$profile_dir,baseline:$baseline,client_exit_status:$status}}' > "$output_file"
 	fi
 	exit "$benchmark_status"
 fi
@@ -460,15 +488,15 @@ if [[ $publication_diagnostic == 1 ]]; then
 	now_ticks=$(monotonic_ticks) || now_ticks=
 	if [[ ! $completion_ns =~ ^[1-9][0-9]*$ || ${#completion_ns} -gt 19 || ( ${#completion_ns} == 19 && $completion_ns > 9223372036854775807 ) || ! $now_ticks =~ ^[0-9]+$ ]] ||
 		(( completion_ns / 10000000 > now_ticks + 1 )); then
-		jq -nc --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{publication_diagnostic:{outcome:"incomplete",reason:"workload_completion_time_unavailable",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+		jq -nc --argjson result "$result" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"workload_completion_time_unavailable",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
 		printf 'last request completion clock unavailable or invalid\n' >&2
 		exit 1
 	fi
 	# One conservative tick also covers JSON number rounding at large uptimes.
 	workload_end_ticks=$((completion_ns / 10000000 - 1))
 fi
-if [[ $publication_diagnostic == 1 ]] && ! jq -e '.profile_window.overlap == true and .profile_window.witnesses > 0' <<<"$result" >/dev/null; then
-	jq -nc --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{publication_diagnostic:{outcome:"incomplete",reason:"cpu_profile_overlap_unconfirmed",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
+if [[ $publication_diagnostic == 1 ]] && ! jq -e '.profile_window.overlap == true and .profile_window.incomplete == false and (.profile_window.successes | type == "number" and . >= 1 and floor == .)' <<<"$result" >/dev/null; then
+	jq -nc --argjson result "$result" --argjson baseline "$publication_before" --arg profile_dir "$profile_dir" '{result:$result,publication_diagnostic:{outcome:"incomplete",reason:"cpu_profile_overlap_unconfirmed",profile_directory:$profile_dir,baseline:$baseline}}' > "$output_file"
 	printf 'CPU profile overlap with a completed workload request not confirmed\n' >&2
 	exit 1
 fi
@@ -501,7 +529,7 @@ if [[ $publication_diagnostic == 1 ]]; then
 	publication_reason=workload_metrics_unavailable
 	publication_write() {
 		jq --argjson before "$publication_before" --argjson end "$publication_end" --argjson drain "$publication_drain" --argjson status "$publication_status" --argjson target "$publication_target" --arg outcome "$publication_outcome" --arg reason "$publication_reason" --arg interval "$sync_interval" --argjson timeout "$drain_timeout" --arg profile_dir "$profile_dir" \
-			'. + {publication_diagnostic:{outcome:(if $outcome == "complete" then "incomplete" else $outcome end),reason:(if $outcome == "complete" then "cleanup_unconfirmed" else $reason end),sync_interval:$interval,drain_timeout_seconds:$timeout,profile_directory:$profile_dir,cpu_profile_readiness:"a completed request spans the three sequential ready checks",observation:"per-node snapshots are sequential; /recovery/status performs ReadIndex and adds quorum overhead; CPU profiles may extend past the workload",baseline:$before,workload_end:$end,drain_end:$drain,fixed_certified_tip:$target,last_status:$status}}' <<<"$result_with_exit" > "$output_file"
+			'. + {publication_diagnostic:{outcome:(if $outcome == "complete" then "incomplete" else $outcome end),reason:(if $outcome == "complete" then "cleanup_unconfirmed" else $reason end),sync_interval:$interval,drain_timeout_seconds:$timeout,profile_directory:$profile_dir,cpu_profile_readiness:"three sequential ready checks before begin and before end, with the same profile requests alive",observation:"per-node snapshots are sequential; /recovery/status performs ReadIndex and adds quorum overhead; CPU profiles may extend past the workload",baseline:$before,workload_end:$end,drain_end:$drain,fixed_certified_tip:$target,last_status:$status}}' <<<"$result_with_exit" > "$output_file"
 	}
 	publication_write
 	if [[ $metrics_failed == 0 ]]; then
