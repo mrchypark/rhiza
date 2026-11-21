@@ -6,6 +6,6 @@ resources:
 images:
   - name: rhiza-operator
     newName: ghcr.io/mrchypark/rhiza-operator
-    newTag: v0.27.2
+    newTag: v0.27.3
 patches:
   - path: operator-profile.yaml
