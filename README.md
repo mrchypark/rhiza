@@ -98,6 +98,8 @@ SQL, Graph, KV, notification, stream, and request-status methods are available
 directly on `DB`. Use `db.Handler()` or `db` itself as an `http.Handler` when
 the HTTP adapter is needed. See [embedded lifecycle](docs/embedded-lifecycle.md)
 for host-managed cancellation, shutdown, and close-error handling.
+For opt-in failover across HTTP adapters exposed by embedded instances, see the
+[HTTP service client](client/README.md). Direct embedded calls do not use it.
 
 ## Embedded Rust SDK
 

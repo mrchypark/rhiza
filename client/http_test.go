@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -308,7 +309,7 @@ func TestMutationHonorsEarlierCallerDeadline(t *testing.T) {
 }
 
 func TestReadAllUnavailableReturnsErrorAndClosesEachBody(t *testing.T) {
-	for _, status := range []int{502, 503, 504} {
+	for _, status := range []int{408, 500, 502, 503, 504} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var calls, closed atomic.Int32
 			transport := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -322,6 +323,54 @@ func TestReadAllUnavailableReturnsErrorAndClosesEachBody(t *testing.T) {
 			resp, err := c.Read(context.Background(), "/kv/get", []byte(`{}`))
 			if !errors.Is(err, ErrReadUnavailable) || resp.StatusCode != status || calls.Load() != 2 || closed.Load() != 2 {
 				t.Fatalf("response=%+v err=%v calls=%d closed=%d", resp, err, calls.Load(), closed.Load())
+			}
+		})
+	}
+}
+
+func TestReadHTTPStatusFailoverAndRejection(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var first, second atomic.Int32
+			transport := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				code := http.StatusOK
+				if r.URL.Host == "first.invalid" {
+					first.Add(1)
+					code = status
+				} else {
+					second.Add(1)
+				}
+				return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}
+			c, err := New([]string{"http://first.invalid", "http://second.invalid"}, transport, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				resp, err := c.Read(context.Background(), "/kv/get", nil)
+				if err != nil || resp.StatusCode != http.StatusOK {
+					t.Fatalf("response=%+v err=%v", resp, err)
+				}
+			}
+			if first.Load() != 1 || second.Load() != 2 {
+				t.Fatalf("first=%d second=%d", first.Load(), second.Load())
+			}
+		})
+	}
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			transport := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`reason`))}, nil
+			})}
+			c, err := New([]string{"http://first.invalid", "http://second.invalid"}, transport, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := c.Read(context.Background(), "/kv/get", nil)
+			if !errors.Is(err, ErrReadRejected) || resp.StatusCode != status || string(resp.Body) != "reason" || calls.Load() != 1 {
+				t.Fatalf("response=%+v err=%v calls=%d", resp, err, calls.Load())
 			}
 		})
 	}

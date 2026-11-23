@@ -20,9 +20,12 @@ import (
 var ErrOutcomeUnknown = errors.New("mutation outcome unknown")
 
 // ErrReadUnavailable means every configured endpoint failed or returned a
-// retryable gateway/unavailable status. Response retains the final attempt's
+// retryable HTTP status. Response retains the final attempt's
 // HTTP status when that attempt received a response.
 var ErrReadUnavailable = errors.New("all read endpoints unavailable")
+
+// ErrReadRejected means the service returned a non-retryable HTTP response.
+var ErrReadRejected = errors.New("read rejected")
 
 const maxResponseBytes = 17 << 20
 
@@ -84,9 +87,14 @@ func (c *Client) Read(ctx context.Context, path string, body []byte) (Response, 
 		attempt, cancel := context.WithTimeout(ctx, c.timeout)
 		response, last = c.call(attempt, c.endpoints[index], path, body)
 		cancel()
-		if last == nil && response.StatusCode != http.StatusBadGateway && response.StatusCode != http.StatusServiceUnavailable && response.StatusCode != http.StatusGatewayTimeout {
-			c.preferred.CompareAndSwap(state, nextPreference(state, uint32(index)))
-			return response, nil
+		if last == nil {
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				c.preferred.CompareAndSwap(state, nextPreference(state, uint32(index)))
+				return response, nil
+			}
+			if response.StatusCode != http.StatusRequestTimeout && response.StatusCode < 500 {
+				return response, fmt.Errorf("%w: HTTP %d", ErrReadRejected, response.StatusCode)
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
