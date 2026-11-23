@@ -116,22 +116,24 @@ jobs:
           set -euo pipefail
           go test -race ./cmd/rhiza-bench -count=1
           bash benchmarks/run-server-reference_test.sh
+          bash benchmarks/run-ingress-diagnostics_test.sh
       - name: Measure healthy, peer failure, ingress failure and ingress reroute
         shell: bash
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-ingress-fault
           TMPDIR: ${{ runner.temp }}/quepaxa-ingress-temp
         run: |
+          set +e
           set -uo pipefail
-          mkdir -p "$EVIDENCE_DIR" "$TMPDIR"
+          mkdir -p "$EVIDENCE_DIR" "$TMPDIR" || exit 1
           {
-            git rev-parse HEAD
-            go version
-            uname -a
-            docker version
+            git rev-parse HEAD || exit 1
+            go version || exit 1
+            uname -a || exit 1
+            docker version || exit 1
             printf 'requests=%s concurrency=%s\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
-          } > "$EVIDENCE_DIR/environment.txt" 2>&1
-          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-before.txt"
+          } > "$EVIDENCE_DIR/environment.txt" 2>&1 || exit 1
+          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-before.txt" || exit 1
           result=0
           for scenario in healthy peer-fault ingress-no-bypass ingress-reroute; do
             expect_ingress_failure=0
@@ -157,9 +159,9 @@ jobs:
               result=1
             fi
           done
-          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-after.txt"
+          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-after.txt" || result=1
           if ! diff -u "$EVIDENCE_DIR/containers-before.txt" "$EVIDENCE_DIR/containers-after.txt" > "$EVIDENCE_DIR/cleanup-containers.diff"; then result=1; fi
-          find "$TMPDIR" -mindepth 1 -maxdepth 1 -print > "$EVIDENCE_DIR/cleanup-temp.txt"
+          find "$TMPDIR" -mindepth 1 -maxdepth 1 -print > "$EVIDENCE_DIR/cleanup-temp.txt" || result=1
           if [ -s "$EVIDENCE_DIR/cleanup-temp.txt" ]; then result=1; fi
           exit "$result"
       - name: Preserve raw ingress evidence
