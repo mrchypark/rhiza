@@ -197,6 +197,31 @@ var s3TransportObservers = struct {
 	byEndpoint map[string]*S3TransportObserver
 }{byEndpoint: make(map[string]*S3TransportObserver)}
 
+var s3RequestTrace = struct {
+	sync.RWMutex
+	byEndpoint map[string]func(*http.Request, http.RoundTripper) (*http.Response, error)
+}{byEndpoint: make(map[string]func(*http.Request, http.RoundTripper) (*http.Response, error))}
+
+// RegisterS3RequestTrace installs an endpoint-scoped test transport hook.
+func RegisterS3RequestTrace(endpoint string, trace func(*http.Request, http.RoundTripper) (*http.Response, error)) (func(), error) {
+	s3RequestTrace.Lock()
+	defer s3RequestTrace.Unlock()
+	if endpoint == "" || trace == nil || s3RequestTrace.byEndpoint[endpoint] != nil {
+		return nil, errors.New("invalid or duplicate S3 request trace")
+	}
+	s3RequestTrace.byEndpoint[endpoint] = trace
+	return func() { s3RequestTrace.Lock(); delete(s3RequestTrace.byEndpoint, endpoint); s3RequestTrace.Unlock() }, nil
+}
+
+type testTraceRoundTripper struct {
+	next  http.RoundTripper
+	trace func(*http.Request, http.RoundTripper) (*http.Response, error)
+}
+
+func (t testTraceRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return t.trace(r, t.next)
+}
+
 // RegisterS3TransportObserver installs an endpoint-scoped observer for tagged
 // tests. Owners are assigned in transport-construction order; callers should
 // open Nodes sequentially. The callback-free collector is safe for concurrent
@@ -305,6 +330,12 @@ func (o *S3TransportObserver) ExtentAttributionSnapshot() []ExtentUploadAttribut
 }
 
 func wrapTestObserver(endpoint string, next http.RoundTripper) http.RoundTripper {
+	s3RequestTrace.RLock()
+	trace := s3RequestTrace.byEndpoint[endpoint]
+	s3RequestTrace.RUnlock()
+	if trace != nil {
+		next = testTraceRoundTripper{next: next, trace: trace}
+	}
 	s3TransportObservers.Lock()
 	observer := s3TransportObservers.byEndpoint[endpoint]
 	var owner string

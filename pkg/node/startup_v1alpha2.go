@@ -225,7 +225,7 @@ func (n *Node) installInternalApplicationBinding(ctx context.Context) error {
 	if !registered || hex.EncodeToString(nonce) != n.core.WALIdentity() {
 		return fmt.Errorf("internal application WAL manifest is not registered")
 	}
-	lifetime, cancel := context.WithCancel(context.Background())
+	lifetime, cancel := localtesthooks.WithLifecycleCancel(context.Background())
 	b := &internalApplicationBinding{identity: i, policy: n.materializationPolicy(), window: n.receiptWindow(), wal: n.core.WALIdentity(), walStore: n.wal, member: member, core: n.core, material: n.material, lifetime: lifetime, cancel: cancel}
 	if !n.internalApplication.CompareAndSwap(nil, b) {
 		cancel()
