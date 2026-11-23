@@ -1,0 +1,45 @@
+name: Service read failover paired diagnostics
+on:
+  push:
+    branches: [feature/service-failover-evidence]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CGO_ENABLED: 0
+      GOMAXPROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify paired orchestration
+        run: sh benchmarks/run-paired-service-reads_test.sh
+      - name: Test production client under race detector
+        env:
+          CGO_ENABLED: 1
+        run: go test -race ./client -count=1
+      - name: Build real service and client driver
+        run: |
+          go build -o "$RUNNER_TEMP/rhiza-service" ./cmd/rhiza
+          go test -c -o "$RUNNER_TEMP/service-read-driver" ./benchmarks
+          chmod +x benchmarks/run-service-read-sample.sh
+      - name: Run paired disposable service samples
+        run: |
+          sh benchmarks/run-paired-service-reads.sh \
+            "$GITHUB_WORKSPACE/benchmarks/run-service-read-sample.sh" \
+            "$RUNNER_TEMP/service-read-driver" "$RUNNER_TEMP/rhiza-service" \
+            "$RUNNER_TEMP/service-read-evidence"
+      - name: Preserve raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-read-paired-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/service-read-evidence
+          if-no-files-found: warn
+          retention-days: 30

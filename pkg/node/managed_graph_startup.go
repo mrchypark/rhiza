@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -39,6 +40,12 @@ func (n *Node) reconstructManagedGraphStartup(ctx context.Context, core *quepaxa
 }
 
 func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepaxa.Core, expected *materializer.ManagedGraphInstallCut, selected *quepaxa.SealedCheckpoint) (result *managedGraphStartupProjection, resultErr error) {
+	stage := "startup_binding"
+	defer func() {
+		if resultErr != nil {
+			log.Printf("MANAGED_GRAPH_RECONSTRUCTION_FAILURE stage=%s", stage)
+		}
+	}()
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:pair_reconstruct")
 	}
@@ -78,12 +85,14 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if err != nil {
 		return nil, err
 	}
+	stage = "capture_certified_cut"
 	coreCut, err := core.CaptureManagedReconstructionCut(seal, requestedTip, expectedPrefix)
 	if err != nil {
 		return nil, err
 	}
 	tip, prefix := coreCut.CertifiedTip(), coreCut.PrefixHash()
 	if expected != nil {
+		stage = "validate_seal_for_cut"
 		if err := n.validateManagedGraphSealForCut(ctx, core, seal); err != nil {
 			return nil, err
 		}
@@ -91,7 +100,8 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:source-cut-captured")
 	}
-	stage, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-graph-reconstruction-*")
+	stage = "create_staging_directory"
+	stageDir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-managed-graph-reconstruction-*")
 	if err != nil {
 		return nil, err
 	}
@@ -107,34 +117,43 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 			closeErr = mat.Close()
 			mat = nil
 		}
-		return errors.Join(closeErr, os.RemoveAll(stage))
+		return errors.Join(closeErr, os.RemoveAll(stageDir))
 	}
 	defer func() {
 		if resultErr != nil {
 			resultErr = errors.Join(resultErr, cleanup())
 		}
 	}()
-	mat, err = n.openMaterializer(filepath.Join(stage, "sqlite.db"), 1)
+	stage = "open_materializer"
+	mat, err = n.openMaterializer(filepath.Join(stageDir, "sqlite.db"), 1)
 	if err != nil {
 		return nil, err
 	}
 	base := quepaxa.Slot(0)
+	stage = "validate_checkpoint_bounds"
 	if n.checkpoints == nil || seal.Index > tip || seal.Index < coreCut.CompactionFloor() {
 		return nil, fmt.Errorf("managed Graph checkpoint lies outside certified source")
 	}
 	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 	})
+	stage = "load_checkpoint_certificate"
 	decision, found := core.CertifiedValue(seal.DecisionSlot)
 	if !found {
 		return nil, fmt.Errorf("managed Graph checkpoint certificate is unavailable")
 	}
+	stage = "validate_checkpoint"
 	if err := n.validateManagedGraphCheckpoint(ctx, core, seal, decision); err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(stage, "checkpoint")
+	dir := filepath.Join(stageDir, "checkpoint")
+	stage = "create_checkpoint_directory"
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
+	}
+	stage = "download_checkpoint"
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("node:managed-graph-startup:before-checkpoint-download")
 	}
 	rootFiles, err := n.checkpoints.DownloadRootFiles(ctx, uint64(seal.Index), seal.RootHash, dir)
 	if err != nil {
@@ -142,13 +161,16 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	}
 	// These staged files can become the permanent pair. Preserve their fixed
 	// certified cut in the WAL before materializing or installing that state.
+	stage = "ensure_durable_cut"
 	if err := core.EnsureDurableThrough(ctx, tip); err != nil {
 		return nil, err
 	}
+	stage = "restore_checkpoint"
 	if err := mat.RestoreCheckpoint(ctx, checkpointMaterializerFiles(rootFiles)); err != nil {
 		return nil, err
 	}
 	base = seal.Index
+	stage = "load_certified_suffix"
 	values, err := certifiedSuffixThrough(core, base+1, tip)
 	if err != nil {
 		return nil, err
@@ -158,12 +180,14 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 			return nil, fmt.Errorf("managed Graph certified suffix full hash differs at slot %d", value.Slot)
 		}
 	}
+	stage = "apply_certified_suffix"
 	if err := mat.ApplyBatch(ctx, values); err != nil {
 		return nil, err
 	}
 	if mat.Tip() != uint64(tip) {
 		return nil, fmt.Errorf("managed Graph reconstruction did not reach certified ACK target")
 	}
+	stage = "verify_projection"
 	if err := mat.ProjectionReadable(ctx); err != nil {
 		return nil, err
 	}
@@ -171,6 +195,7 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if err != nil {
 		return nil, err
 	}
+	stage = "capture_projection"
 	files, actual, releaseFiles, err := mat.CheckpointFilesAt(ctx)
 	if err != nil {
 		return nil, err
@@ -179,9 +204,11 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 	if actual != uint64(tip) {
 		return nil, fmt.Errorf("managed Graph reconstruction did not preserve its captured certified cut")
 	}
+	stage = "recheck_certified_cut"
 	if _, err := core.RecheckManagedReconstructionCut(ctx, coreCut); err != nil {
 		return nil, err
 	}
+	stage = "verify_projection_files"
 	for i := range files {
 		info, err := os.Lstat(files[i].Path)
 		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
@@ -202,6 +229,7 @@ func (n *Node) reconstructManagedGraphStartupAt(ctx context.Context, core *quepa
 		files[i].ExpectedLength = uint64(size)
 		files[i].ExpectedSHA256 = fmt.Sprintf("%x", hash.Sum(nil))
 	}
+	stage = "close_projection"
 	if err := mat.Close(); err != nil {
 		mat = nil
 		return nil, err
@@ -238,12 +266,20 @@ func managedGraphInstallBindingFor(core *quepaxa.Core, identity ManagedStartupId
 }
 
 func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Core, observed materializer.ManagedGraphTargetState, selected *quepaxa.SealedCheckpoint) (opened *materializer.Materializer, replayThrough quepaxa.Slot, resultErr error) {
+	stage := "resume_install"
+	defer func() {
+		if resultErr != nil {
+			log.Printf("MANAGED_GRAPH_INSTALL_FAILURE stage=%s", stage)
+		}
+	}()
 	if observed.InstallAttempt != nil {
 		return n.resumeManagedGraphStartupInstall(ctx, core, observed)
 	}
+	stage = "validate_previous_tip"
 	if observed.SQLiteTip > uint64(core.Tip()) {
 		return nil, 0, fmt.Errorf("previous managed Graph application tip exceeds authenticated Core")
 	}
+	stage = "reconstruct"
 	projection, err := n.reconstructManagedGraphStartup(ctx, core, selected)
 	if err != nil {
 		return nil, 0, err
@@ -255,23 +291,28 @@ func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Cor
 			opened = nil
 		}
 	}()
+	stage = "validate_startup_authority"
 	if err := n.managedStartup.Checker.ValidateManagedStartup(ctx, n.managedStartup.Identity); err != nil {
 		return nil, 0, err
 	}
+	stage = "validate_projection_before_reconcile"
 	if err := n.validateManagedGraphProjectionCut(ctx, core, projection); err != nil {
 		return nil, 0, err
 	}
+	stage = "reconcile_target"
 	if len(observed.Replay) != 0 {
 		if err := n.reconcileManagedGraphTarget(ctx, core, projection, observed); err != nil {
 			return nil, 0, err
 		}
 	}
+	stage = "validate_projection_after_reconcile"
 	if err := n.validateManagedGraphProjectionCut(ctx, core, projection); err != nil {
 		return nil, 0, err
 	}
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:pair_install")
 	}
+	stage = "install_verified_pair"
 	opened, err = materializer.OpenManagedGraphFromVerifiedPair(ctx, filepath.Join(n.config.DataDir, "sqlite.db"), 4, materializer.ManagedGraphInstall{ApplicationProtocol: n.managedGraphInstallProtocol(), Cut: projection.cut, Files: projection.files})
 	if err != nil {
 		return nil, 0, err
@@ -279,6 +320,7 @@ func (n *Node) installManagedGraphStartup(ctx context.Context, core *quepaxa.Cor
 	if localtesthooks.Enabled {
 		localtesthooks.Hit("node:managed-graph-startup:pair_opened-before-final-recheck")
 	}
+	stage = "recheck_installed_cut"
 	replayThrough, err = core.RecheckManagedReconstructionCut(ctx, projection.coreCut)
 	if err != nil {
 		return opened, 0, err

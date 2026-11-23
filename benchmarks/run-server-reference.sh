@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+record_service_child() {
+	[[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 ]] || return 0
+	local child=$1 role=$2 status=$3 state=gone
+	if kill -0 "$child" 2>/dev/null; then state=alive; fi
+	printf '%s\t%s\t%s\t%s\n' "$child" "$role" "$status" "$state" >> "$run_dir/children.tsv"
+}
+
 # The PID remains an owned, unwaited child until wait clears it. Only a running
 # shell job may be signalled; never signal a stale PID after an explicit wait.
 stop_benchmark_child() {
@@ -9,14 +16,19 @@ stop_benchmark_child() {
 	if jobs -pr | grep -qx "$bench_pid"; then
 		kill -KILL "$bench_pid" 2>/dev/null || true
 	fi
-	wait "$bench_pid" 2>/dev/null || true
+	local status=0
+	wait "$bench_pid" 2>/dev/null || status=$?
+	record_service_child "$bench_pid" driver "$status"
+	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	bench_pid=
 }
 
 wait_benchmark_child() {
 	local status=0
 	wait "$bench_pid" || status=$?
+	record_service_child "$bench_pid" driver "$status"
 	bench_pid=
+	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	return "$status"
 }
 
@@ -68,6 +80,9 @@ requests=${RHIZA_SERVER_BENCH_REQUESTS:-100000}
 concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
+bypass_node=${RHIZA_SERVER_BENCH_BYPASS_NODE:-none}
+slow_ingress=${RHIZA_SERVER_BENCH_SLOW_INGRESS:-0}
+expect_ingress_failure=${RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE:-0}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
@@ -90,8 +105,26 @@ if [[ $durability != async && $durability != before-ack ]]; then
 	printf 'RHIZA_SERVER_BENCH_DURABILITY must be async or before-ack\n' >&2
 	exit 2
 fi
-if [[ $failed_node == "$target_node" ]]; then
-	printf 'failed node and client target must differ\n' >&2
+if [[ $bypass_node != none && $bypass_node != n0 && $bypass_node != n1 && $bypass_node != n2 ]]; then
+	printf 'RHIZA_SERVER_BENCH_BYPASS_NODE must be none, n0, n1, or n2\n' >&2
+	exit 2
+fi
+if [[ $expect_ingress_failure != 0 && $expect_ingress_failure != 1 ]]; then
+	printf 'RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE must be 0 or 1\n' >&2
+	exit 2
+fi
+if [[ $slow_ingress != 0 && $slow_ingress != 1 ]]; then printf 'slow ingress must be 0 or 1\n' >&2; exit 2; fi
+if [[ $slow_ingress == 1 && $failed_node != none ]]; then printf 'slow ingress cannot be combined with node kill\n' >&2; exit 2; fi
+if [[ $expect_ingress_failure == 1 && (($failed_node != "$target_node" && $slow_ingress != 1) || $bypass_node != none) ]]; then
+	printf 'expected ingress failure requires the target to fail and no bypass\n' >&2
+	exit 2
+fi
+if [[ $failed_node == "$target_node" && ($bypass_node == "$target_node" || ($bypass_node == none && $expect_ingress_failure != 1)) ]]; then
+	printf 'failed ingress requires a distinct bypass node\n' >&2
+	exit 2
+fi
+if [[ $bypass_node != none && (($failed_node != "$target_node" && $slow_ingress != 1) || $bypass_node == "$target_node") ]]; then
+	printf 'bypass mode requires the failed node to be the target and a distinct bypass node\n' >&2
 	exit 2
 fi
 if [[ ! $fault_after =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -110,6 +143,9 @@ cleanup() {
 	set +e
 	stop_benchmark_child
 	output_stem=$(basename "$output_file" .json)
+	if [[ -n ${result_file:-} && -f $result_file ]]; then
+		cp "$result_file" "$(dirname "$output_file")/$output_stem-client.raw"
+	fi
 	for log in "$run_dir"/node-*.log; do
 		[[ -f $log ]] || continue
 		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
@@ -121,8 +157,13 @@ cleanup() {
 		[[ -f $pid_file ]] || continue
 		pid=$(<"$pid_file")
 		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || true; fi
-		wait "$pid" 2>/dev/null || true
+		child_status=0
+		wait "$pid" 2>/dev/null || child_status=$?
+		record_service_child "$pid" node "$child_status"
 	done
+	if [[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 && -f $run_dir/children.tsv ]]; then
+		cp "$run_dir/children.tsv" "${output_file%.json}-children-cleanup.tsv"
+	fi
 	docker rm -f "$container" >/dev/null 2>&1 || true
 	case "$run_dir" in
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
@@ -132,7 +173,11 @@ trap 'exit_status=$?; trap - EXIT; cleanup; exit "$exit_status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+if [[ -n ${RHIZA_SERVICE_SERVER_BIN:-} ]]; then
+	cp -- "$RHIZA_SERVICE_SERVER_BIN" "$run_dir/rhiza"
+else
+	(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+fi
 # Both server revisions use the exact same candidate client/oracle, not each
 # revision's potentially different receipt parser or fault instrumentation.
 (cd "$client_source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
@@ -199,9 +244,48 @@ done
 
 target_index=${target_node#n}
 target="http://127.0.0.1:$((base_http_port + target_index))"
+verify_target=$target
+bypass_args=()
+if [[ $bypass_node != none ]]; then
+	bypass_index=${bypass_node#n}
+	verify_target="http://127.0.0.1:$((base_http_port + bypass_index))"
+	bypass_args=(-fallback-url "$verify_target")
+fi
 curl -fsS -H 'Content-Type: application/json' \
 	-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
 	"$target/sql/execute" >/dev/null
+if [[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 ]]; then
+	[[ -x ${RHIZA_SERVICE_READ_DRIVER:-} && -n ${RHIZA_READ_MODE:-} && -n ${RHIZA_READ_SCENARIO:-} ]] || { echo 'missing production read driver or scenario' >&2; exit 2; }
+	curl -fsS -H 'Content-Type: application/json' \
+		-d '{"request_id":"read-seed","sql":"INSERT INTO benchmark_writes(id) VALUES (42)"}' \
+		"$target/sql/execute" > "$run_dir/read-seed.json"
+	secondary="http://127.0.0.1:$((base_http_port + 2))"
+	mkdir "$run_dir/read-fault"
+	RHIZA_READ_PRIMARY="$target" RHIZA_READ_SECONDARY="$secondary" RHIZA_READ_THIRD="http://127.0.0.1:$base_http_port" RHIZA_READ_OUTPUT="$output_file" \
+		RHIZA_READ_FAULT_DIR="$run_dir/read-fault" \
+		"$RHIZA_SERVICE_READ_DRIVER" -test.run '^TestServiceReadDriver$' -test.v &
+	bench_pid=$!
+	if [[ $RHIZA_READ_SCENARIO == dead-ingress ]]; then
+		for _ in {1..500}; do
+			[[ -f $run_dir/read-fault/response-held ]] && break
+			jobs -pr | grep -qx "$bench_pid" || break
+			sleep 0.01
+		done
+		[[ -f $run_dir/read-fault/response-held ]] || { echo 'no held upstream response witness' >&2; exit 1; }
+		pid=$(<"$run_dir/node-$target_index.pid")
+		jobs -pr | grep -qx "$pid" || { echo 'target is not an owned running process' >&2; exit 1; }
+		kill -KILL "$pid"
+		code=0; wait "$pid" || code=$?
+		record_service_child "$pid" node "$code"
+		printf 'signal=SIGKILL\nnode=%s\npid=%s\nexit=%s\nstage=upstream_response_received_then_held\n' "$target_node" "$pid" "$code" > "${output_file%.json}-fault-metadata.txt"
+		[[ $code == 137 ]] || { echo "unexpected fault exit $code" >&2; exit 1; }
+		rm -- "$run_dir/node-$target_index.pid"
+		if curl -fsS --max-time 2 "$target/ready" >/dev/null 2>&1; then echo 'dead ingress still responds' >&2; exit 1; fi
+		: > "$run_dir/read-fault/released"
+	fi
+	wait_benchmark_child
+	exit 0
+fi
 metric_nodes=(n0 n1 n2)
 case "$failed_node" in
 	n0) metric_nodes=(n1 n2) ;;
@@ -219,6 +303,7 @@ object_stats() {
 object_before=$(object_stats)
 result_file="$run_dir/result.json"
 control_args=()
+if [[ $slow_ingress == 1 ]]; then control_args=(-timeout 500ms -slow-first-response 2s); fi
 if [[ $failed_node != none ]]; then
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
@@ -231,7 +316,7 @@ if [[ $failed_node != none ]]; then
 fi
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
-	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${control_args[@]+${control_args[@]}}" >"$result_file" &
+	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 -verify-insert-receipt "${bypass_args[@]+${bypass_args[@]}}" "${control_args[@]+${control_args[@]}}" >"$result_file" &
 bench_pid=$!
 overlap='null'
 fault_exit_status=null
@@ -279,22 +364,41 @@ if [[ $failed_node != none ]]; then
 		exit 1
 	fi
 fi
+if [[ $expect_ingress_failure == 1 ]]; then
+	if [[ $slow_ingress == 1 ]]; then
+		jq -e --argjson requests "$requests" '.errors == 1 and .successes == ($requests - 1) and .error_kinds == {"transport":1,"http_0":1} and .slow_proxy_committed == 1 and .slow_proxy_timeout_witness == 1' <<<"$result" >/dev/null || exit 1
+	elif ! jq -e '.errors > 0 and .fault_window.overlap == true' <<<"$result" >/dev/null; then
+		printf 'expected ingress failure was not observed or did not overlap\n' >&2
+		exit 1
+	fi
+	jq '. + {qualification:"expected_ingress_failure"}' <<<"$result" > "$output_file"
+	printf 'expected ingress failure observed; run is not a success\n' >&2
+	exit 1
+fi
 count=$(curl -fsS -H 'Content-Type: application/json' \
 	-d "{\"sql\":\"SELECT COUNT(*), COUNT(CASE WHEN id >= 0 AND id < $requests THEN 1 END) FROM benchmark_writes\",\"consistency\":\"linearizable\"}" \
-	"$target/sql/query")
+	"$verify_target/sql/query")
 object_after=$(object_stats)
 object_delta=$(jq -nc --argjson before "$object_before" --argjson after "$object_after" \
 	'reduce ((($before|keys_unsorted) + ($after|keys_unsorted)) | unique[]) as $key
 		({}; .[$key] = (($after[$key] // 0) - ($before[$key] // 0)))')
 object_metric_nodes=$(printf '%s\n' "${metric_nodes[@]}" | jq -R . | jq -sc .)
 jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests and .receipt_oracle == "sql-insert-id-v1"' <<<"$result" >/dev/null
+if [[ $bypass_node != none && $slow_ingress == 1 ]]; then
+	jq -e '.slow_proxy_committed == 1 and .slow_proxy_rerouted_witness == 1 and .ingress_reroutes > 0 and .reroute_successes > 0' <<<"$result" >/dev/null || exit 1
+elif [[ $bypass_node != none ]]; then
+	if ! jq -e '.ingress_reroutes > 0 and .ingress_reroute_after_signal == true and .fault_window.rerouted_witnesses > 0' <<<"$result" >/dev/null; then
+		printf 'ingress reroute not qualified: no successful same-request fault witness\n' >&2
+		exit 1
+	fi
+fi
 verify_benchmark_rows "$requests" <<<"$count"
 runtime_failure_lines=0
 for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg bypass_node "$bypass_node" --arg durability "$durability" --arg fault_after "$fault_after" --arg slow_ingress "$slow_ingress" \
+	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $slow_ingress == "1" then "committed-response-delay-proxy" elif $failed_node == "none" then "healthy" elif $bypass_node != "none" then "ingress-sigkill-benchmark-client-reroute" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,bypass_node:$bypass_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

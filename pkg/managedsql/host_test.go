@@ -55,6 +55,7 @@ type sqlWireControl struct {
 	putReadGateBytes        int
 	putReadErrors           chan error
 	putReadFailure          func(*http.Request, error)
+	putReadStarted          func(*http.Request)
 	ownedClose              atomic.Int64
 	// Evaluated before body reads/object-map lock. The owner must fail its
 	// test on predicate observation errors rather than silently passing them.
@@ -266,7 +267,12 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				_, _ = io.WriteString(w, "<Error><Code>PreconditionFailed</Code></Error>")
 				return
 			}
+			mu.Unlock()
+			if control.putReadStarted != nil {
+				control.putReadStarted(r)
+			}
 			body, err := io.ReadAll(r.Body)
+			mu.Lock()
 			if err != nil {
 				if control.putReadFailure != nil {
 					control.putReadFailure(r, err)
@@ -317,6 +323,14 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 					body = body[int(n)+2:]
 				}
 				body = decoded
+			}
+			// Recheck after reading: another request may have changed the object.
+			b, exists = objects[key]
+			etag = fmt.Sprintf("\"%x\"", md5.Sum(b))
+			if r.Header.Get("If-None-Match") == "*" && exists || r.Header.Get("If-Match") != "" && (!exists || r.Header.Get("If-Match") != etag) {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, _ = io.WriteString(w, "<Error><Code>PreconditionFailed</Code></Error>")
+				return
 			}
 			objects[key] = body
 			if strings.HasSuffix(key, "voters/managed-sql-initialization.json") && control.dropReceiptResponse.Swap(false) {

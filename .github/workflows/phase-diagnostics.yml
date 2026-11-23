@@ -1,0 +1,182 @@
+name: QuePaxa phase diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/quepaxa-phase-diagnostics
+
+permissions:
+  contents: read
+
+jobs:
+  phase-diagnostics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: 2
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Record environment
+        shell: sh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-phase-diagnostics
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            git rev-parse HEAD
+            go version
+            go env GOOS GOARCH CGO_ENABLED
+            printf 'GOMAXPROCS=%s\n' "$GOMAXPROCS"
+            uname -a
+          } > "$EVIDENCE_DIR/environment.txt"
+      - name: Verify instrumentation under race detector
+        shell: sh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-phase-diagnostics
+        run: |
+          set +e
+          go test -json -race -tags rhiza_phase_diagnostics ./pkg/quepaxa -run '^TestPhaseDiagnostics(CaptureSuccessAndQuorumFailure|ConcurrentOverflowAndCancellation)$|^TestPhaseDiagnosticBehavior$' -count=1 > "$EVIDENCE_DIR/race.jsonl" 2>&1
+          code=$?
+          printf '%s\n' "$code" > "$EVIDENCE_DIR/race.exit"
+          exit "$code"
+      - name: Verify uninstrumented behavior
+        shell: sh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-phase-diagnostics
+        run: |
+          set +e
+          go test -json -race ./pkg/quepaxa -run '^TestPhaseDiagnosticBehavior$' -count=1 > "$EVIDENCE_DIR/uninstrumented.jsonl" 2>&1
+          code=$?
+          printf '%s\n' "$code" > "$EVIDENCE_DIR/uninstrumented.exit"
+          exit "$code"
+      - name: Measure instrumented and uninstrumented workloads
+        shell: sh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-phase-diagnostics
+        run: |
+          measure() {
+            mode=$1
+            sample=$2
+            output="$EVIDENCE_DIR/${mode}-${sample}.jsonl"
+            set +e
+            if [ "$mode" = instrumented ]; then
+              go test -json -tags rhiza_phase_diagnostics ./pkg/quepaxa -run '^$' -bench '^BenchmarkPhaseDiagnostics$' -benchtime=1s -count=1 > "$output" 2>&1
+            else
+              go test -json ./pkg/quepaxa -run '^$' -bench '^BenchmarkPhaseDiagnostics$' -benchtime=1s -count=1 > "$output" 2>&1
+            fi
+            code=$?
+            printf '%s\n' "$code" > "$EVIDENCE_DIR/${mode}-${sample}.exit"
+            if [ "$code" -ne 0 ]; then return "$code"; fi
+            if ! grep -q 'BenchmarkPhaseDiagnostics/healthy' "$output" || ! grep -q 'BenchmarkPhaseDiagnostics/one_peer_down' "$output"; then
+              echo "Missing expected benchmark scenario: $mode sample $sample" >&2
+              return 1
+            fi
+          }
+          i=1
+          while [ "$i" -le 10 ]; do
+            if [ $((i % 2)) -eq 1 ]; then
+              measure uninstrumented "$i" && measure instrumented "$i" || exit 1
+            else
+              measure instrumented "$i" && measure uninstrumented "$i" || exit 1
+            fi
+            i=$((i + 1))
+          done
+      - name: Preserve raw diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quepaxa-phase-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quepaxa-phase-diagnostics
+          if-no-files-found: warn
+          retention-days: 30
+
+  ingress-fault:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GOMAXPROCS: 2
+      CGO_ENABLED: 1
+      RHIZA_SERVER_BENCH_REQUESTS: 100000
+      RHIZA_SERVER_BENCH_CONCURRENCY: 16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify fault harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race ./cmd/rhiza-bench -count=1
+          bash benchmarks/run-server-reference_test.sh
+          bash benchmarks/run-ingress-diagnostics_test.sh
+      - name: Measure healthy, peer failure, ingress failure and ingress reroute
+        shell: bash
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-ingress-fault
+          TMPDIR: ${{ runner.temp }}/quepaxa-ingress-temp
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p "$EVIDENCE_DIR" "$TMPDIR" || exit 1
+          {
+            git rev-parse HEAD || exit 1
+            go version || exit 1
+            uname -a || exit 1
+            docker version || exit 1
+            printf 'requests=%s concurrency=%s\n' "$RHIZA_SERVER_BENCH_REQUESTS" "$RHIZA_SERVER_BENCH_CONCURRENCY"
+          } > "$EVIDENCE_DIR/environment.txt" 2>&1 || exit 1
+          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-before.txt" || exit 1
+          result=0
+          for scenario in healthy peer-fault ingress-no-bypass ingress-reroute slow-no-bypass slow-reroute; do
+            expect_ingress_failure=0
+            slow_ingress=0
+            case "$scenario" in
+              healthy) failed=none; target=n1; bypass=none ;;
+              peer-fault) failed=n0; target=n1; bypass=none ;;
+              ingress-no-bypass) failed=n1; target=n1; bypass=none; expect_ingress_failure=1 ;;
+              ingress-reroute) failed=n1; target=n1; bypass=n2 ;;
+              slow-no-bypass) failed=none; target=n1; bypass=none; slow_ingress=1; expect_ingress_failure=1 ;;
+              slow-reroute) failed=none; target=n1; bypass=n2; slow_ingress=1 ;;
+            esac
+            RHIZA_SERVER_BENCH_FAILED_NODE="$failed" \
+              RHIZA_SERVER_BENCH_TARGET_NODE="$target" \
+              RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" \
+              RHIZA_SERVER_BENCH_SLOW_INGRESS="$slow_ingress" \
+              RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE="$expect_ingress_failure" \
+              bash benchmarks/run-server-reference.sh "$GITHUB_WORKSPACE" "$EVIDENCE_DIR/$scenario.json" \
+              > "$EVIDENCE_DIR/$scenario.log" 2>&1
+            code=$?
+            printf '%s\n' "$code" > "$EVIDENCE_DIR/$scenario.exit"
+            if [ "$scenario" = ingress-no-bypass ]; then
+              if [ "$code" -ne 1 ] || ! jq -e '.qualification == "expected_ingress_failure" and .errors > 0 and .fault_window.overlap == true' "$EVIDENCE_DIR/$scenario.json" > /dev/null; then
+                result=1
+              fi
+            elif [ "$scenario" = slow-no-bypass ]; then
+              if [ "$code" -ne 1 ] || ! jq -e --argjson requests "$RHIZA_SERVER_BENCH_REQUESTS" '.qualification == "expected_ingress_failure" and .errors == 1 and .successes == ($requests - 1) and .error_kinds == {"transport":1,"http_0":1} and .slow_proxy_committed == 1 and .slow_proxy_timeout_witness == 1' "$EVIDENCE_DIR/$scenario.json" > /dev/null; then
+                result=1
+              fi
+            elif [ "$code" -ne 0 ]; then
+              result=1
+            fi
+          done
+          docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-after.txt" || result=1
+          if ! diff -u "$EVIDENCE_DIR/containers-before.txt" "$EVIDENCE_DIR/containers-after.txt" > "$EVIDENCE_DIR/cleanup-containers.diff"; then result=1; fi
+          find "$TMPDIR" -mindepth 1 -maxdepth 1 -print > "$EVIDENCE_DIR/cleanup-temp.txt" || result=1
+          if [ -s "$EVIDENCE_DIR/cleanup-temp.txt" ]; then result=1; fi
+          exit "$result"
+      - name: Preserve raw ingress evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quepaxa-ingress-fault-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quepaxa-ingress-fault
+          if-no-files-found: warn
+          retention-days: 30
