@@ -1,0 +1,42 @@
+name: QuePaxa stall diagnostic
+
+on:
+  push:
+    branches: [feature/quepaxa-stall-diagnostics]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Validate and record exact candidate
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rhiza-stall"
+          sh benchmarks/validate-stall-candidate_test.sh
+          sh benchmarks/validate-stall-candidate.sh "$EXPECTED_SHA" > "$RUNNER_TEMP/rhiza-stall/sha.txt"
+      - name: Verify tagged diagnostic and signal handling
+        run: go test -race -tags rhiza_stall_diagnostics ./pkg/quepaxa ./cmd/rhiza -run '^TestStallDiagnostic' -count=1 -timeout=2m
+      - name: Run n1 fault and preserve actual exit
+        shell: bash
+        run: |
+          status=0
+          RHIZA_SERVER_BENCH_STALL_DIAG=1 RHIZA_SERVER_BENCH_FAILED_NODE=n1 RHIZA_SERVER_BENCH_TARGET_NODE=n2 \
+            benchmarks/run-server-reference.sh . "$RUNNER_TEMP/rhiza-stall/result.json" > "$RUNNER_TEMP/rhiza-stall/run.log" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/rhiza-stall/exit.txt"
+          exit "$status"
+      - name: Preserve diagnostics from disposable test processes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stall-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-stall
+          retention-days: 7

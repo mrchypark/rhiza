@@ -26,6 +26,8 @@ func main() {
 	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	stopStallDiagnostics := startStallDiagnostics(ctx)
+	defer stopStallDiagnostics()
 	if err := runCommand(ctx, *enroll); err != nil {
 		log.Fatal(err)
 	}

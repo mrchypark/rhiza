@@ -82,6 +82,7 @@ failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 bypass_node=${RHIZA_SERVER_BENCH_BYPASS_NODE:-none}
 slow_ingress=${RHIZA_SERVER_BENCH_SLOW_INGRESS:-0}
+stall_diag=${RHIZA_SERVER_BENCH_STALL_DIAG:-0}
 expect_ingress_failure=${RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE:-0}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
@@ -114,6 +115,9 @@ if [[ $expect_ingress_failure != 0 && $expect_ingress_failure != 1 ]]; then
 	exit 2
 fi
 if [[ $slow_ingress != 0 && $slow_ingress != 1 ]]; then printf 'slow ingress must be 0 or 1\n' >&2; exit 2; fi
+if [[ $stall_diag != 0 && $stall_diag != 1 ]]; then printf 'stall diagnostics must be 0 or 1\n' >&2; exit 2; fi
+if [[ $stall_diag == 1 && $failed_node == none ]]; then printf 'stall diagnostics require a fault scenario\n' >&2; exit 2; fi
+if [[ $stall_diag == 1 && (-n ${RHIZA_SERVICE_SERVER_BIN:-} || $(uname -s) != Linux) ]]; then printf 'stall diagnostics require a locally built Linux server\n' >&2; exit 2; fi
 if [[ $slow_ingress == 1 && $failed_node != none ]]; then printf 'slow ingress cannot be combined with node kill\n' >&2; exit 2; fi
 if [[ $expect_ingress_failure == 1 && (($failed_node != "$target_node" && $slow_ingress != 1) || $bypass_node != none) ]]; then
 	printf 'expected ingress failure requires the target to fail and no bypass\n' >&2
@@ -150,6 +154,13 @@ cleanup() {
 		[[ -f $log ]] || continue
 		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
 	done
+	for trace in "$run_dir"/node-*.stacks; do
+		[[ -f $trace ]] || continue
+		cp "$trace" "$(dirname "$output_file")/$output_stem-$(basename "$trace")"
+	done
+	if [[ -f $run_dir/stall-snapshots.tsv ]]; then
+		cp "$run_dir/stall-snapshots.tsv" "$(dirname "$output_file")/$output_stem-stall-snapshots.tsv"
+	fi
 	if [[ -f $run_dir/fault-metadata.txt ]]; then
 		cp "$run_dir/fault-metadata.txt" "$(dirname "$output_file")/$output_stem-fault-metadata.txt"
 	fi
@@ -176,7 +187,11 @@ trap 'exit 143' TERM
 if [[ -n ${RHIZA_SERVICE_SERVER_BIN:-} ]]; then
 	cp -- "$RHIZA_SERVICE_SERVER_BIN" "$run_dir/rhiza"
 else
-	(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+	if [[ $stall_diag == 1 ]]; then
+		(cd "$source_dir" && CGO_ENABLED=0 go build -tags rhiza_stall_diagnostics -o "$run_dir/rhiza" ./cmd/rhiza)
+	else
+		(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+	fi
 fi
 # Both server revisions use the exact same candidate client/oracle, not each
 # revision's potentially different receipt parser or fault instrumentation.
@@ -221,6 +236,7 @@ for i in 0 1 2; do
 	peer_token_env=()
 	[[ $legacy_membership -eq 1 ]] || peer_token_env=(RHIZA_PEER_TOKEN="n$i-token")
 	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
+		RHIZA_STALL_TRACE_FILE="$run_dir/node-$i.stacks" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
 		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
@@ -349,6 +365,34 @@ if [[ $failed_node != none ]]; then
 		jq -nc --argjson status "$fault_exit_status" --argjson overlap "$overlap" \
 			'{qualification:"not_qualified",reason:"fault_child_exit_status",fault_exit_status:$status,fault_overlap:$overlap}' | tee "$output_file"
 		exit "$wait_status"
+	fi
+	if [[ $stall_diag == 1 ]]; then
+		# Snapshot only owned, still-running children, while the workload continues.
+		sleep 5
+		printf 'timestamp_utc\tpid\tnode\tresult\n' > "$run_dir/stall-snapshots.tsv"
+		if jobs -pr | grep -qx "$bench_pid"; then
+			for pid_file in "$run_dir"/node-*.pid; do
+				[[ -f $pid_file ]] || continue
+				pid=$(<"$pid_file")
+				node=$(basename "$pid_file" .pid)
+				stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+				if jobs -pr | grep -qx "$pid" && kill -USR1 "$pid"; then
+					for _ in {1..100}; do
+						[[ -s $run_dir/$node.stacks ]] && break
+						sleep 0.01
+					done
+					if [[ -s $run_dir/$node.stacks ]]; then
+						printf '%s\t%s\t%s\tcaptured\n' "$stamp" "$pid" "$node" >> "$run_dir/stall-snapshots.tsv"
+					else
+						printf '%s\t%s\t%s\tno_snapshot\n' "$stamp" "$pid" "$node" >> "$run_dir/stall-snapshots.tsv"
+					fi
+				else
+					printf '%s\t%s\t%s\tnot_running_or_signal_failed\n' "$stamp" "$pid" "$node" >> "$run_dir/stall-snapshots.tsv"
+				fi
+			done
+		else
+			printf '%s\t%s\t%s\tworkload_finished_before_snapshot\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$bench_pid" client >> "$run_dir/stall-snapshots.tsv"
+		fi
 	fi
 fi
 wait_benchmark_child

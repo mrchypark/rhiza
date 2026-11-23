@@ -1654,14 +1654,20 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 	defer cancel()
 	for nodeID, request := range requests {
 		go func(nodeID NodeID, request RecordRequest) {
-			var summary Summary
+			recordCtx := callCtx
 			var err error
+			if stallDiagnosticsEnabled {
+				var finish func(error)
+				recordCtx, finish = stallRecordContext(recordCtx, nodeID, request)
+				defer func() { finish(err) }()
+			}
+			var summary Summary
 			if nodeID == c.nodeID {
-				summary, err = c.Record(callCtx, request)
+				summary, err = c.Record(recordCtx, request)
 			} else if c.transport == nil {
 				err = fmt.Errorf("no transport for %s", nodeID)
 			} else {
-				summary, err = c.transport.SendRecord(callCtx, nodeID, request)
+				summary, err = c.transport.SendRecord(recordCtx, nodeID, request)
 			}
 			results <- result{id: nodeID, summary: summary, err: err}
 		}(nodeID, request)
