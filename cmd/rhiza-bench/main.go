@@ -23,29 +23,38 @@ import (
 )
 
 type result struct {
-	Requests         int               `json:"requests"`
-	Successes        int               `json:"successes"`
-	Errors           uint64            `json:"errors"`
-	Retries          uint64            `json:"retries,omitempty"`
-	DurationMS       float64           `json:"duration_ms"`
-	OpsPerSec        float64           `json:"ops_per_sec"`
-	SuccessOpsPerSec float64           `json:"success_ops_per_sec"`
-	P50MS            float64           `json:"p50_ms"`
-	P95MS            float64           `json:"p95_ms"`
-	P99MS            float64           `json:"p99_ms"`
-	MaxMS            float64           `json:"max_ms"`
-	ErrorP50MS       float64           `json:"error_p50_ms,omitempty"`
-	ErrorP95MS       float64           `json:"error_p95_ms,omitempty"`
-	ErrorP99MS       float64           `json:"error_p99_ms,omitempty"`
-	ErrorKinds       map[string]uint64 `json:"error_kinds,omitempty"`
-	ErrorSamples     map[string]string `json:"error_samples,omitempty"`
-	ReceiptOracle    string            `json:"receipt_oracle,omitempty"`
-	FaultOverlap     bool              `json:"fault_overlap_control,omitempty"`
-	FaultWindow      *faultWindow      `json:"fault_window,omitempty"`
+	Requests           int               `json:"requests"`
+	Successes          int               `json:"successes"`
+	Errors             uint64            `json:"errors"`
+	Retries            uint64            `json:"retries,omitempty"`
+	DurationMS         float64           `json:"duration_ms"`
+	OpsPerSec          float64           `json:"ops_per_sec"`
+	SuccessOpsPerSec   float64           `json:"success_ops_per_sec"`
+	P50MS              float64           `json:"p50_ms"`
+	P95MS              float64           `json:"p95_ms"`
+	P99MS              float64           `json:"p99_ms"`
+	MaxMS              float64           `json:"max_ms"`
+	ErrorP50MS         float64           `json:"error_p50_ms,omitempty"`
+	ErrorP95MS         float64           `json:"error_p95_ms,omitempty"`
+	ErrorP99MS         float64           `json:"error_p99_ms,omitempty"`
+	ErrorKinds         map[string]uint64 `json:"error_kinds,omitempty"`
+	ErrorSamples       map[string]string `json:"error_samples,omitempty"`
+	ReceiptOracle      string            `json:"receipt_oracle,omitempty"`
+	FaultOverlap       bool              `json:"fault_overlap_control,omitempty"`
+	FaultWindow        *faultWindow      `json:"fault_window,omitempty"`
+	IngressReroutes    uint64            `json:"ingress_reroutes,omitempty"`
+	RerouteAfterSignal bool              `json:"ingress_reroute_after_signal,omitempty"`
+	RerouteSuccesses   int               `json:"reroute_successes,omitempty"`
+	RerouteP50MS       float64           `json:"reroute_p50_ms,omitempty"`
+	RerouteP95MS       float64           `json:"reroute_p95_ms,omitempty"`
+	RerouteP99MS       float64           `json:"reroute_p99_ms,omitempty"`
+	RerouteMaxMS       float64           `json:"reroute_max_ms,omitempty"`
+	RerouteErrors      int               `json:"reroute_errors,omitempty"`
 }
 
 func main() {
 	baseURL := flag.String("url", "http://127.0.0.1:18090", "Rhiza HTTP base URL")
+	fallbackURL := flag.String("fallback-url", "", "optional alternate ingress after transport failure (same request ID)")
 	requestPath := flag.String("path", "/healthz", "request path")
 	body := flag.String("body", "", "JSON body; {{id}} is replaced per request")
 	requests := flag.Int("n", 1000, "request count")
@@ -68,9 +77,13 @@ func main() {
 	jobs := make(chan int)
 	latencies := make([]time.Duration, 0, *requests)
 	errorLatencies := make([]time.Duration, 0)
+	rerouteLatencies := make([]time.Duration, 0)
+	var rerouteErrors int
 	var latencyMu sync.Mutex
 	var failures atomic.Uint64
 	var retries atomic.Uint64
+	var ingressReroutes atomic.Uint64
+	var useFallback atomic.Bool
 	var transportFailures atomic.Uint64
 	var receiptFailures atomic.Uint64
 	var statuses [600]atomic.Uint64
@@ -137,12 +150,26 @@ func main() {
 				if progress != nil {
 					requestCtx, finish = progress.traceRequest(ctx, id)
 				}
-				status, sample, retryCount, requestErr := doRequest(requestCtx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries, *verifyInsert)
+				status, sample, retryCount, requestErr, rerouteAt := doRequestWithFallback(requestCtx, client, method, *baseURL+*requestPath, *fallbackURL, *requestPath, payload, *commitUnknownRetries, *verifyInsert, &useFallback, &ingressReroutes, progress)
+				completed := time.Now()
+				succeeded := requestErr == nil && status >= 200 && status < 300
+				if progress != nil {
+					progress.recordOutcome(id, rerouteAt, completed, succeeded)
+				}
 				if finish != nil {
-					finish(time.Now()) // capture completion BEFORE the tracking lock
+					finish(completed) // capture completion BEFORE the tracking lock
 				}
 				retries.Add(uint64(retryCount))
-				elapsed := time.Since(begin)
+				elapsed := completed.Sub(begin)
+				if !rerouteAt.IsZero() {
+					latencyMu.Lock()
+					if succeeded {
+						rerouteLatencies = append(rerouteLatencies, elapsed)
+					} else {
+						rerouteErrors++
+					}
+					latencyMu.Unlock()
+				}
 				if status < 200 || status >= 300 {
 					if text := strings.TrimSpace(string(sample)); text != "" {
 						errorSamplesMu.Lock()
@@ -193,6 +220,7 @@ func main() {
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	sort.Slice(errorLatencies, func(i, j int) bool { return errorLatencies[i] < errorLatencies[j] })
+	sort.Slice(rerouteLatencies, func(i, j int) bool { return rerouteLatencies[i] < rerouteLatencies[j] })
 	quantile := func(values []time.Duration, q float64) float64 {
 		if len(values) == 0 {
 			return 0
@@ -225,11 +253,15 @@ func main() {
 		OpsPerSec: float64(*requests) / elapsedSec, SuccessOpsPerSec: float64(len(latencies)) / elapsedSec, P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
 		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
 		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
-		FaultOverlap: progress != nil,
+		FaultOverlap:     progress != nil,
+		IngressReroutes:  ingressReroutes.Load(),
+		RerouteSuccesses: len(rerouteLatencies), RerouteErrors: rerouteErrors,
+		RerouteP50MS: quantile(rerouteLatencies, .50), RerouteP95MS: quantile(rerouteLatencies, .95), RerouteP99MS: quantile(rerouteLatencies, .99), RerouteMaxMS: quantile(rerouteLatencies, 1),
 	}
 	if progress != nil {
 		window := progress.window()
 		output.FaultWindow = &window
+		output.RerouteAfterSignal = window.SignalBeforeNS > 0 && progress.latestRerouteNS.Load() >= window.SignalBeforeNS
 	}
 	if *verifyInsert {
 		output.ReceiptOracle = "sql-insert-id-v1"
@@ -238,6 +270,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func doRequestWithFallback(ctx context.Context, client *http.Client, method, url, fallback, path, payload string, maxRetries int, verifyInsert bool, useFallback *atomic.Bool, reroutes *atomic.Uint64, progress *faultProgress) (int, []byte, int, error, time.Time) {
+	if fallback != "" && useFallback.Load() {
+		url = fallback + path
+	}
+	status, body, retries, err := doRequest(ctx, client, method, url, payload, maxRetries, verifyInsert)
+	if fallback == "" || url == fallback+path || err == nil || errors.Is(err, errInvalidInsertReceipt) || ctx.Err() != nil {
+		return status, body, retries, err, time.Time{}
+	}
+	useFallback.Store(true)
+	reroutes.Add(1)
+	rerouteAt := time.Now()
+	if progress != nil {
+		now := rerouteAt.Sub(progress.epoch).Nanoseconds()
+		for prev := progress.latestRerouteNS.Load(); now > prev && !progress.latestRerouteNS.CompareAndSwap(prev, now); prev = progress.latestRerouteNS.Load() {
+		}
+	}
+	status, body, fallbackRetries, err := doRequest(ctx, client, method, fallback+path, payload, maxRetries, verifyInsert)
+	return status, body, retries + fallbackRetries + 1, err, rerouteAt
 }
 
 func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int, verifyInsert bool) (int, []byte, int, error) {
@@ -306,34 +358,58 @@ func validateInsertReceipt(payload string, body []byte) error {
 // Only fault lanes enable this coordinator. Retain only the current requests
 // and one bounded fault snapshot, never the complete benchmark history.
 type faultProgress struct {
-	mu            sync.Mutex
-	token         string
-	active        map[int]*requestInterval
-	epoch         time.Time
-	signal        func() (time.Time, time.Time, error)
-	attempted     bool
-	snapshot      []*requestInterval
-	before, after time.Time
-	signalOK      bool
-	reason        string
+	latestRerouteNS       atomic.Int64
+	mu                    sync.Mutex
+	token                 string
+	active                map[int]*requestInterval
+	epoch                 time.Time
+	signal                func() (time.Time, time.Time, error)
+	attempted             bool
+	snapshot              []*requestInterval
+	before, after         time.Time
+	firstSuccess          time.Time
+	earlySuccessUncertain bool
+	signalOK              bool
+	reason                string
 }
 
 type requestInterval struct {
-	sent     atomic.Pointer[time.Time]
-	finished atomic.Pointer[time.Time]
+	sent       atomic.Pointer[time.Time]
+	finished   atomic.Pointer[time.Time]
+	rerouted   atomic.Pointer[time.Time]
+	successful atomic.Bool
 }
 
 type faultWindow struct {
-	Attempted         bool   `json:"attempted"`
-	SignalSucceeded   bool   `json:"signal_succeeded"`
-	Overlap           bool   `json:"overlap"`
-	Witnesses         int    `json:"witnesses"`
-	SnapshotRequests  int    `json:"snapshot_requests"`
-	SignalBeforeNS    int64  `json:"signal_before_ns"`
-	SignalAfterNS     int64  `json:"signal_after_ns"`
-	WitnessSentNS     int64  `json:"witness_sent_ns"`
-	WitnessFinishedNS int64  `json:"witness_finished_ns"`
-	Reason            string `json:"reason"`
+	Attempted                 bool     `json:"attempted"`
+	SignalSucceeded           bool     `json:"signal_succeeded"`
+	Overlap                   bool     `json:"overlap"`
+	Witnesses                 int      `json:"witnesses"`
+	SnapshotRequests          int      `json:"snapshot_requests"`
+	SignalBeforeNS            int64    `json:"signal_before_ns"`
+	SignalAfterNS             int64    `json:"signal_after_ns"`
+	WitnessSentNS             int64    `json:"witness_sent_ns"`
+	WitnessFinishedNS         int64    `json:"witness_finished_ns"`
+	ReroutedWitnesses         int      `json:"rerouted_witnesses"`
+	FirstSuccessAfterSignalMS *float64 `json:"first_success_after_signal_ms"`
+	Reason                    string   `json:"reason"`
+}
+
+func (p *faultProgress) recordOutcome(id int, rerouteAt, finished time.Time, success bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if interval := p.active[id]; interval != nil {
+		if !rerouteAt.IsZero() {
+			interval.rerouted.Store(&rerouteAt)
+		}
+		interval.successful.Store(success)
+	}
+	if success && p.attempted && !p.signalOK {
+		p.earlySuccessUncertain = true
+	}
+	if success && p.signalOK && !finished.Before(p.after) && (p.firstSuccess.IsZero() || finished.Before(p.firstSuccess)) {
+		p.firstSuccess = finished
+	}
 }
 
 func (p *faultProgress) traceRequest(ctx context.Context, id int) (context.Context, func(time.Time)) {
@@ -402,10 +478,17 @@ func (p *faultProgress) window() faultWindow {
 		return result
 	}
 	result.SignalBeforeNS, result.SignalAfterNS = p.before.Sub(p.epoch).Nanoseconds(), p.after.Sub(p.epoch).Nanoseconds()
+	if !p.earlySuccessUncertain && !p.firstSuccess.IsZero() {
+		ms := float64(p.firstSuccess.Sub(p.after)) / float64(time.Millisecond)
+		result.FirstSuccessAfterSignalMS = &ms
+	}
 	for _, interval := range p.snapshot {
 		sent, finished := interval.sent.Load(), interval.finished.Load()
 		if sent != nil && finished != nil && coversFault(*sent, *finished, p.before, p.after) {
 			result.Witnesses++
+			if rerouted := interval.rerouted.Load(); rerouted != nil && !rerouted.Before(p.before) && interval.successful.Load() {
+				result.ReroutedWitnesses++
+			}
 			result.WitnessSentNS, result.WitnessFinishedNS = sent.Sub(p.epoch).Nanoseconds(), finished.Sub(p.epoch).Nanoseconds()
 		}
 	}

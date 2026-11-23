@@ -24,6 +24,74 @@ func TestIsCommitUnknown(t *testing.T) {
 	}
 }
 
+func TestIngressFallbackRetainsRequestAndDoesNotHideHTTPFailure(t *testing.T) {
+	const payload = `{"request_id":"bench-7","sql":"INSERT INTO benchmark_writes(id) VALUES (7)"}`
+	const receipt = `{"slot":4,"status":"committed","rows_affected":1,"last_insert_id":7,"retry_through_slot":65539}`
+	var calls atomic.Int64
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != payload {
+			t.Errorf("fallback changed request: %q", body)
+		}
+		_, _ = io.WriteString(w, receipt)
+	}))
+	defer fallback.Close()
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer primary.Close()
+	var useFallback atomic.Bool
+	var reroutes atomic.Uint64
+	status, _, retries, err, rerouted := doRequestWithFallback(context.Background(), primary.Client(), http.MethodPost, primary.URL+"/sql/execute", fallback.URL, "/sql/execute", payload, 0, true, &useFallback, &reroutes, nil)
+	if err != nil || status != 200 || retries != 1 || reroutes.Load() != 1 || calls.Load() != 1 || rerouted.IsZero() {
+		t.Fatalf("status=%d retries=%d reroutes=%d calls=%d err=%v", status, retries, reroutes.Load(), calls.Load(), err)
+	}
+	status, _, retries, err, rerouted = doRequestWithFallback(context.Background(), primary.Client(), http.MethodPost, primary.URL+"/sql/execute", fallback.URL, "/sql/execute", payload, 0, true, &useFallback, &reroutes, nil)
+	if err != nil || status != 200 || retries != 0 || calls.Load() != 2 || !rerouted.IsZero() {
+		t.Fatalf("subsequent request status=%d retries=%d calls=%d err=%v", status, retries, calls.Load(), err)
+	}
+	useFallback.Store(false)
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"code":"overloaded"}`)
+	}))
+	defer rejected.Close()
+	status, _, _, err, _ = doRequestWithFallback(context.Background(), rejected.Client(), http.MethodPost, rejected.URL+"/sql/execute", fallback.URL, "/sql/execute", payload, 0, true, &useFallback, &reroutes, nil)
+	if err != nil || status != 503 || calls.Load() != 2 || useFallback.Load() {
+		t.Fatalf("HTTP failure hidden: status=%d calls=%d err=%v", status, calls.Load(), err)
+	}
+}
+
+func TestRerouteFaultCorrelationRequiresSameRequest(t *testing.T) {
+	epoch := time.Now()
+	before, after := epoch.Add(time.Second), epoch.Add(2*time.Second)
+	sent, finished, rerouted := epoch.Add(time.Millisecond), epoch.Add(4*time.Second), epoch.Add(3*time.Second)
+	witness, unrelated := &requestInterval{}, &requestInterval{}
+	witness.sent.Store(&sent)
+	witness.finished.Store(&finished)
+	unrelated.rerouted.Store(&rerouted)
+	unrelated.successful.Store(true)
+	p := &faultProgress{epoch: epoch, attempted: true, signalOK: true, before: before, after: after, snapshot: []*requestInterval{witness}, active: map[int]*requestInterval{1: witness}}
+	if got := p.window(); got.Witnesses != 1 || got.ReroutedWitnesses != 0 {
+		t.Fatalf("unrelated reroute incorrectly correlated: %+v", got)
+	}
+	p.recordOutcome(1, rerouted, finished, true)
+	got := p.window()
+	if got.ReroutedWitnesses != 1 || got.FirstSuccessAfterSignalMS == nil || *got.FirstSuccessAfterSignalMS != 2000 {
+		t.Fatalf("missing same-request evidence: %+v", got)
+	}
+	p.signalOK = false
+	p.recordOutcome(1, time.Time{}, epoch.Add(1500*time.Millisecond), true)
+	p.signalOK = true
+	if got := p.window(); got.FirstSuccessAfterSignalMS != nil {
+		t.Fatalf("uncertain first success should be unreported: %+v", got)
+	}
+}
+
 func TestDoRequestRetriesCommitUnknownWithSamePayload(t *testing.T) {
 	const payload = `{"request_id":"bench-7","sql":"INSERT INTO benchmark_writes(id) VALUES (7)"}`
 	attempts := 0

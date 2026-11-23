@@ -1506,7 +1506,14 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 				return Decision{}, fmt.Errorf("local QuePaxa record attempt limit exceeded at slot %d", slot)
 			}
 		}
+		var phaseStarted time.Time
+		if phaseDiagnosticsEnabled {
+			phaseStarted = time.Now()
+		}
 		summaries, err := c.recordQuorum(ctx, requests)
+		if phaseDiagnosticsEnabled {
+			observePhase(step, time.Since(phaseStarted), err)
+		}
 		if err != nil {
 			return Decision{}, err
 		}
@@ -1555,6 +1562,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 				if err := c.hydrateProposal(ctx, &proposal, summarySources(summaries)...); err != nil {
 					return Decision{}, err
 				}
+				if phaseDiagnosticsEnabled {
+					observeDecision(step)
+				}
 				return Decision{Slot: slot, Step: step, Proposal: proposal, Summaries: summaries}, nil
 			}
 			best := maxFirst(summaries)
@@ -1569,6 +1579,9 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			// Algorithm 4 has no phase-specific action.
 		case 2:
 			if sameProposal(&proposal, maxPrior(summaries)) {
+				if phaseDiagnosticsEnabled {
+					observeDecision(step)
+				}
 				return Decision{Slot: slot, Step: step, Proposal: proposal, Summaries: summaries}, nil
 			}
 		case 3:

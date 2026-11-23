@@ -133,10 +133,14 @@ if [[ -n $control ]]; then
  if [[ $MOCK_MODE == after-last || $MOCK_MODE == no-witness ]]; then
   window='{"attempted":true,"signal_succeeded":true,"overlap":false,"witnesses":0,"reason":"no_completed_interval_spans_signal"}'
  else
-  window='{"attempted":true,"signal_succeeded":true,"overlap":true,"witnesses":1,"reason":"qualified"}'
+  if [[ $MOCK_MODE == bypass-no-correlation ]]; then
+   window='{"attempted":true,"signal_succeeded":true,"overlap":true,"witnesses":1,"rerouted_witnesses":0,"reason":"qualified"}'
+  else
+   window='{"attempted":true,"signal_succeeded":true,"overlap":true,"witnesses":1,"rerouted_witnesses":1,"reason":"qualified"}'
+  fi
  fi
 fi
-printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s,"ingress_reroutes":1,"ingress_reroute_after_signal":true}\n' "$window"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -172,20 +176,26 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in normal bypass bypass-no-correlation shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
+ bypass=none
+ if [[ $mode == bypass || $mode == bypass-no-correlation ]]; then fault=n1; bypass=n2; fi
  [[ $mode != shifted ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" \
+ RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
- if [[ $mode == normal ]]; then
+ if [[ $mode == normal || $mode == bypass ]]; then
   [[ $status == 0 ]]
   jq -e '.fault_overlap.overlap == true and .fault_exit_status == 137 and .receipt_oracle == "sql-insert-id-v1" and (.client_sha256 | length == 64)' "$scratch/$mode/result.json" >/dev/null
   grep -qx 'fault_exit_status=137' "$scratch/$mode/result-fault-metadata.txt"
+  if [[ $mode == bypass ]]; then
+   jq -e '.failure_mode == "ingress-sigkill-benchmark-client-reroute" and .bypass_node == "n2"' "$scratch/$mode/result.json" >/dev/null
+   grep -q -- '-fallback-url http://127.0.0.1:18102' "$scratch/$mode/bench.args"
+  fi
  else
   [[ $status != 0 ]]
   if [[ $mode == wait-* ]]; then
@@ -194,6 +204,7 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
    grep -qx "fault_exit_status=$raw" "$scratch/$mode/result-fault-metadata.txt"
    jq -e --argjson raw "$raw" '.qualification == "not_qualified" and .fault_exit_status == $raw' "$scratch/$mode/result.json" >/dev/null
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
+  elif [[ $mode == bypass-no-correlation ]]; then grep -q 'no successful same-request fault witness' "$scratch/$mode/stderr"
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
@@ -204,4 +215,4 @@ for mode in normal shifted before-first after-last no-witness signal-failure wai
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + nine complete mocked runner cases PASS\n'
+printf 'server oracle helpers + eleven complete mocked runner cases PASS\n'
