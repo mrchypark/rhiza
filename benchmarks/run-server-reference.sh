@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+record_service_child() {
+	[[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 ]] || return 0
+	local child=$1 role=$2 status=$3 state=gone
+	if kill -0 "$child" 2>/dev/null; then state=alive; fi
+	printf '%s\t%s\t%s\t%s\n' "$child" "$role" "$status" "$state" >> "$run_dir/children.tsv"
+}
+
 # The PID remains an owned, unwaited child until wait clears it. Only a running
 # shell job may be signalled; never signal a stale PID after an explicit wait.
 stop_benchmark_child() {
@@ -11,6 +18,7 @@ stop_benchmark_child() {
 	fi
 	local status=0
 	wait "$bench_pid" 2>/dev/null || status=$?
+	record_service_child "$bench_pid" driver "$status"
 	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	bench_pid=
 }
@@ -18,6 +26,7 @@ stop_benchmark_child() {
 wait_benchmark_child() {
 	local status=0
 	wait "$bench_pid" || status=$?
+	record_service_child "$bench_pid" driver "$status"
 	bench_pid=
 	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	return "$status"
@@ -148,8 +157,13 @@ cleanup() {
 		[[ -f $pid_file ]] || continue
 		pid=$(<"$pid_file")
 		if jobs -pr | grep -qx "$pid"; then kill "$pid" 2>/dev/null || true; fi
-		wait "$pid" 2>/dev/null || true
+		child_status=0
+		wait "$pid" 2>/dev/null || child_status=$?
+		record_service_child "$pid" node "$child_status"
 	done
+	if [[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 && -f $run_dir/children.tsv ]]; then
+		cp "$run_dir/children.tsv" "${output_file%.json}-children-cleanup.tsv"
+	fi
 	docker rm -f "$container" >/dev/null 2>&1 || true
 	case "$run_dir" in
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
@@ -159,7 +173,11 @@ trap 'exit_status=$?; trap - EXIT; cleanup; exit "$exit_status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+if [[ -n ${RHIZA_SERVICE_SERVER_BIN:-} ]]; then
+	cp -- "$RHIZA_SERVICE_SERVER_BIN" "$run_dir/rhiza"
+else
+	(cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
+fi
 # Both server revisions use the exact same candidate client/oracle, not each
 # revision's potentially different receipt parser or fault instrumentation.
 (cd "$client_source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
@@ -236,6 +254,38 @@ fi
 curl -fsS -H 'Content-Type: application/json' \
 	-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
 	"$target/sql/execute" >/dev/null
+if [[ ${RHIZA_SERVICE_READ_EXPERIMENT:-0} == 1 ]]; then
+	[[ -x ${RHIZA_SERVICE_READ_DRIVER:-} && -n ${RHIZA_READ_MODE:-} && -n ${RHIZA_READ_SCENARIO:-} ]] || { echo 'missing production read driver or scenario' >&2; exit 2; }
+	curl -fsS -H 'Content-Type: application/json' \
+		-d '{"request_id":"read-seed","sql":"INSERT INTO benchmark_writes(id) VALUES (42)"}' \
+		"$target/sql/execute" > "$run_dir/read-seed.json"
+	secondary="http://127.0.0.1:$((base_http_port + 2))"
+	mkdir "$run_dir/read-fault"
+	RHIZA_READ_PRIMARY="$target" RHIZA_READ_SECONDARY="$secondary" RHIZA_READ_THIRD="http://127.0.0.1:$base_http_port" RHIZA_READ_OUTPUT="$output_file" \
+		RHIZA_READ_FAULT_DIR="$run_dir/read-fault" \
+		"$RHIZA_SERVICE_READ_DRIVER" -test.run '^TestServiceReadDriver$' -test.v &
+	bench_pid=$!
+	if [[ $RHIZA_READ_SCENARIO == dead-ingress ]]; then
+		for _ in {1..500}; do
+			[[ -f $run_dir/read-fault/response-held ]] && break
+			jobs -pr | grep -qx "$bench_pid" || break
+			sleep 0.01
+		done
+		[[ -f $run_dir/read-fault/response-held ]] || { echo 'no held upstream response witness' >&2; exit 1; }
+		pid=$(<"$run_dir/node-$target_index.pid")
+		jobs -pr | grep -qx "$pid" || { echo 'target is not an owned running process' >&2; exit 1; }
+		kill -KILL "$pid"
+		code=0; wait "$pid" || code=$?
+		record_service_child "$pid" node "$code"
+		printf 'signal=SIGKILL\nnode=%s\npid=%s\nexit=%s\nstage=upstream_response_received_then_held\n' "$target_node" "$pid" "$code" > "${output_file%.json}-fault-metadata.txt"
+		[[ $code == 137 ]] || { echo "unexpected fault exit $code" >&2; exit 1; }
+		rm -- "$run_dir/node-$target_index.pid"
+		if curl -fsS --max-time 2 "$target/ready" >/dev/null 2>&1; then echo 'dead ingress still responds' >&2; exit 1; fi
+		: > "$run_dir/read-fault/released"
+	fi
+	wait_benchmark_child
+	exit 0
+fi
 metric_nodes=(n0 n1 n2)
 case "$failed_node" in
 	n0) metric_nodes=(n1 n2) ;;
