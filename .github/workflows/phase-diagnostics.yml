@@ -116,7 +116,7 @@ jobs:
           set -euo pipefail
           go test -race ./cmd/rhiza-bench -count=1
           bash benchmarks/run-server-reference_test.sh
-      - name: Measure healthy, peer failure and ingress reroute
+      - name: Measure healthy, peer failure, ingress failure and ingress reroute
         shell: bash
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/quepaxa-ingress-fault
@@ -133,20 +133,29 @@ jobs:
           } > "$EVIDENCE_DIR/environment.txt" 2>&1
           docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-before.txt"
           result=0
-          for scenario in healthy peer-fault ingress-reroute; do
+          for scenario in healthy peer-fault ingress-no-bypass ingress-reroute; do
+            expect_ingress_failure=0
             case "$scenario" in
               healthy) failed=none; target=n1; bypass=none ;;
               peer-fault) failed=n0; target=n1; bypass=none ;;
+              ingress-no-bypass) failed=n1; target=n1; bypass=none; expect_ingress_failure=1 ;;
               ingress-reroute) failed=n1; target=n1; bypass=n2 ;;
             esac
             RHIZA_SERVER_BENCH_FAILED_NODE="$failed" \
               RHIZA_SERVER_BENCH_TARGET_NODE="$target" \
               RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" \
+              RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE="$expect_ingress_failure" \
               bash benchmarks/run-server-reference.sh "$GITHUB_WORKSPACE" "$EVIDENCE_DIR/$scenario.json" \
               > "$EVIDENCE_DIR/$scenario.log" 2>&1
             code=$?
             printf '%s\n' "$code" > "$EVIDENCE_DIR/$scenario.exit"
-            if [ "$code" -ne 0 ]; then result=1; fi
+            if [ "$scenario" = ingress-no-bypass ]; then
+              if [ "$code" -ne 1 ] || ! jq -e '.qualification == "expected_ingress_failure" and .errors > 0 and .fault_window.overlap == true' "$EVIDENCE_DIR/$scenario.json" > /dev/null; then
+                result=1
+              fi
+            elif [ "$code" -ne 0 ]; then
+              result=1
+            fi
           done
           docker ps -aq --filter name=rhiza-bench-s3- | sort > "$EVIDENCE_DIR/containers-after.txt"
           if ! diff -u "$EVIDENCE_DIR/containers-before.txt" "$EVIDENCE_DIR/containers-after.txt" > "$EVIDENCE_DIR/cleanup-containers.diff"; then result=1; fi

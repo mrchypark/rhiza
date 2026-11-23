@@ -140,6 +140,14 @@ if [[ -n $control ]]; then
   fi
  fi
 fi
+if [[ $MOCK_MODE == client-error ]]; then
+ printf '{"partial":"client evidence"}\n'
+ exit 42
+fi
+if [[ $MOCK_MODE == ingress-no-bypass ]]; then
+ printf '{"requests":4,"successes":2,"errors":2,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
+ exit 0
+fi
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s,"ingress_reroutes":1,"ingress_reroute_after_signal":true}\n' "$window"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
@@ -176,17 +184,19 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal bypass bypass-no-correlation shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in normal bypass bypass-no-correlation ingress-no-bypass client-error shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
  bypass=none
+ expect_ingress_failure=0
  if [[ $mode == bypass || $mode == bypass-no-correlation ]]; then fault=n1; bypass=n2; fi
+ if [[ $mode == ingress-no-bypass ]]; then fault=n1; expect_ingress_failure=1; fi
  [[ $mode != shifted ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" \
+ RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE="$expect_ingress_failure" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal || $mode == bypass ]]; then
   [[ $status == 0 ]]
@@ -203,6 +213,14 @@ for mode in normal bypass bypass-no-correlation shifted before-first after-last 
    [[ $status == "$want" ]]
    grep -qx "fault_exit_status=$raw" "$scratch/$mode/result-fault-metadata.txt"
    jq -e --argjson raw "$raw" '.qualification == "not_qualified" and .fault_exit_status == $raw' "$scratch/$mode/result.json" >/dev/null
+  elif [[ $mode == client-error ]]; then
+   [[ $status == 42 ]]
+   grep -qx 42 "$scratch/$mode/result-client.exit"
+   jq -e '.partial == "client evidence"' "$scratch/$mode/result-client.raw" >/dev/null
+  elif [[ $mode == ingress-no-bypass ]]; then
+   [[ $status == 1 ]]
+   grep -qx 0 "$scratch/$mode/result-client.exit"
+   jq -e '.qualification == "expected_ingress_failure" and .errors == 2 and .fault_window.overlap == true' "$scratch/$mode/result.json" >/dev/null
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
   elif [[ $mode == bypass-no-correlation ]]; then grep -q 'no successful same-request fault witness' "$scratch/$mode/stderr"
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
@@ -215,4 +233,4 @@ for mode in normal bypass bypass-no-correlation shifted before-first after-last 
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + eleven complete mocked runner cases PASS\n'
+printf 'server oracle helpers + thirteen complete mocked runner cases PASS\n'

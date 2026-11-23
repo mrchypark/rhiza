@@ -9,7 +9,9 @@ stop_benchmark_child() {
 	if jobs -pr | grep -qx "$bench_pid"; then
 		kill -KILL "$bench_pid" 2>/dev/null || true
 	fi
-	wait "$bench_pid" 2>/dev/null || true
+	local status=0
+	wait "$bench_pid" 2>/dev/null || status=$?
+	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	bench_pid=
 }
 
@@ -17,6 +19,7 @@ wait_benchmark_child() {
 	local status=0
 	wait "$bench_pid" || status=$?
 	bench_pid=
+	if [[ -n ${output_file:-} ]]; then printf '%s\n' "$status" > "${output_file%.json}-client.exit"; fi
 	return "$status"
 }
 
@@ -69,6 +72,7 @@ concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 bypass_node=${RHIZA_SERVER_BENCH_BYPASS_NODE:-none}
+expect_ingress_failure=${RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE:-0}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
@@ -95,7 +99,15 @@ if [[ $bypass_node != none && $bypass_node != n0 && $bypass_node != n1 && $bypas
 	printf 'RHIZA_SERVER_BENCH_BYPASS_NODE must be none, n0, n1, or n2\n' >&2
 	exit 2
 fi
-if [[ $failed_node == "$target_node" && ($bypass_node == none || $bypass_node == "$target_node") ]]; then
+if [[ $expect_ingress_failure != 0 && $expect_ingress_failure != 1 ]]; then
+	printf 'RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE must be 0 or 1\n' >&2
+	exit 2
+fi
+if [[ $expect_ingress_failure == 1 && ($failed_node != "$target_node" || $bypass_node != none) ]]; then
+	printf 'expected ingress failure requires the target to fail and no bypass\n' >&2
+	exit 2
+fi
+if [[ $failed_node == "$target_node" && ($bypass_node == "$target_node" || ($bypass_node == none && $expect_ingress_failure != 1)) ]]; then
 	printf 'failed ingress requires a distinct bypass node\n' >&2
 	exit 2
 fi
@@ -119,6 +131,9 @@ cleanup() {
 	set +e
 	stop_benchmark_child
 	output_stem=$(basename "$output_file" .json)
+	if [[ -n ${result_file:-} && -f $result_file ]]; then
+		cp "$result_file" "$(dirname "$output_file")/$output_stem-client.raw"
+	fi
 	for log in "$run_dir"/node-*.log; do
 		[[ -f $log ]] || continue
 		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
@@ -294,6 +309,15 @@ if [[ $failed_node != none ]]; then
 		printf 'fault interval not qualified: %s\n' "$(jq -r '.reason // "missing_window"' <<<"$overlap")" >&2
 		exit 1
 	fi
+fi
+if [[ $expect_ingress_failure == 1 ]]; then
+	if ! jq -e '.errors > 0 and .fault_window.overlap == true' <<<"$result" >/dev/null; then
+		printf 'expected ingress failure was not observed or did not overlap\n' >&2
+		exit 1
+	fi
+	jq '. + {qualification:"expected_ingress_failure"}' <<<"$result" > "$output_file"
+	printf 'expected ingress failure observed; run is not a success\n' >&2
+	exit 1
 fi
 count=$(curl -fsS -H 'Content-Type: application/json' \
 	-d "{\"sql\":\"SELECT COUNT(*), COUNT(CASE WHEN id >= 0 AND id < $requests THEN 1 END) FROM benchmark_writes\",\"consistency\":\"linearizable\"}" \
