@@ -148,6 +148,19 @@ if [[ $MOCK_MODE == ingress-no-bypass ]]; then
  printf '{"requests":4,"successes":2,"errors":2,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s}\n' "$window"
  exit 0
 fi
+if [[ $MOCK_MODE == slow-good ]]; then
+ printf '{"requests":4,"successes":3,"errors":1,"error_kinds":{"transport":1,"http_0":1},"slow_proxy_committed":1,"slow_proxy_timeout_witness":1}\n'
+ exit 0
+fi
+if [[ $MOCK_MODE == slow-extra-* ]]; then
+ case "$MOCK_MODE" in
+  slow-extra-receipt) kinds='"transport":1,"http_0":1,"receipt":1,"http_200":1' ;;
+  slow-extra-http) kinds='"transport":1,"http_0":1,"http_503":1' ;;
+  slow-extra-transport) kinds='"transport":2,"http_0":2' ;;
+ esac
+ printf '{"requests":4,"successes":2,"errors":2,"error_kinds":{%s},"slow_proxy_committed":1,"slow_proxy_timeout_witness":1}\n' "$kinds"
+ exit 0
+fi
 printf '{"requests":4,"successes":4,"errors":0,"max_ms":1,"receipt_oracle":"sql-insert-id-v1","fault_window":%s,"ingress_reroutes":1,"ingress_reroute_after_signal":true}\n' "$window"
 MOCK
 cat > "$scratch/bin/curl" <<'MOCK'
@@ -184,19 +197,21 @@ wait() {
 }
 MOCK
 chmod +x "$scratch/bin/"* "$scratch/node" "$scratch/bench"
-for mode in normal bypass bypass-no-correlation ingress-no-bypass client-error shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error; do
+for mode in normal bypass bypass-no-correlation ingress-no-bypass client-error shifted before-first after-last no-witness signal-failure wait-normal wait-crash wait-error slow-good slow-extra-receipt slow-extra-http slow-extra-transport; do
  mkdir "$scratch/$mode"
  # Each run's stand-ins and process evidence remain in its own scratch scope.
  cp "$scratch/node" "$scratch/bench" "$scratch/$mode/"
  fault=n0
  bypass=none
  expect_ingress_failure=0
+ slow_ingress=0
  if [[ $mode == bypass || $mode == bypass-no-correlation ]]; then fault=n1; bypass=n2; fi
  if [[ $mode == ingress-no-bypass ]]; then fault=n1; expect_ingress_failure=1; fi
+ if [[ $mode == slow-* ]]; then fault=none; slow_ingress=1; expect_ingress_failure=1; fi
  [[ $mode != shifted ]] || fault=none
  status=0
  BASH_ENV="$scratch/wait-env" MOCK_HOME="$scratch/$mode" MOCK_MODE="$mode" PATH="$scratch/bin:$PATH" TMPDIR="$scratch/$mode" \
- RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE="$expect_ingress_failure" \
+ RHIZA_SERVER_BENCH_REQUESTS=4 RHIZA_SERVER_BENCH_CONCURRENCY=2 RHIZA_SERVER_BENCH_FAULT_AFTER=0 RHIZA_SERVER_BENCH_FAILED_NODE="$fault" RHIZA_SERVER_BENCH_BYPASS_NODE="$bypass" RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE="$expect_ingress_failure" RHIZA_SERVER_BENCH_SLOW_INGRESS="$slow_ingress" \
  bash "$here/run-server-reference.sh" "$scratch/base-server" "$scratch/$mode/result.json" >"$scratch/$mode/stdout" 2>"$scratch/$mode/stderr" || status=$?
  if [[ $mode == normal || $mode == bypass ]]; then
   [[ $status == 0 ]]
@@ -221,16 +236,22 @@ for mode in normal bypass bypass-no-correlation ingress-no-bypass client-error s
    [[ $status == 1 ]]
    grep -qx 0 "$scratch/$mode/result-client.exit"
    jq -e '.qualification == "expected_ingress_failure" and .errors == 2 and .fault_window.overlap == true' "$scratch/$mode/result.json" >/dev/null
+  elif [[ $mode == slow-good ]]; then
+   [[ $status == 1 ]]
+   jq -e '.qualification == "expected_ingress_failure" and .errors == 1' "$scratch/$mode/result.json" >/dev/null
+  elif [[ $mode == slow-extra-* ]]; then
+   [[ $status == 1 ]]
+   jq -e 'has("qualification") | not' "$scratch/$mode/result.json" >/dev/null
   elif [[ $mode == signal-failure ]]; then [[ $status == 47 ]];
   elif [[ $mode == bypass-no-correlation ]]; then grep -q 'no successful same-request fault witness' "$scratch/$mode/stderr"
   elif [[ $mode != shifted ]]; then grep -Eq 'fault (coordinator failed|interval not qualified)' "$scratch/$mode/stderr"; fi
  fi
  grep -q -- '-verify-insert-receipt' "$scratch/$mode/bench.args"
- if [[ $mode != shifted ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
+ if [[ $mode != shifted && $mode != slow-* ]]; then grep -q -- '-fault-start-time 123' "$scratch/$mode/bench.args"; fi
  grep -Fq "$scratch/base-server|build -o" "$scratch/$mode/builds"
  grep -Fq "$(cd "$here/.." && pwd)|build -o" "$scratch/$mode/builds"
  while IFS= read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then printf 'mock owned process survived: %s\n' "$pid" >&2; exit 1; fi
  done < <(cat "$scratch/$mode/nodes" "$scratch/$mode/bench.pid")
 done
-printf 'server oracle helpers + thirteen complete mocked runner cases PASS\n'
+printf 'server oracle helpers + seventeen complete mocked runner cases PASS\n'

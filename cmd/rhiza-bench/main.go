@@ -23,33 +23,36 @@ import (
 )
 
 type result struct {
-	Requests           int               `json:"requests"`
-	Successes          int               `json:"successes"`
-	Errors             uint64            `json:"errors"`
-	Retries            uint64            `json:"retries,omitempty"`
-	DurationMS         float64           `json:"duration_ms"`
-	OpsPerSec          float64           `json:"ops_per_sec"`
-	SuccessOpsPerSec   float64           `json:"success_ops_per_sec"`
-	P50MS              float64           `json:"p50_ms"`
-	P95MS              float64           `json:"p95_ms"`
-	P99MS              float64           `json:"p99_ms"`
-	MaxMS              float64           `json:"max_ms"`
-	ErrorP50MS         float64           `json:"error_p50_ms,omitempty"`
-	ErrorP95MS         float64           `json:"error_p95_ms,omitempty"`
-	ErrorP99MS         float64           `json:"error_p99_ms,omitempty"`
-	ErrorKinds         map[string]uint64 `json:"error_kinds,omitempty"`
-	ErrorSamples       map[string]string `json:"error_samples,omitempty"`
-	ReceiptOracle      string            `json:"receipt_oracle,omitempty"`
-	FaultOverlap       bool              `json:"fault_overlap_control,omitempty"`
-	FaultWindow        *faultWindow      `json:"fault_window,omitempty"`
-	IngressReroutes    uint64            `json:"ingress_reroutes,omitempty"`
-	RerouteAfterSignal bool              `json:"ingress_reroute_after_signal,omitempty"`
-	RerouteSuccesses   int               `json:"reroute_successes,omitempty"`
-	RerouteP50MS       float64           `json:"reroute_p50_ms,omitempty"`
-	RerouteP95MS       float64           `json:"reroute_p95_ms,omitempty"`
-	RerouteP99MS       float64           `json:"reroute_p99_ms,omitempty"`
-	RerouteMaxMS       float64           `json:"reroute_max_ms,omitempty"`
-	RerouteErrors      int               `json:"reroute_errors,omitempty"`
+	Requests            int               `json:"requests"`
+	Successes           int               `json:"successes"`
+	Errors              uint64            `json:"errors"`
+	Retries             uint64            `json:"retries,omitempty"`
+	DurationMS          float64           `json:"duration_ms"`
+	OpsPerSec           float64           `json:"ops_per_sec"`
+	SuccessOpsPerSec    float64           `json:"success_ops_per_sec"`
+	P50MS               float64           `json:"p50_ms"`
+	P95MS               float64           `json:"p95_ms"`
+	P99MS               float64           `json:"p99_ms"`
+	MaxMS               float64           `json:"max_ms"`
+	ErrorP50MS          float64           `json:"error_p50_ms,omitempty"`
+	ErrorP95MS          float64           `json:"error_p95_ms,omitempty"`
+	ErrorP99MS          float64           `json:"error_p99_ms,omitempty"`
+	ErrorKinds          map[string]uint64 `json:"error_kinds,omitempty"`
+	ErrorSamples        map[string]string `json:"error_samples,omitempty"`
+	ReceiptOracle       string            `json:"receipt_oracle,omitempty"`
+	FaultOverlap        bool              `json:"fault_overlap_control,omitempty"`
+	FaultWindow         *faultWindow      `json:"fault_window,omitempty"`
+	IngressReroutes     uint64            `json:"ingress_reroutes,omitempty"`
+	RerouteAfterSignal  bool              `json:"ingress_reroute_after_signal,omitempty"`
+	RerouteSuccesses    int               `json:"reroute_successes,omitempty"`
+	RerouteP50MS        float64           `json:"reroute_p50_ms,omitempty"`
+	RerouteP95MS        float64           `json:"reroute_p95_ms,omitempty"`
+	RerouteP99MS        float64           `json:"reroute_p99_ms,omitempty"`
+	RerouteMaxMS        float64           `json:"reroute_max_ms,omitempty"`
+	RerouteErrors       int               `json:"reroute_errors,omitempty"`
+	SlowCommitted       uint64            `json:"slow_proxy_committed,omitempty"`
+	SlowReroutedWitness uint64            `json:"slow_proxy_rerouted_witness,omitempty"`
+	SlowTimeoutWitness  uint64            `json:"slow_proxy_timeout_witness,omitempty"`
 }
 
 func main() {
@@ -60,6 +63,7 @@ func main() {
 	requests := flag.Int("n", 1000, "request count")
 	concurrency := flag.Int("c", 16, "worker count")
 	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
+	slowResponse := flag.Duration("slow-first-response", 0, "delay first verified committed ingress response (test only)")
 	commitUnknownRetries := flag.Int("commit-unknown-retries", 0, "maximum same-request retries after commit_unknown")
 	verifyInsert := flag.Bool("verify-insert-receipt", false, "verify benchmark INSERT committed receipt and exact id")
 	faultControlFile := flag.String("fault-control-file", "", "optional owned file for loopback fault overlap control URL")
@@ -74,6 +78,21 @@ func main() {
 	client := &http.Client{Timeout: *timeout, Transport: &http.Transport{
 		MaxIdleConns: *concurrency, MaxIdleConnsPerHost: *concurrency, MaxConnsPerHost: *concurrency,
 	}}
+	var slow *slowIngress
+	if *slowResponse != 0 {
+		if *slowResponse <= *timeout || !*verifyInsert || *requests < 1 {
+			fmt.Fprintln(os.Stderr, "slow response must exceed timeout and requires insert receipt validation")
+			os.Exit(2)
+		}
+		var err error
+		slow, err = startSlowIngress(*baseURL, *slowResponse)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer slow.Close()
+		*baseURL = slow.url
+	}
 	jobs := make(chan int)
 	latencies := make([]time.Duration, 0, *requests)
 	errorLatencies := make([]time.Duration, 0)
@@ -83,6 +102,8 @@ func main() {
 	var failures atomic.Uint64
 	var retries atomic.Uint64
 	var ingressReroutes atomic.Uint64
+	var slowReroutedWitness atomic.Uint64
+	var slowTimeoutWitness atomic.Uint64
 	var useFallback atomic.Bool
 	var transportFailures atomic.Uint64
 	var receiptFailures atomic.Uint64
@@ -153,6 +174,12 @@ func main() {
 				status, sample, retryCount, requestErr, rerouteAt := doRequestWithFallback(requestCtx, client, method, *baseURL+*requestPath, *fallbackURL, *requestPath, payload, *commitUnknownRetries, *verifyInsert, &useFallback, &ingressReroutes, progress)
 				completed := time.Now()
 				succeeded := requestErr == nil && status >= 200 && status < 300
+				if slow != nil && slow.delayedID.Load() == int64(id) && !rerouteAt.IsZero() && succeeded {
+					slowReroutedWitness.Add(1)
+				}
+				if slow != nil && slow.isDelayedTimeout(id, rerouteAt, requestErr) {
+					slowTimeoutWitness.Add(1)
+				}
 				if progress != nil {
 					progress.recordOutcome(id, rerouteAt, completed, succeeded)
 				}
@@ -257,6 +284,11 @@ func main() {
 		IngressReroutes:  ingressReroutes.Load(),
 		RerouteSuccesses: len(rerouteLatencies), RerouteErrors: rerouteErrors,
 		RerouteP50MS: quantile(rerouteLatencies, .50), RerouteP95MS: quantile(rerouteLatencies, .95), RerouteP99MS: quantile(rerouteLatencies, .99), RerouteMaxMS: quantile(rerouteLatencies, 1),
+	}
+	if slow != nil {
+		output.SlowCommitted = slow.committed.Load()
+		output.SlowReroutedWitness = slowReroutedWitness.Load()
+		output.SlowTimeoutWitness = slowTimeoutWitness.Load()
 	}
 	if progress != nil {
 		window := progress.window()

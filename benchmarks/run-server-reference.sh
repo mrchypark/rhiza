@@ -72,6 +72,7 @@ concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 bypass_node=${RHIZA_SERVER_BENCH_BYPASS_NODE:-none}
+slow_ingress=${RHIZA_SERVER_BENCH_SLOW_INGRESS:-0}
 expect_ingress_failure=${RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE:-0}
 durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
@@ -103,7 +104,9 @@ if [[ $expect_ingress_failure != 0 && $expect_ingress_failure != 1 ]]; then
 	printf 'RHIZA_SERVER_BENCH_EXPECT_INGRESS_FAILURE must be 0 or 1\n' >&2
 	exit 2
 fi
-if [[ $expect_ingress_failure == 1 && ($failed_node != "$target_node" || $bypass_node != none) ]]; then
+if [[ $slow_ingress != 0 && $slow_ingress != 1 ]]; then printf 'slow ingress must be 0 or 1\n' >&2; exit 2; fi
+if [[ $slow_ingress == 1 && $failed_node != none ]]; then printf 'slow ingress cannot be combined with node kill\n' >&2; exit 2; fi
+if [[ $expect_ingress_failure == 1 && (($failed_node != "$target_node" && $slow_ingress != 1) || $bypass_node != none) ]]; then
 	printf 'expected ingress failure requires the target to fail and no bypass\n' >&2
 	exit 2
 fi
@@ -111,7 +114,7 @@ if [[ $failed_node == "$target_node" && ($bypass_node == "$target_node" || ($byp
 	printf 'failed ingress requires a distinct bypass node\n' >&2
 	exit 2
 fi
-if [[ $bypass_node != none && ($failed_node != "$target_node" || $bypass_node == "$target_node") ]]; then
+if [[ $bypass_node != none && (($failed_node != "$target_node" && $slow_ingress != 1) || $bypass_node == "$target_node") ]]; then
 	printf 'bypass mode requires the failed node to be the target and a distinct bypass node\n' >&2
 	exit 2
 fi
@@ -250,6 +253,7 @@ object_stats() {
 object_before=$(object_stats)
 result_file="$run_dir/result.json"
 control_args=()
+if [[ $slow_ingress == 1 ]]; then control_args=(-timeout 500ms -slow-first-response 2s); fi
 if [[ $failed_node != none ]]; then
 	failed_index=${failed_node#n}
 	failed_pid=$(<"$run_dir/node-$failed_index.pid")
@@ -311,7 +315,9 @@ if [[ $failed_node != none ]]; then
 	fi
 fi
 if [[ $expect_ingress_failure == 1 ]]; then
-	if ! jq -e '.errors > 0 and .fault_window.overlap == true' <<<"$result" >/dev/null; then
+	if [[ $slow_ingress == 1 ]]; then
+		jq -e --argjson requests "$requests" '.errors == 1 and .successes == ($requests - 1) and .error_kinds == {"transport":1,"http_0":1} and .slow_proxy_committed == 1 and .slow_proxy_timeout_witness == 1' <<<"$result" >/dev/null || exit 1
+	elif ! jq -e '.errors > 0 and .fault_window.overlap == true' <<<"$result" >/dev/null; then
 		printf 'expected ingress failure was not observed or did not overlap\n' >&2
 		exit 1
 	fi
@@ -328,7 +334,9 @@ object_delta=$(jq -nc --argjson before "$object_before" --argjson after "$object
 		({}; .[$key] = (($after[$key] // 0) - ($before[$key] // 0)))')
 object_metric_nodes=$(printf '%s\n' "${metric_nodes[@]}" | jq -R . | jq -sc .)
 jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests and .receipt_oracle == "sql-insert-id-v1"' <<<"$result" >/dev/null
-if [[ $bypass_node != none ]]; then
+if [[ $bypass_node != none && $slow_ingress == 1 ]]; then
+	jq -e '.slow_proxy_committed == 1 and .slow_proxy_rerouted_witness == 1 and .ingress_reroutes > 0 and .reroute_successes > 0' <<<"$result" >/dev/null || exit 1
+elif [[ $bypass_node != none ]]; then
 	if ! jq -e '.ingress_reroutes > 0 and .ingress_reroute_after_signal == true and .fault_window.rerouted_witnesses > 0' <<<"$result" >/dev/null; then
 		printf 'ingress reroute not qualified: no successful same-request fault witness\n' >&2
 		exit 1
@@ -340,7 +348,7 @@ for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg bypass_node "$bypass_node" --arg durability "$durability" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" elif $bypass_node != "none" then "ingress-sigkill-benchmark-client-reroute" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,bypass_node:$bypass_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson overlap "$overlap" --argjson fault_exit_status "$fault_exit_status" --arg client_revision "$client_revision" --arg client_sha256 "$client_sha256" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg bypass_node "$bypass_node" --arg durability "$durability" --arg fault_after "$fault_after" --arg slow_ingress "$slow_ingress" \
+	'{transport:"HTTP client + three QUIC voters",client_revision:$client_revision,client_sha256:$client_sha256,receipt_oracle:"sql-insert-id-v1",fault_overlap:$overlap,fault_exit_status:$fault_exit_status,fault_instrumentation:(if $failed_node == "none" then "disabled" else "pidfd-single-coordinator-monotonic-interval-v2" end),durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $slow_ingress == "1" then "committed-response-delay-proxy" elif $failed_node == "none" then "healthy" elif $bypass_node != "none" then "ingress-sigkill-benchmark-client-reroute" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,bypass_node:$bypass_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null
