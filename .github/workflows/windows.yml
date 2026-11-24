@@ -54,6 +54,16 @@ jobs:
         run: |
           go build ./...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Observe directory flush API results
+        shell: pwsh
+        run: |
+          $tests = go test ./pkg/qlog -list '^TestWindowsDirectoryFlushDiagnostics$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -contains 'TestWindowsDirectoryFlushDiagnostics')) {
+            throw 'Required Windows directory flush diagnostic was not compiled'
+          }
+          go test ./pkg/qlog -run '^TestWindowsDirectoryFlushDiagnostics$' -v -count=1 -timeout=2m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify WAL lock and recovery on Windows
         shell: pwsh
         run: |
