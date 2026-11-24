@@ -170,7 +170,9 @@ jobs:
         run: cargo test --manifest-path sdk/rust/Cargo.toml --locked --all-targets
       - name: Standalone crates.io package
         run: |
+          sh sdk/rust/scripts/test-package-source-guard.sh
           sh sdk/rust/scripts/ci-package-artifact_test.sh
+          sh sdk/rust/scripts/publish-verified-crate_test.sh
           sh sdk/rust/scripts/ci-package-artifact.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/crate-package"
       - name: Verified source crate (Ubuntu only)
         if: runner.os == 'Linux'

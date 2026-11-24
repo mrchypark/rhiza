@@ -66,6 +66,13 @@ fn main() {
     {
         adjacent
     } else {
+        // A prebuilt archive must not hide an incomplete published source crate.
+        if !native.join("go.mod").is_file()
+            || !native.join("cmd/rhiza-ffi/main.go").is_file()
+            || !native.join("vendor/modules.txt").is_file()
+        {
+            panic!("incomplete rhizadb package: bundled native Go sources are missing; publish using sdk/rust/scripts/stage-crate.sh");
+        }
         native
     };
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
