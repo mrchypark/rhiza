@@ -12,6 +12,11 @@
 # go to stderr.
 set -eu
 
+[ "${DOCS_RS+x}" != x ] && [ "${RHIZA_NATIVE_LIB_DIR+x}" != x ] || {
+    echo 'FAIL crate staging requires bundled native source verification' >&2
+    exit 1
+}
+
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 sdk_dir=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 repo_dir=$(CDPATH='' cd -- "$sdk_dir/../.." && pwd)

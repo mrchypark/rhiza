@@ -26,6 +26,23 @@ For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers
 refresh the bundled native tree with `prepare-native.sh`; releases stage it with
 `stage-crate.sh`.
 
+Maintainers must publish the complete verified stage, not `sdk/rust` directly.
+Unset `DOCS_RS` and `RHIZA_NATIVE_LIB_DIR`, and retain the new evidence directory:
+
+```sh
+unset DOCS_RS RHIZA_NATIVE_LIB_DIR
+sh sdk/rust/scripts/publish-verified-crate.sh HEAD /path/to/new-release-evidence
+```
+
+The script checks the complete native inventory, source bytes and modes against
+an exact-commit stage, builds the extracted package without a prebuilt archive,
+then compares a fresh publish stage with that verified package. It publishes
+with Cargo's configured credential provider and compares registry bytes after
+publication. A post-publication mismatch or readback failure cannot undo a
+published crate; inspect the registry before attempting another publication.
+`--no-verify`, `DOCS_RS`, or direct `cargo publish` bypass this release process
+and must not be used for releases.
+
 ## Known issues
 
 `rhizadb` 0.15.2 and earlier fail to open a database when the data directory is
