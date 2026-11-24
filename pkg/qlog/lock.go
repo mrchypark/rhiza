@@ -3,7 +3,6 @@ package qlog
 import (
 	"fmt"
 	"os"
-	"syscall"
 )
 
 // LockFile prevents multiple processes from using the same WAL directory.
@@ -25,10 +24,10 @@ func Acquire(dir string) (bool, *LockFile, error) {
 	}
 
 	// Try exclusive lock (non-blocking)
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	err = lockWAL(f)
 	if err != nil {
 		f.Close()
-		if err == syscall.EWOULDBLOCK {
+		if isWALLocked(err) {
 			return false, nil, fmt.Errorf("another process is using this WAL")
 		}
 		return false, nil, fmt.Errorf("acquire lock: %w", err)
@@ -68,7 +67,7 @@ func (lf *LockFile) Release() error {
 	if err := lf.file.Sync(); err != nil {
 		return err
 	}
-	if err := syscall.Flock(int(lf.file.Fd()), syscall.LOCK_UN); err != nil {
+	if err := unlockWAL(lf.file); err != nil {
 		return err
 	}
 	err := lf.file.Close()

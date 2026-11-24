@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -682,14 +681,6 @@ type localCheckpointFileWriter struct{ file *os.File }
 
 func (w localCheckpointFileWriter) Write(data []byte) (int, error) {
 	return localCheckpointWriteFile(w.file, data)
-}
-
-func localFreeBytes(path string) (uint64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, err
-	}
-	return uint64(stat.Bavail) * uint64(stat.Bsize), nil
 }
 
 func (identity localCheckpointIdentity) checkpointDiskUsage() (uint64, error) {

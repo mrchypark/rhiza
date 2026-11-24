@@ -1,0 +1,91 @@
+name: Windows native
+
+on:
+  pull_request:
+  push:
+    branches: [main, feature/windows-native-qualification]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    name: Windows native (${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            goarch: amd64
+            runner_arch: X64
+          - runner: windows-11-arm
+            goarch: arm64
+            runner_arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify native operating system and architecture
+        shell: pwsh
+        env:
+          EXPECTED_GOARCH: ${{ matrix.goarch }}
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          ACTUAL_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go version
+          $goos = go env GOOS
+          $goarch = go env GOARCH
+          $osarch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          $processarch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($goos -ne 'windows' -or $goarch -ne $env:EXPECTED_GOARCH -or $env:ACTUAL_RUNNER_ARCH -ne $env:EXPECTED_RUNNER_ARCH -or $osarch -ne $env:EXPECTED_RUNNER_ARCH -or $processarch -ne $env:EXPECTED_RUNNER_ARCH) {
+            throw "Expected native Windows $env:EXPECTED_GOARCH/$env:EXPECTED_RUNNER_ARCH; got $goos/$goarch/$env:ACTUAL_RUNNER_ARCH/$osarch/$processarch"
+          }
+      - name: Build Go packages
+        shell: pwsh
+        run: |
+          go build ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify WAL lock and recovery on Windows
+        shell: pwsh
+        run: |
+          $tests = go test ./pkg/qlog -list '^TestWindowsLockExcludesProcessAndRecoversAfterDeath$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -contains 'TestWindowsLockExcludesProcessAndRecoversAfterDeath')) {
+            throw 'Required Windows cross-process lock and termination test was not compiled'
+          }
+          go test ./pkg/qlog -count=1 -timeout=10m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify atomic directory behavior
+        shell: pwsh
+        run: |
+          go test ./internal/atomicdir -count=1 -timeout=5m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify local disk free-space query
+        shell: pwsh
+        run: |
+          $tests = go test ./pkg/node -list '^TestLocalFreeBytes$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -contains 'TestLocalFreeBytes')) {
+            throw 'Required Windows disk free-space test was not compiled'
+          }
+          go test ./pkg/node -run '^TestLocalFreeBytes$' -v -count=1 -timeout=5m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify public Local API persistence and restart
+        shell: pwsh
+        run: |
+          $tests = go test . -list '^TestWindowsPublicAPIRestart$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($tests -contains 'TestWindowsPublicAPIRestart')) {
+            throw 'Required public API restart test was not compiled'
+          }
+          go test . -run '^TestWindowsPublicAPIRestart$' -v -count=1 -timeout=10m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

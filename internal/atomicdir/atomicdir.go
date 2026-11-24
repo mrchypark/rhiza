@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package atomicdir provides descriptor-relative, no-replace directory moves.
 package atomicdir
 
