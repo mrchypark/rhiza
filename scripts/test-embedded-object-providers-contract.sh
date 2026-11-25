@@ -27,6 +27,7 @@ for ref in "$s3_ref" "$gcs_ref" "$azure_ref"; do
 done
 check_floci_ref "$k8s" "$s3_ref"
 eval "$(sed -n '/^ffi_verify_log() {/,/^}/p' "$driver")"
+eval "$(sed -n '/^retention_verify_log() {/,/^}/p' "$driver")"
 eval "$(sed -n '/^ffi_owned_endpoint() {/,/^}/p' "$driver")"
 eval "$(sed -n '/^ffi_wait() {/,/^}/p' "$driver")"
 eval "$(sed -n '/^cleanup() {/,/^}/p' "$driver")"
@@ -40,6 +41,17 @@ for bad in missing skip fail duplicate; do
  duplicate) printf '%s\n' '--- PASS: TestNotificationFFIThreeNode (1.00s)' '--- PASS: TestNotificationFFIThreeNode (1.00s)' '--- PASS: TestManagedStartupBudgetKeepsRealCorePeerUntilClose (0.10s)' > "$scratch/log" ;;
  esac
  if ffi_verify_log "$scratch/log"; then echo "accepted $bad evidence" >&2; exit 1; fi
+done
+printf '%s\n' '--- PASS: TestManagedRetentionThreeProcessesRestart (1.00s)' > "$scratch/retention-log"
+retention_verify_log "$scratch/retention-log"
+for bad in missing skip fail duplicate; do
+ case "$bad" in
+ missing) : > "$scratch/retention-log" ;;
+ skip) printf '%s\n' '--- SKIP: TestManagedRetentionThreeProcessesRestart (0.00s)' > "$scratch/retention-log" ;;
+ fail) printf '%s\n' '--- FAIL: TestManagedRetentionThreeProcessesRestart (0.00s)' > "$scratch/retention-log" ;;
+ duplicate) printf '%s\n' '--- PASS: TestManagedRetentionThreeProcessesRestart (1.00s)' '--- PASS: TestManagedRetentionThreeProcessesRestart (1.00s)' > "$scratch/retention-log" ;;
+ esac
+ if retention_verify_log "$scratch/retention-log"; then echo "accepted $bad retention evidence" >&2; exit 1; fi
 done
 printf '%s\n' '[{"Id":"container","State":{"Running":true},"Config":{"Labels":{"rhiza.embedded-test":"owner"}},"NetworkSettings":{"Networks":{"owned-s3":{"NetworkID":"network","IPAddress":"172.18.0.2"}}}}]' > "$scratch/inspect.json"
 [ "$(ffi_owned_endpoint "$scratch/inspect.json" container network owned-s3 owner)" = 172.18.0.2:4566 ]
@@ -72,5 +84,38 @@ for child_code in 0 17; do
   grep -Fx "cleanup_failed=$cleanup_error" "$case_dir/evidence/cleanup.txt" >/dev/null
   grep -Fx "final_exit=$expected" "$case_dir/evidence/cleanup.txt" >/dev/null
  done
+done
+# A failed or interrupted qualification still removes only its own anonymous
+# volume after saving logs; failed evidence capture must preserve the container.
+for scenario in failure interruption logfail mountfail; do
+ case_dir="$scratch/retention-cleanup-$scenario"
+ mkdir -p "$case_dir/owned"
+ touch "$case_dir/container" "$case_dir/volume"
+ if (
+  containers=owned; networks=''; image_built=0; result=1
+  retention_required=1; run_dir="$case_dir/owned"; ffi_evidence=''; ffi_child=''; run_name=mock
+  docker() {
+   case "$1 $2" in
+   'inspect owned')
+    [ -f "$case_dir/container" ] || return 1
+    if [ "$#" -gt 2 ]; then [ "$scenario" != mountfail ] || return 1; printf '%s\n' anonymous; fi ;;
+   'logs owned') [ "$scenario" != logfail ] || return 1; printf '%s\n' 'saved logs' ;;
+   'rm -f') [ "$3" = -v ] && [ "$4" = owned ] || return 1; rm "$case_dir/container" "$case_dir/volume" ;;
+   'volume inspect') [ -f "$case_dir/volume" ] ;;
+   *) return 1 ;;
+   esac
+  }
+  trap cleanup EXIT
+  [ "$scenario" != interruption ] || exit 130
+  exit 17
+ ); then actual=0; else actual=$?; fi
+ case "$scenario" in
+ failure|interruption)
+  [ ! -e "$case_dir/container" ] && [ ! -e "$case_dir/volume" ]
+  grep -F 'saved logs' "$case_dir/owned/owned.log" >/dev/null
+  grep -F 'anonymous removed; data not recoverable' "$case_dir/owned/owned-volume-cleanup.txt" >/dev/null ;;
+ logfail|mountfail) [ -e "$case_dir/container" ] && [ -e "$case_dir/volume" ] ;;
+ esac
+ case "$scenario:$actual" in interruption:130|*:17) ;; *) exit 1 ;; esac
 done
 echo 'PASS: exact FFI evidence, owned Floci endpoint predicates, and expected Floci references present'

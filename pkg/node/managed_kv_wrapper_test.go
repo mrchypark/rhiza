@@ -51,6 +51,10 @@ func kvWrapperDurable(ctx context.Context, n *Node, slot quepaxa.Slot) error {
 }
 
 func newKVWrapperFixture(t *testing.T, sharedStore ...localobj.Config) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
+	return newKVWrapperFixtureWindow(t, 0, sharedStore...)
+}
+
+func newKVWrapperFixtureWindow(t *testing.T, window uint64, sharedStore ...localobj.Config) (*Node, *kvWrapperChecker, *managedGraphAdmissionRaceFixture) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -105,7 +109,7 @@ func newKVWrapperFixture(t *testing.T, sharedStore ...localobj.Config) (*Node, *
 			t.Fatal(err)
 		}
 		identity := ManagedStartupIdentity{ApplicationProtocol: protocol, EvidenceFormat: protocol, AssignmentID: "assignment", IntentHash: "intent", StorageID: "storage", PhysicalBinding: physical, BootstrapPlanDigest: common, Member: recovery.PreparedStartupIdentity{ClusterUID: "uid", DeploymentUID: "deployment", PodUID: string(member.ID), NodeID: string(member.ID), SourceBinding: physical, ConfigDigest: memberDigest}}
-		n.managedStartup = &ManagedStartupConfig{Identity: identity, Checker: c, expectedPolicy: sqlpolicy.ManagedRequestMaterializationPolicy}
+		n.managedStartup = &ManagedStartupConfig{Identity: identity, Checker: c, expectedPolicy: sqlpolicy.ManagedRequestMaterializationPolicy, idempotencyWindow: window}
 		// Match public startup ordering: claim exact birth intent before any
 		// voter registration consumes the shared namespace's empty boundary.
 		if fresh, err := n.PrepareManagedSQLSource(ctx, identity, true); err != nil || !fresh {

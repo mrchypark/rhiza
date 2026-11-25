@@ -10,6 +10,32 @@ permissions:
   contents: read
 
 jobs:
+  managed-retention-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify managed retention across voter process restart
+        env:
+          RHIZA_EMBEDDED_RETENTION_REQUIRED: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          sh scripts/test-embedded-object-providers.sh 2>&1 | tee "$RUNNER_TEMP/managed-retention-process.log"
+      - name: Preserve managed retention evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-retention-process-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/managed-retention-process.log
+            /tmp/rhiza-embedded-providers.*/*.log
+            /tmp/rhiza-embedded-providers.*/selected-tests.txt
+
   embedded-object-storage-providers:
     runs-on: ubuntu-latest
     timeout-minutes: 30

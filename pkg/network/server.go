@@ -215,6 +215,28 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 	return s.propose(ctx, value)
 }
 
+// ProposeRetentionControl waits for accepted work to actually finish, even if
+// its deadline expires, so the maintenance worker cannot overlap proposals.
+func (s *Server) ProposeRetentionControl(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
+		return 0, fmt.Errorf("read barrier control value is required")
+	}
+	return s.proposeWithAdmission(ctx, value, nil, 0, 0, nil, nil, true)
+}
+
+// ProposeLocalRetentionControl keeps an accepted Local maintenance barrier
+// alive until completion or server shutdown, including any WAL reclamation.
+// It must only be used by the node's single retention maintenance worker.
+func (s *Server) ProposeLocalRetentionControl(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if !s.localMode {
+		return 0, fmt.Errorf("Local retention control requires Local mode")
+	}
+	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
+		return 0, fmt.Errorf("read barrier control value is required")
+	}
+	return s.proposeWithAdmission(ctx, value, nil, 0, 0, nil, nil, true)
+}
+
 // ProposeCheckpointBarrier is reserved for the checkpoint publisher's internal
 // read barrier. General control proposals retain ProposeControl semantics.
 func (s *Server) ProposeCheckpointBarrier(ctx context.Context, value []byte) (quepaxa.Slot, error) {
@@ -279,12 +301,13 @@ func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
 }
 
 type proposalCall struct {
-	done        chan struct{}
-	slot        quepaxa.Slot
-	err         error
-	deadline    time.Time
-	hasDeadline bool
-	leases      []*mutationLease
+	done             chan struct{}
+	slot             quepaxa.Slot
+	err              error
+	deadline         time.Time
+	hasDeadline      bool
+	retentionControl bool
+	leases           []*mutationLease
 }
 
 // NewServer creates a legacy-policy HTTP server. Incompatible explicit
@@ -644,7 +667,7 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 }
 
 func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *mutationLease) (quepaxa.Slot, error) {
-	return s.proposeWithAdmission(ctx, value, lease, 0, 0, nil, nil)
+	return s.proposeWithAdmission(ctx, value, lease, 0, 0, nil, nil, false)
 }
 
 // These finite bounds are an uncalibrated internal-batch candidate. Direct
@@ -661,11 +684,11 @@ func (s *Server) proposeInternalBatch(ctx context.Context, value []byte) (quepax
 // proposeBatch permits same-package tests to use shorter finite bounds.
 func (s *Server) proposeBatch(ctx context.Context, value []byte, admissionBudget, executionReserve time.Duration) (quepaxa.Slot, error) {
 	if !localtesthooks.Enabled {
-		return s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, nil, nil)
+		return s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, nil, nil, false)
 	}
 	trace := localtesthooks.NewBatchAdmissionTrace()
 	result := &batchAdmissionResult{}
-	slot, err := s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, &trace, result)
+	slot, err := s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, &trace, result, false)
 	reason := result.reason
 	if reason == "" {
 		switch {
@@ -701,7 +724,7 @@ func (s *Server) signalAdmissionLocked(invalidate bool) {
 	s.admissionChanged = make(chan struct{})
 }
 
-func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult) (quepaxa.Slot, error) {
+func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult, retentionControl bool) (quepaxa.Slot, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -732,6 +755,10 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			return 0, ErrNotReady
 		}
 		if call := s.inflight[hash]; call != nil {
+			if retentionControl && !call.retentionControl {
+				s.proposeMu.Unlock()
+				return 0, proposalAdmissionOverload{}
+			}
 			if !s.retainProposalLease(call, lease) {
 				s.proposeMu.Unlock()
 				return 0, ErrInvalidRequest
@@ -743,6 +770,10 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			}
 			select {
 			case <-ctx.Done():
+				if retentionControl {
+					<-call.done
+					return call.slot, call.err
+				}
 				return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
 			case <-call.done:
 				return call.slot, call.err
@@ -826,7 +857,7 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 			s.proposeMu.Unlock()
 			return 0, proposalAdmissionOverload{}
 		}
-		call := &proposalCall{done: make(chan struct{})}
+		call := &proposalCall{done: make(chan struct{}), retentionControl: retentionControl}
 		if !s.retainProposalLease(call, lease) {
 			<-s.operationCap
 			<-s.localCap
@@ -847,6 +878,10 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
+			if retentionControl {
+				<-call.done
+				return call.slot, call.err
+			}
 			return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
 		case <-call.done:
 			return call.slot, call.err
@@ -918,6 +953,9 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	ctx, cancel := s.proposalWorkContext(call)
 	defer cancel()
+	if call.retentionControl {
+		localtesthooks.Hit("network:retention-control:accepted")
+	}
 	var coreStarted, prewriteDenied bool
 	call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
 	if s.localMode && prewriteDenied {
@@ -967,6 +1005,9 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 }
 
 func (s *Server) proposalWorkContext(call *proposalCall) (context.Context, context.CancelFunc) {
+	if s.localMode && call.retentionControl {
+		return context.WithCancel(s.proposalCtx)
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	if call.hasDeadline && call.deadline.Before(deadline) {
 		deadline = call.deadline

@@ -85,6 +85,7 @@ type Materializer struct {
 	materializationPolicy    sqlpolicy.MaterializationPolicy
 	commitUnknown            bool
 	sqlReceiptRetention      sqlReceiptRetentionUsage
+	sqlRetentionPlan         sqlRetentionBarrierPlan
 	afterApplyCommitError    func() error
 	recentSQLReceipts        map[string]storedReceipt
 	pendingSQLReceipts       []pendingSQLReceipt

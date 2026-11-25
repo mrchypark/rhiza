@@ -49,6 +49,13 @@ type Node struct {
 	localOwner                   *objectstore.LocalFilesystemOwner
 	localBackupReady             bool
 	localBackupNeedsSnapshot     bool
+	sqlRetentionBarrierAttempts  atomic.Uint64
+	sqlRetentionBarrierCompleted atomic.Uint64
+	sqlRetentionBarrierErrors    atomic.Uint64
+	sqlRetentionBarrierTarget    atomic.Uint64
+	sqlRetentionScannedTip       atomic.Uint64
+	sqlRetentionScanned          atomic.Bool
+	sqlRetentionQuorumBlocked    atomic.Bool
 	localGCContext               context.Context
 	localGCCancel                context.CancelFunc
 	localSnapshotMu              sync.Mutex
@@ -1016,8 +1023,12 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 			replayGroupingEnabled = 1
 		}
 		return map[string]uint64{
-			"replay_grouping_enabled": replayGroupingEnabled,
-			"uploads":                 stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
+			"sql_retention_barrier_attempts":  n.sqlRetentionBarrierAttempts.Load(),
+			"sql_retention_barrier_completed": n.sqlRetentionBarrierCompleted.Load(),
+			"sql_retention_barrier_errors":    n.sqlRetentionBarrierErrors.Load(),
+			"sql_retention_barrier_target":    n.sqlRetentionBarrierTarget.Load(),
+			"replay_grouping_enabled":         replayGroupingEnabled,
+			"uploads":                         stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
 			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
 			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
 			"s3_http_failures": stats.S3HTTPFailures,
@@ -1474,6 +1485,11 @@ func (n *Node) openInternal(ctx context.Context, enroll bool, prelocked *qlog.Lo
 
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		n.runSQLRetentionBarriers(ctx)
+	}()
 	if n.archive != nil {
 		interval := n.config.ObjStoreSyncInterval
 		if interval == 0 {

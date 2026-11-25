@@ -256,6 +256,54 @@ func TestExplicitLocalPrewriteDenialReclaimsThenRetriesSameBytesOnce(t *testing.
 	}
 }
 
+func TestLocalRetentionControlWaitsForSlowReclaimBeforeSubsequentWrite(t *testing.T) {
+	server, _, wal := newLocalLifecycleServerWithLimit(t, 1)
+	started, release := make(chan struct{}), make(chan struct{})
+	server.SetLocalReclaimHandler(func(ctx context.Context) error {
+		resume, err := server.Quiesce(ctx)
+		if err != nil {
+			return err
+		}
+		defer resume()
+		if _, bounded := ctx.Deadline(); bounded {
+			return errors.New("accepted Local retention reclaim unexpectedly has an execution deadline")
+		}
+		close(started)
+		select {
+		case <-release:
+			return wal.SetMaxBytes(math.MaxInt64)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := server.ProposeLocalRetentionControl(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{42}))
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Local reclaim did not start")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("retention control ended before slow reclaim completed: %v", err)
+	case <-time.After(5200 * time.Millisecond):
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("retention control after reclaim: %v", err)
+	}
+	if !server.Ready() || server.localFailure() != nil {
+		t.Fatalf("slow reclaim poisoned Local lifecycle: ready=%v failure=%v", server.Ready(), server.localFailure())
+	}
+	response, err := server.Execute(context.Background(), ExecuteRequest{RequestID: "after-slow-retention-reclaim", SQL: "CREATE TABLE after_slow_reclaim(id INTEGER)"})
+	if err != nil || response.Status != types.MutationCommitted {
+		t.Fatalf("subsequent write without reopening: receipt=%+v err=%v", response.MutationReceipt, err)
+	}
+}
+
 func TestExplicitLocalPrewriteMaintenanceFailurePoisonsAmbiguousProposal(t *testing.T) {
 	server, _, wal := newLocalLifecycleServerWithLimit(t, 1)
 	maintenanceFailure := errors.New("checkpoint publication failed")
