@@ -864,12 +864,6 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 	var response *peerfb.ResponseT
 	var lastRetryErr error
 	var retryCtx context.Context
-	var retryCancel context.CancelFunc
-	defer func() {
-		if retryCancel != nil {
-			retryCancel()
-		}
-	}()
 	delay := 10 * time.Millisecond
 	for {
 		callCtx := ctx
@@ -888,7 +882,9 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 		if retryCtx == nil {
 			// Limit a transient refusal independently of the caller's deadline so
 			// an impossible quorum can still return promptly.
-			retryCtx, retryCancel = context.WithTimeout(ctx, time.Second)
+			var cancel context.CancelFunc
+			retryCtx, cancel = context.WithTimeout(ctx, time.Second)
+			defer cancel()
 		}
 		timer := time.NewTimer(delay)
 		select {
