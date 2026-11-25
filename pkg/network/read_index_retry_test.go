@@ -16,6 +16,48 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+func TestReadIndexExcludingBoundsUnreadyPeerRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		recover bool
+	}{{"quorum_restored", true}, {"quorum_impossible", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			members := []quepaxa.Member{testMember("cluster", "a", "a-token"), testMember("cluster", "b", "b-token"), testMember("cluster", "c", "c-token"), testMember("cluster", "d", "d-token")}
+			var calls atomic.Int32
+			for _, idx := range []int{1, 3} {
+				idx := idx
+				core := mustCore(t, members[idx].ID, members, nil, nil)
+				ready := func() bool { return true }
+				if idx == 3 {
+					ready = func() bool { n := calls.Add(1); return tc.recover && n >= 7 }
+				}
+				server := NewServer(core, nil, "cluster", false, nil, ready)
+				t.Cleanup(server.Close)
+				peer, err := StartPeerServer(context.Background(), "127.0.0.1:0", server, members, []string{"", "b-token", "", "d-token"}[idx], "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = peer.Close() })
+				members[idx].PeerURL = "quic://" + peer.Addr()
+			}
+			cluster := &quepaxa.Cluster{Members: members}
+			transport := NewTransport("cluster", "a", cluster, "a-token")
+			t.Cleanup(func() { _ = transport.Close() })
+			core := mustCore(t, "a", members, nil, transport)
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			_, _, err := core.ReadIndexExcluding(ctx, "c")
+			if tc.recover {
+				if err != nil || calls.Load() < 7 {
+					t.Fatalf("restored quorum: calls=%d err=%v", calls.Load(), err)
+				}
+			} else if !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+				t.Fatalf("impossible quorum must fail before caller deadline: calls=%d err=%v", calls.Load(), err)
+			}
+		})
+	}
+}
+
 func TestReadIndexRetriesTransientlyUnreadyVoterWithoutCountingDownPeer(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

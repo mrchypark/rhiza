@@ -886,12 +886,9 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 		}
 		lastRetryErr = err
 		if retryCtx == nil {
-			if _, bounded := ctx.Deadline(); bounded {
-				retryCtx = ctx
-			} else {
-				// A caller without a deadline must not retry a never-ready peer forever.
-				retryCtx, retryCancel = context.WithTimeout(ctx, time.Second)
-			}
+			// Limit a transient refusal independently of the caller's deadline so
+			// an impossible quorum can still return promptly.
+			retryCtx, retryCancel = context.WithTimeout(ctx, time.Second)
 		}
 		timer := time.NewTimer(delay)
 		select {
