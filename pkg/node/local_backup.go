@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -558,6 +559,40 @@ func (n *Node) uploadLocalBackupSnapshot(ctx context.Context, seal quepaxa.Check
 	if err != nil {
 		return recovery.LocalSnapshot{}, err
 	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		return recovery.LocalSnapshot{}, err
+	}
+	existing, err := recovery.ReadLocalSnapshot(ctx, n.bucket, n.localBackupPrefix(), seal.RootHash)
+	if err == nil {
+		wantDecision, marshalErr := json.Marshal(decision)
+		if marshalErr != nil {
+			return recovery.LocalSnapshot{}, marshalErr
+		}
+		gotDecision, marshalErr := json.Marshal(existing.Decision)
+		if marshalErr != nil {
+			return recovery.LocalSnapshot{}, marshalErr
+		}
+		if !reflect.DeepEqual(existing.Seal, seal) || !bytes.Equal(wantDecision, gotDecision) || !bytes.Equal(existing.Descriptor, encoded) {
+			return recovery.LocalSnapshot{}, fmt.Errorf("existing Local snapshot differs from certified checkpoint")
+		}
+		dir, mkdirErr := os.MkdirTemp(n.config.DataDir, ".local-backup-verify-")
+		if mkdirErr != nil {
+			return recovery.LocalSnapshot{}, mkdirErr
+		}
+		defer os.RemoveAll(dir)
+		downloaded, downloadErr := manager.DownloadRootFiles(ctx, uint64(seal.Index), existing.PortableRoot, dir)
+		if downloadErr != nil {
+			return recovery.LocalSnapshot{}, downloadErr
+		}
+		if verifyErr := verifyLocalBackupFiles(descriptor, downloaded); verifyErr != nil {
+			return recovery.LocalSnapshot{}, verifyErr
+		}
+		return existing, nil
+	}
+	if !n.bucket.IsObjNotFoundErr(err) {
+		return recovery.LocalSnapshot{}, err
+	}
 	var portable *checkpoint.Checkpoint
 	err = retryLocalMaintenance(ctx, func() error {
 		var err error
@@ -577,10 +612,6 @@ func (n *Node) uploadLocalBackupSnapshot(ctx context.Context, seal quepaxa.Check
 		return recovery.LocalSnapshot{}, err
 	}
 	if err := verifyLocalBackupFiles(descriptor, downloaded); err != nil {
-		return recovery.LocalSnapshot{}, err
-	}
-	encoded, err := json.Marshal(descriptor)
-	if err != nil {
 		return recovery.LocalSnapshot{}, err
 	}
 	snapshot := recovery.LocalSnapshot{Seal: seal, Decision: decision, PortableRoot: portable.RootHash, Descriptor: encoded}

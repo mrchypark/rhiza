@@ -227,16 +227,37 @@ type consensusBase struct {
 // independently verified and quorum-sealed recoveryRoot before invoking it.
 func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	if c.localMode {
+		if err := c.acquireLocalCheckpoint(context.Background()); err != nil {
+			return err
+		}
+		defer c.releaseLocalCheckpoint()
 		if err := c.acquireLocalExecution(context.Background()); err != nil {
 			return err
 		}
-		defer c.releaseLocalExecution()
+		owned := true
+		defer func() {
+			if owned {
+				c.releaseLocalExecution()
+			}
+		}()
+		return c.compactThroughOwnedWith(through, recoveryRoot, true, func(build func() error) error {
+			c.releaseLocalExecution()
+			owned = false
+			if err := build(); err != nil {
+				return err
+			}
+			if err := c.acquireLocalExecution(context.Background()); err != nil {
+				return err
+			}
+			owned = true
+			return nil
+		})
 	}
-	return c.compactThroughOwnedWith(through, recoveryRoot, true)
+	return c.compactThroughOwnedWith(through, recoveryRoot, true, nil)
 }
 
 func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
-	return c.compactThroughOwnedWith(through, recoveryRoot, true)
+	return c.compactThroughOwnedWith(through, recoveryRoot, true, nil)
 }
 
 // CompactManagedThrough reclaims a local managed append-only WAL through a
@@ -246,10 +267,10 @@ func (c *Core) CompactManagedThrough(through Slot, recoveryRoot [32]byte) error 
 	if c.managedAppendOnly == nil {
 		return fmt.Errorf("managed append-only compaction is unavailable")
 	}
-	return c.compactThroughOwnedWith(through, recoveryRoot, false)
+	return c.compactThroughOwnedWith(through, recoveryRoot, false, nil)
 }
 
-func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requirePrepared bool) error {
+func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requirePrepared bool, runBuild func(func() error) error) error {
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
@@ -318,9 +339,11 @@ func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requ
 		c.unlockCompactionBarrier()
 		return err
 	}
+	var rewriteBytes uint64
 	if c.localMode {
 		baseEntry := qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}
-		rewriteBytes, estimateErr := c.wal.EstimateCompactedBytes(baseEntry, retained)
+		var estimateErr error
+		rewriteBytes, estimateErr = c.wal.EstimateCompactedBytes(baseEntry, retained)
 		if estimateErr != nil {
 			c.mu.Unlock()
 			c.unlockCompactionBarrier()
@@ -338,7 +361,7 @@ func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requ
 			return fmt.Errorf("%w: exact compacted WAL requires %d bytes (limit %d)", qlog.ErrCapacity, rewriteBytes, capacity.Limit)
 		}
 	}
-	compaction, err := c.beginCompactionLocked(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, retained)
+	compaction, err := c.beginReservedCompactionLocked(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, retained, rewriteBytes)
 	c.mu.Unlock()
 	c.unlockCompactionBarrier()
 	if err != nil {
@@ -346,8 +369,17 @@ func (c *Core) compactThroughOwnedWith(through Slot, recoveryRoot [32]byte, requ
 	}
 	defer c.finishCompaction()
 	defer compaction.Abort()
-	if err := compaction.Build(); err != nil {
-		return err
+	if runBuild == nil {
+		if err := compaction.Build(); err != nil {
+			return err
+		}
+	} else {
+		c.checkpointMu.Unlock()
+		buildErr := runBuild(compaction.Build)
+		c.checkpointMu.Lock()
+		if buildErr != nil {
+			return buildErr
+		}
 	}
 
 	c.lockCompactionBarrier()
@@ -584,7 +616,17 @@ func (c *Core) liveProposalValuesAboveLocked(through Slot) (map[[32]byte][]byte,
 }
 
 func (c *Core) beginCompactionLocked(base qlog.Entry, retained map[[32]byte][]byte) (*qlog.Compaction, error) {
-	compaction, err := c.wal.BeginCompaction(base, retained)
+	return c.beginReservedCompactionLocked(base, retained, 0)
+}
+
+func (c *Core) beginReservedCompactionLocked(base qlog.Entry, retained map[[32]byte][]byte, reserved uint64) (*qlog.Compaction, error) {
+	var compaction *qlog.Compaction
+	var err error
+	if reserved == 0 {
+		compaction, err = c.wal.BeginCompaction(base, retained)
+	} else {
+		compaction, err = c.wal.BeginCompactionReserved(base, retained, reserved)
+	}
 	if err != nil {
 		return nil, err
 	}

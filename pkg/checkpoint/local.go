@@ -43,7 +43,10 @@ func (m *Manager) createLocalFiles(ctx context.Context, sources []Source, index 
 	root := Checkpoint{SQLExecutionPolicy: sqlpolicy.Version, ConfigID: m.configID, Generation: 1, Index: index}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, 1, true, nil, nil)
+		file, legacy, err := legacyLocalSnapshotUploadForTest(ctx, m, source)
+		if !legacy && err == nil {
+			file, err = m.uploadFile(ctx, source, 1, true, true, nil, nil)
+		}
 		if err != nil {
 			return nil, err
 		}
