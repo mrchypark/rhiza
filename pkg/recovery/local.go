@@ -742,6 +742,11 @@ func (a *LocalArchive) ReadSnapshot(ctx context.Context, root [32]byte) (LocalSn
 	}
 	return snapshot, nil
 }
+
+// ReadLocalSnapshot reads immutable snapshot metadata without opening the archive head.
+func ReadLocalSnapshot(ctx context.Context, bucket objstore.Bucket, prefix string, root [32]byte) (LocalSnapshot, error) {
+	return (&LocalArchive{bucket: bucket, prefix: prefix}).ReadSnapshot(ctx, root)
+}
 func (a *LocalArchive) key(name string) string { return path.Join(a.prefix, name) }
 func (a *LocalArchive) read(ctx context.Context, name string, limit int64) ([]byte, error) {
 	r, err := a.bucket.Get(ctx, a.key(name))
