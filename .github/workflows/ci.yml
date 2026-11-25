@@ -311,6 +311,8 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestTerminalDecisionCancelsUnneededPeerHandshake|TestServerGraphBatcherConstructedExactlyOnce|TestServerGraphBatcherPolicyAndClose)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestPostSubmitKVSecondLookupFailureIsUnknown$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^(TestPostSubmitCertifiedExpirationOutsideBatcher|TestPostSubmitMissingReceiptBeforeProposerReturns)$' -count=1 -timeout=3m
+          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^(TestPostSubmitCertifiedExpirationOutsideBatcher|TestPostSubmitMissingReceiptBeforeProposerReturns)$' -count=1 -timeout=3m
           go test -tags rhiza_local_testhooks ./cmd/rhiza-ffi -run '^(TestManagedGraphStartupObserverPreservesFailureBoundary|TestManagedMutationDiagnosticPreservesWireAndRedacts|TestManagedStartupDiagnosticPreservesCodeAndRedactsCause|TestManagedReadyDiagnosticPreservesBoolABIAndRedactsCause)$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedSQLCertifiedRecoveryGapHoldsPushAndPeriodicPull|TestManagedSQLRetainedOriginalAppliesCertifiedSuffixBeforeFinalize)$' -count=1 -timeout=60s
           go test -tags rhiza_local_testhooks ./pkg/managedsql -run '^(TestManagedGraphLongPollCloseCancelsBorrow|TestManagedGraphActualUnknownRetainsNativeOriginal|TestManagedGraphInitialRootBlocksApplicationAndHonorsCancellation|TestManagedGraphInitialRootCloseCancelsBackgroundWait|TestManagedGraphInitialRootPUTReadFailureScope)$' -count=1 -timeout=60s

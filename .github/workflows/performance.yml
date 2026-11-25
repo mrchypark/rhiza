@@ -41,17 +41,21 @@ on:
         description: Run serialized local S3 checkpoint, archive-GC, Node.Open restore, and foreground cost evidence
         type: boolean
         default: false
+      issue413_local_compaction:
+        description: Compare actual Local backup compaction and BeforeAck foreground latency
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}-${{ inputs.issue413_local_compaction && 'local-compaction' || 'general' }}
   cancel-in-progress: true
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence && !inputs.issue413_local_compaction }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -275,6 +279,35 @@ jobs:
         with:
           name: paired-performance-${{ github.run_id }}
           path: ${{ runner.temp }}/rhiza-performance
+          if-no-files-found: error
+          retention-days: 30
+
+  issue413-local-compaction:
+    if: ${{ inputs.issue413_local_compaction }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Verify measurement-summary validation
+        run: sh scripts/ci-local-compaction-summary_test.sh
+      - name: Compare Local compaction and verify ACK restore
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/issue413-evidence"
+          sh scripts/ci-local-compaction-evidence.sh "$BASE_REF" "$CANDIDATE_REF" "$RUNNER_TEMP/issue413-evidence"
+      - name: Preserve raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue413-local-compaction-${{ github.run_id }}
+          path: ${{ runner.temp }}/issue413-evidence
           if-no-files-found: error
           retention-days: 30
 

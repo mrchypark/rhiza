@@ -667,7 +667,7 @@ func (m *Manager) uploadCandidate(ctx context.Context, sources []Source, index, 
 	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, generation, conditional, knownBlocks, onScan)
+		file, err := m.uploadFile(ctx, source, generation, conditional, false, knownBlocks, onScan)
 		if err != nil {
 			return nil, err
 		}
@@ -889,7 +889,7 @@ func (m *Manager) rememberCertified(root Checkpoint) {
 	m.sortRoots()
 }
 
-func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional bool, known map[string]Block, onScan func(role string, elapsed time.Duration)) (File, error) {
+func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional, canonical bool, known map[string]Block, onScan func(role string, elapsed time.Duration)) (File, error) {
 	input, err := os.Open(source.Path)
 	if err != nil {
 		return File{}, err
@@ -951,6 +951,25 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		if conditional {
 			err = m.bucket.Upload(ctx, key, reader, objstore.WithIfNotExists())
 			if m.bucket.IsConditionNotMetErr(err) {
+				if canonical {
+					existing, readErr := m.bucket.Get(ctx, key)
+					if readErr != nil {
+						return readErr
+					}
+					hasher := sha256.New()
+					size, readErr := io.Copy(hasher, io.LimitReader(existing, upload.block.Size+1))
+					closeErr := existing.Close()
+					if readErr != nil {
+						return readErr
+					}
+					if closeErr != nil {
+						return closeErr
+					}
+					if size != upload.block.Size || !bytes.Equal(hasher.Sum(nil), upload.hash[:]) {
+						return fmt.Errorf("existing checkpoint block does not match its hash")
+					}
+					return nil
+				}
 				generations[index] = generation
 				if m.appendOnly {
 					generationKey := m.key(blockGenerationKey(upload.hash, generation))

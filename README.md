@@ -85,7 +85,7 @@ if err != nil {
     return err
 }
 
-rows, err := db.Query(ctx, rhiza.QueryRequest{
+_, err = db.Query(ctx, rhiza.QueryRequest{
     SQL:         "SELECT id, name FROM tea",
     Consistency: rhiza.ConsistencyLocal,
 })

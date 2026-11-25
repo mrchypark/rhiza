@@ -36,26 +36,28 @@ type Segment struct {
 // WAL is the local write-ahead log for QLog entries.
 // It stores proposals, receipts, and decisions for fast recovery.
 type WAL struct {
-	dir            string
-	segments       []*Segment
-	current        *Segment
-	mu             sync.RWMutex
-	compactMu      sync.Mutex
-	generation     uint64
-	maxSize        int64
-	maxBytes       int64
-	totalBytes     int64
-	identity       []byte
-	dirty          bool
-	fatal          error
-	readOnly       bool
-	deferCleanup   bool
-	pendingCleanup bool
-	syncDir        func(string) error
-	remove         func(string) error
-	writeAt        func(*os.File, []byte, int64) (int, error)
-	syncFile       func(*os.File) error
-	syncCount      atomic.Uint64
+	dir                   string
+	segments              []*Segment
+	current               *Segment
+	mu                    sync.RWMutex
+	compactMu             sync.Mutex
+	generation            uint64
+	maxSize               int64
+	maxBytes              int64
+	totalBytes            int64
+	compactionReserved    int64
+	compactionPrefixBytes int64
+	identity              []byte
+	dirty                 bool
+	fatal                 error
+	readOnly              bool
+	deferCleanup          bool
+	pendingCleanup        bool
+	syncDir               func(string) error
+	remove                func(string) error
+	writeAt               func(*os.File, []byte, int64) (int, error)
+	syncFile              func(*os.File) error
+	syncCount             atomic.Uint64
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
@@ -78,6 +80,8 @@ type CapacitySnapshot struct {
 	Used  int64
 	Limit int64
 	Fatal error
+	// RewriteReserved is a logical post-compaction allowance, not allocated disk space.
+	RewriteReserved int64
 }
 
 // Capacity returns the used bytes, configured hard limit, and fatal state
@@ -85,7 +89,18 @@ type CapacitySnapshot struct {
 func (w *WAL) Capacity() CapacitySnapshot {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return CapacitySnapshot{Used: w.totalBytes, Limit: w.maxBytes, Fatal: w.fatal}
+	return CapacitySnapshot{Used: w.admissionBytesLocked(), Limit: w.maxBytes, Fatal: w.fatal, RewriteReserved: w.compactionReserved}
+}
+
+func (w *WAL) admissionBytesLocked() int64 {
+	if w.compactionReserved == 0 {
+		return w.totalBytes
+	}
+	tail := w.totalBytes - w.compactionPrefixBytes
+	if tail > int64(^uint64(0)>>1)-w.compactionReserved {
+		return int64(^uint64(0) >> 1)
+	}
+	return max(w.totalBytes, tail+w.compactionReserved)
 }
 
 // Bytes returns the current on-disk segment bytes.
@@ -114,7 +129,7 @@ func (w *WAL) SetMaxBytes(max int64) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if used := w.bytesLocked(); used > max {
+	if used := w.admissionBytesLocked(); used > max {
 		return fmt.Errorf("%w: used=%d max=%d", ErrCapacity, used, max)
 	}
 	w.maxBytes = max
@@ -719,8 +734,8 @@ func (w *WAL) AppendAt(entry Entry) (EntryLocation, error) {
 	if int64(len(data)) > 1<<31-1 {
 		return EntryLocation{}, fmt.Errorf("WAL entry length %d exceeds EntryLocation range", len(data))
 	}
-	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
-		return EntryLocation{}, fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
+	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.admissionBytesLocked() {
+		return EntryLocation{}, fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.admissionBytesLocked(), len(data), w.maxBytes)
 	}
 
 	// Roll over if needed
@@ -1027,6 +1042,9 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.compactionReserved != 0 {
+		return fmt.Errorf("cannot restore a segment during reserved WAL compaction")
+	}
 	if w.fatal != nil {
 		return w.fatal
 	}
@@ -1180,6 +1198,8 @@ type Compaction struct {
 	targetIndex    uint32
 	targetPath     string
 	maxBytes       int64
+	reservedBytes  int64
+	cleanupFailed  bool
 	offset         int64
 	built          bool
 	done           bool
@@ -1188,6 +1208,19 @@ type Compaction struct {
 // BeginCompaction seals the current prefix and switches appends to a durable
 // tail generation. The caller may release higher-level locks after it returns.
 func (w *WAL) BeginCompaction(base Entry, retainedValues map[[32]byte][]byte) (*Compaction, error) {
+	return w.beginCompaction(base, retainedValues, 0)
+}
+
+// BeginCompactionReserved protects the post-compaction logical WAL limit while
+// allowing concurrent appends. It does not reserve physical disk space.
+func (w *WAL) BeginCompactionReserved(base Entry, retainedValues map[[32]byte][]byte, reserved uint64) (*Compaction, error) {
+	if reserved == 0 || reserved > uint64(^uint64(0)>>1) {
+		return nil, fmt.Errorf("invalid WAL compaction reservation")
+	}
+	return w.beginCompaction(base, retainedValues, int64(reserved))
+}
+
+func (w *WAL) beginCompaction(base Entry, retainedValues map[[32]byte][]byte, reserved int64) (*Compaction, error) {
 	if base.Type != EntryCheckpoint || base.Slot == 0 {
 		return nil, fmt.Errorf("invalid WAL compaction base")
 	}
@@ -1216,12 +1249,18 @@ func (w *WAL) BeginCompaction(base Entry, retainedValues map[[32]byte][]byte) (*
 		w.compactMu.Unlock()
 		return nil, fmt.Errorf("WAL has no active segment")
 	}
+	if w.maxBytes > 0 && reserved > w.maxBytes {
+		w.mu.Unlock()
+		w.compactMu.Unlock()
+		return nil, fmt.Errorf("%w: reserved compacted WAL exceeds limit", ErrCapacity)
+	}
 	if w.current.index > ^uint32(0)-2 {
 		w.mu.Unlock()
 		w.compactMu.Unlock()
 		return nil, fmt.Errorf("WAL segment index exhausted")
 	}
 	prefix := append([]*Segment(nil), w.segments...)
+	prefixBytes := w.totalBytes
 	targetIndex := w.current.index + 1
 	tailIndex := targetIndex + 1
 	if err := w.createSegment(tailIndex); err != nil {
@@ -1229,12 +1268,15 @@ func (w *WAL) BeginCompaction(base Entry, retainedValues map[[32]byte][]byte) (*
 		w.compactMu.Unlock()
 		return nil, err
 	}
+	w.compactionReserved = reserved
+	w.compactionPrefixBytes = prefixBytes
+	maxBytes := w.maxBytes
 	w.mu.Unlock()
-	return &Compaction{wal: w, base: base, retainedValues: retained, prefix: prefix, tailIndex: tailIndex, targetIndex: targetIndex, targetPath: w.segmentPath(targetIndex), maxBytes: w.maxBytes}, nil
+	return &Compaction{wal: w, base: base, retainedValues: retained, prefix: prefix, tailIndex: tailIndex, targetIndex: targetIndex, targetPath: w.segmentPath(targetIndex), maxBytes: maxBytes, reservedBytes: reserved}, nil
 }
 
 // Build writes and syncs the compacted prefix without blocking appends.
-func (c *Compaction) Build() error {
+func (c *Compaction) Build() (resultErr error) {
 	if c == nil || c.done || c.built {
 		return fmt.Errorf("invalid WAL compaction state")
 	}
@@ -1244,10 +1286,21 @@ func (c *Compaction) Build() error {
 		return err
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	defer func() {
+		if c.reservedBytes == 0 {
+			_ = os.Remove(tempPath)
+			return
+		}
+		if err := c.removeReservedFile(tempPath); err != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
 	offset := int64(0)
 	writeEntry := func(entry Entry) error {
 		data := entry.Encode()
+		if c.reservedBytes > 0 && int64(len(data)) > c.reservedBytes-offset {
+			return fmt.Errorf("%w: compacted WAL exceeds reserved bytes", ErrCapacity)
+		}
 		if c.maxBytes > 0 && offset+int64(len(data)) > c.maxBytes {
 			return fmt.Errorf("%w: compacted WAL requires more than %d bytes", ErrCapacity, c.maxBytes)
 		}
@@ -1349,13 +1402,15 @@ func (c *Compaction) Commit() error {
 	w.segments = next
 	w.current = next[len(next)-1]
 	w.totalBytes = nextBytes
+	w.compactionReserved = 0
+	w.compactionPrefixBytes = 0
 	w.dirty = false
 	if w.deferCleanup {
 		w.pendingCleanup = true
 	}
 	w.mu.Unlock()
 	c.done = true
-	w.compactMu.Unlock()
+	defer w.compactMu.Unlock()
 	hitLocalWALCrashBoundary("after-manifest-switch-before-old-cleanup")
 	for _, seg := range old {
 		seg.mu.Lock()
@@ -1371,11 +1426,20 @@ func (c *Compaction) Commit() error {
 		// FinalizeDeferredCleanup against the then-current manifest.
 		return nil
 	}
+	var cleanupErr error
 	for _, seg := range old {
-		_ = w.remove(w.segmentPath(seg.index))
+		if err := w.remove(w.segmentPath(seg.index)); err != nil && !os.IsNotExist(err) {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
 	}
-	_ = w.syncDir(w.dir)
-	return nil
+	cleanupErr = errors.Join(cleanupErr, w.syncDir(w.dir))
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("committed WAL compaction cleanup requires reopen: %w", cleanupErr)
+		w.mu.Lock()
+		w.fatal = errors.Join(w.fatal, cleanupErr)
+		w.mu.Unlock()
+	}
+	return cleanupErr
 }
 
 // Abort discards an uncommitted compacted prefix. The fenced tail remains the
@@ -1385,8 +1449,37 @@ func (c *Compaction) Abort() {
 		return
 	}
 	c.done = true
-	_ = os.Remove(c.targetPath)
+	if c.reservedBytes == 0 {
+		_ = os.Remove(c.targetPath)
+	} else {
+		_ = c.removeReservedFile(c.targetPath)
+	}
+	c.wal.mu.Lock()
+	if !c.cleanupFailed {
+		c.wal.compactionReserved = 0
+		c.wal.compactionPrefixBytes = 0
+	}
+	c.wal.mu.Unlock()
 	c.wal.compactMu.Unlock()
+}
+
+func (c *Compaction) removeReservedFile(path string) error {
+	err := c.wal.remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err == nil {
+		err = c.wal.syncDir(c.wal.dir)
+	}
+	if err == nil {
+		return nil
+	}
+	c.cleanupFailed = true
+	wrapped := fmt.Errorf("reserved WAL compaction cleanup requires reopen: %w", err)
+	c.wal.mu.Lock()
+	c.wal.fatal = errors.Join(c.wal.fatal, wrapped)
+	c.wal.mu.Unlock()
+	return wrapped
 }
 
 // Compact preserves the simple API for restore paths.
