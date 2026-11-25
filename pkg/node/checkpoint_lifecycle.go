@@ -173,6 +173,12 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 	if n.config == nil || !n.config.Local || n.server == nil || n.core == nil || n.material == nil || n.localStore == nil {
 		return network.ErrLocalMaintenanceRefused
 	}
+	return n.core.WithLocalCheckpoint(ctx, func(guard *quepaxa.LocalCheckpointGuard) error {
+		return n.reclaimLocalCheckpointGuarded(ctx, guard)
+	})
+}
+
+func (n *Node) reclaimLocalCheckpointGuarded(ctx context.Context, guard *quepaxa.LocalCheckpointGuard) (resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: canceled before Local maintenance admission", network.ErrLocalMaintenanceRefused)
 	}
@@ -190,11 +196,16 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 		if resultErr != nil && !errors.Is(resultErr, network.ErrLocalMaintenanceRefused) && !quepaxa.IsLocalAdmissionDenial(resultErr) && !errors.Is(resultErr, network.ErrNotReady) {
 			n.server.FailLocalLifecycle(resultErr)
 		}
-		resume()
+		if resume != nil {
+			resume()
+		}
 	}()
 	n.localSnapshotMu.Lock()
+	snapshotHeld := true
 	defer func() {
-		n.localSnapshotMu.Unlock()
+		if snapshotHeld {
+			n.localSnapshotMu.Unlock()
+		}
 		if resultErr == nil {
 			n.collectLocalBackup(ctx)
 		}
@@ -252,7 +263,7 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	slot, err := n.core.ReclaimLocalCheckpointWithSpacePreflight(ctx, seal, func(rewriteBytes, remainingBytes uint64) error {
+	slot, err := n.core.ReclaimLocalCheckpointWithGuard(ctx, guard, seal, func(rewriteBytes, remainingBytes uint64) error {
 		return n.localCheckpointSpacePreflight(rewriteBytes, remainingBytes)
 	}, func(applyCtx context.Context, appliedThrough quepaxa.Slot) error {
 		if err := n.replayLocalDecisions(applyCtx); err != nil {
@@ -265,6 +276,20 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 			return err
 		}
 		return n.localCheckpointSpacePreflight()
+	}, func(build func() error) error {
+		n.localSnapshotMu.Unlock()
+		snapshotHeld = false
+		resume()
+		resume = nil
+		buildErr := build()
+		nextResume, drainErr := n.server.Quiesce(ctx)
+		if drainErr != nil {
+			return errors.Join(buildErr, fmt.Errorf("drain Local foreground after WAL rewrite: %w", drainErr))
+		}
+		resume = nextResume
+		n.localSnapshotMu.Lock()
+		snapshotHeld = true
+		return buildErr
 	})
 	if err != nil {
 		if quepaxa.IsLocalAdmissionDenial(err) {
@@ -287,7 +312,13 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 	return nil
 }
 
-func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) (resultErr error) {
+func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) error {
+	return n.core.WithLocalCheckpoint(ctx, func(guard *quepaxa.LocalCheckpointGuard) error {
+		return n.resumePreparedLocalCheckpointGuarded(ctx, guard)
+	})
+}
+
+func (n *Node) resumePreparedLocalCheckpointGuarded(ctx context.Context, guard *quepaxa.LocalCheckpointGuard) (resultErr error) {
 	index, root, prepared := n.core.LatestPreparedCheckpoint()
 	if !prepared {
 		return nil
@@ -330,7 +361,7 @@ func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) (resultErr err
 	if err != nil {
 		return err
 	}
-	_, err = n.core.ReclaimLocalCheckpointWithSpacePreflight(ctx, seal, func(rewriteBytes, remainingBytes uint64) error {
+	_, err = n.core.ReclaimLocalCheckpointWithGuard(ctx, guard, seal, func(rewriteBytes, remainingBytes uint64) error {
 		return n.localCheckpointSpacePreflight(rewriteBytes, remainingBytes)
 	}, func(applyCtx context.Context, through quepaxa.Slot) error {
 		if err := n.replayLocalDecisions(applyCtx); err != nil {
@@ -340,7 +371,7 @@ func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) (resultErr err
 			return fmt.Errorf("resumed Local materializer stopped at %d before seal slot %d", n.material.Tip(), through)
 		}
 		return n.publishLocalBackupCheckpoint(applyCtx, seal, through)
-	})
+	}, nil)
 	if err != nil {
 		return fmt.Errorf("complete prepared Local checkpoint: %w", err)
 	}

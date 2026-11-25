@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
@@ -79,6 +80,7 @@ type Core struct {
 	localCost               localCostModel
 	localUnloggedCount      uint64
 	localExecutionOwner     chan struct{}
+	localCheckpointGate     chan struct{}
 	localRecordAttemptLimit int // private test seam; zero selects the production limit
 	walIdentity             string
 	reconfigEnabled         bool
@@ -182,7 +184,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 	core := &Core{
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
-		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
+		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), localCheckpointGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
 		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), pendingPrepares: make(map[Slot]pendingCheckpointPrepare), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		maxRetainedBytes: DefaultMaxRetainedDecisionBytes, maxRetainedSlots: DefaultMaxRetainedDecisionSlots, decisionLocs: make(map[Slot]qlog.EntryLocation), coldBase: 1,
 		coldLeaderSchedules: make(map[Slot][]NodeID), pinnedValues: make(map[ValueHash]int), recentStaged: make(map[ValueHash]struct{}),
@@ -2481,6 +2483,10 @@ func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
 // verified identity before this node may vote for its seal.
 func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error {
 	if c.localMode {
+		if err := c.acquireLocalCheckpoint(ctx); err != nil {
+			return err
+		}
+		defer c.releaseLocalCheckpoint()
 		if err := c.acquireLocalExecution(ctx); err != nil {
 			return err
 		}
@@ -3332,6 +3338,44 @@ func (c *Core) acquireLocalExecution(ctx context.Context) error {
 }
 
 func (c *Core) releaseLocalExecution() { <-c.localExecutionOwner }
+
+func (c *Core) acquireLocalCheckpoint(ctx context.Context) error {
+	select {
+	case c.localCheckpointGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Core) releaseLocalCheckpoint() { <-c.localCheckpointGate }
+
+// LocalCheckpointGuard serializes Local checkpoint lifecycles without blocking foreground operations.
+type LocalCheckpointGuard struct {
+	core   *Core
+	scope  sync.RWMutex
+	active atomic.Bool
+	inUse  atomic.Bool
+}
+
+// WithLocalCheckpoint serializes Local checkpoint work before its caller drains foreground requests.
+func (c *Core) WithLocalCheckpoint(ctx context.Context, fn func(*LocalCheckpointGuard) error) error {
+	if !c.localMode || fn == nil {
+		return errLocalCostsUnavailable
+	}
+	if err := c.acquireLocalCheckpoint(ctx); err != nil {
+		return err
+	}
+	defer c.releaseLocalCheckpoint()
+	guard := &LocalCheckpointGuard{core: c}
+	guard.active.Store(true)
+	defer func() {
+		guard.scope.Lock()
+		guard.active.Store(false)
+		guard.scope.Unlock()
+	}()
+	return fn(guard)
+}
 
 func (c *Core) takeLocalRecordAttempt(attempts *int) bool {
 	limit := c.localRecordAttemptLimit

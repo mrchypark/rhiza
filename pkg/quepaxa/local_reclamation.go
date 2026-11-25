@@ -162,13 +162,44 @@ func (c *Core) ReclaimLocalCheckpointWithSpacePreflight(ctx context.Context, sea
 	if !c.localMode {
 		return 0, errLocalCostsUnavailable
 	}
+	if err := c.acquireLocalCheckpoint(ctx); err != nil {
+		return 0, err
+	}
+	defer c.releaseLocalCheckpoint()
+	return c.reclaimLocalCheckpoint(ctx, seal, preflight, apply, nil)
+}
+
+// ReclaimLocalCheckpointWithGuard runs under the caller's Local checkpoint guard.
+// When supplied, runBuild must call its argument once and restore caller locks before returning.
+func (c *Core) ReclaimLocalCheckpointWithGuard(ctx context.Context, guard *LocalCheckpointGuard, seal CheckpointSeal, preflight func(uint64, uint64) error, apply func(context.Context, Slot) error, runBuild func(func() error) error) (Slot, error) {
+	if guard == nil || guard.core != c {
+		return 0, fmt.Errorf("invalid Local checkpoint guard")
+	}
+	guard.scope.RLock()
+	defer guard.scope.RUnlock()
+	if !guard.active.Load() || !guard.inUse.CompareAndSwap(false, true) {
+		return 0, fmt.Errorf("invalid Local checkpoint guard")
+	}
+	defer guard.inUse.Store(false)
+	return c.reclaimLocalCheckpoint(ctx, seal, preflight, apply, runBuild)
+}
+
+func (c *Core) reclaimLocalCheckpoint(ctx context.Context, seal CheckpointSeal, preflight func(uint64, uint64) error, apply func(context.Context, Slot) error, runBuild func(func() error) error) (Slot, error) {
+	if !c.localMode {
+		return 0, errLocalCostsUnavailable
+	}
 	if apply == nil {
 		return 0, fmt.Errorf("Local checkpoint apply callback is required")
 	}
 	if err := c.acquireLocalExecution(ctx); err != nil {
 		return 0, err
 	}
-	defer c.releaseLocalExecution()
+	owned := true
+	defer func() {
+		if owned {
+			c.releaseLocalExecution()
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -269,8 +300,42 @@ func (c *Core) ReclaimLocalCheckpointWithSpacePreflight(ctx context.Context, sea
 		return slot, fmt.Errorf("revalidate exact Local checkpoint root: %w", err)
 	}
 	hitLocalCheckpointCrashBoundary("after-seal-decision-durable-before-compact")
-	if err := c.compactThroughOwned(seal.Index, seal.RootHash); err != nil {
-		return slot, err
+	var compactErr error
+	if runBuild == nil {
+		compactErr = c.compactThroughOwned(seal.Index, seal.RootHash)
+	} else {
+		compactErr = c.compactThroughOwnedWith(seal.Index, seal.RootHash, true, func(build func() error) error {
+			c.releaseLocalExecution()
+			owned = false
+			called := false
+			var actualBuildErr error
+			buildErr := runBuild(func() error {
+				if called {
+					actualBuildErr = fmt.Errorf("Local checkpoint build invoked more than once")
+					return actualBuildErr
+				}
+				called = true
+				actualBuildErr = build()
+				return actualBuildErr
+			})
+			if buildErr != nil {
+				return buildErr
+			}
+			if !called {
+				return fmt.Errorf("Local checkpoint build was not invoked")
+			}
+			if actualBuildErr != nil {
+				return actualBuildErr
+			}
+			if err := c.acquireLocalExecution(ctx); err != nil {
+				return err
+			}
+			owned = true
+			return nil
+		})
+	}
+	if compactErr != nil {
+		return slot, compactErr
 	}
 	return slot, nil
 }
