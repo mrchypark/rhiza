@@ -88,6 +88,7 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var samples []sample
+	phaseRecorder := localtesthooks.StartCIPhase413(65536)
 	type window struct{ begin, end time.Time }
 	var windows []window
 	reset := localtesthooks.Set(func(name string) {
@@ -150,6 +151,52 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	reclaimEnd := time.Now()
 	close(stop)
 	workers.Wait()
+	shutdownErr := n.Shutdown()
+	n = nil
+	phases, droppedPhases := localtesthooks.StopCIPhase413(phaseRecorder)
+	type proposalTrace struct{ entered, accepted, rejected, returned, finished bool }
+	traces := make(map[[32]byte]proposalTrace)
+	requestHashes := make(map[string][32]byte)
+	quiesceStarts, quiesceEnds, quiesceDepth := 0, 0, 0
+	quiesceValid := true
+	for _, phase := range phases {
+		trace := traces[phase.Hash]
+		switch phase.Kind {
+		case "quiesce-start":
+			quiesceStarts++
+			quiesceDepth++
+			if quiesceDepth != 1 {
+				quiesceValid = false
+			}
+		case "quiesce-end":
+			quiesceEnds++
+			quiesceDepth--
+			if quiesceDepth != 0 {
+				quiesceValid = false
+			}
+		case "batch-request":
+			if old, exists := requestHashes[phase.RequestID]; exists && old != phase.Hash {
+				quiesceValid = false
+			}
+			requestHashes[phase.RequestID] = phase.Hash
+		case "proposal-enter":
+			trace.entered = true
+		case "proposal-accept":
+			trace.accepted = true
+		case "epoch-reject", "state-reject", "postwait-reject":
+			trace.rejected = true
+		case "batch-propose-return":
+			trace.returned = true
+		case "batch-finish":
+			trace.finished = true
+		}
+		traces[phase.Hash] = trace
+		data, marshalErr := json.Marshal(phase)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		t.Logf("LOCAL_COMPACTION_PHASE %s", data)
+	}
 	boundariesValid := len(windows) == cycleCount && completed == cycleCount
 	var buildTime time.Duration
 	for i, w := range windows {
@@ -170,6 +217,7 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	var acknowledged []int
 	errors := 0
 	overlaps := 0
+	unlinkedSuccess, unlinkedFailure, traceMismatch := 0, 0, 0
 	for _, s := range samples {
 		status := "acknowledged"
 		if s.err != nil {
@@ -193,6 +241,19 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 		if s.err == nil {
 			acknowledged = append(acknowledged, s.id)
 		}
+		hash, linked := requestHashes[fmt.Sprintf("foreground-%d", s.id)]
+		if !linked {
+			if s.err == nil {
+				unlinkedSuccess++
+			} else {
+				unlinkedFailure++
+			}
+		} else {
+			trace := traces[hash]
+			if !trace.entered || !trace.returned || !trace.finished || (s.err == nil && !trace.accepted) || (s.err != nil && !trace.accepted && !trace.rejected) {
+				traceMismatch++
+			}
+		}
 		if boundariesValid && len(overlapCycles) > 0 {
 			overlaps++
 			if s.err != nil {
@@ -211,7 +272,17 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	}
 	result := map[string]any{"cycles_total_ms": float64(reclaimEnd.Sub(reclaimStart)) / float64(time.Millisecond), "overlap_requests": overlaps, "overlap_success": len(latencies), "overlap_errors": errors, "p50_ms": percentile(50), "p99_ms": percentile(99), "acknowledged": len(acknowledged), "seed": 256, "workers": workerCount, "cycles_planned": cycleCount, "cycles_completed": completed, "boundaries_valid": boundariesValid}
 	result["metrics_present"] = boundariesValid && overlaps > 0
-	result["p99_comparable"] = boundariesValid && len(latencies) >= 100
+	result["phase_events_dropped"] = droppedPhases
+	result["phase_quiesce_starts"] = quiesceStarts
+	result["phase_quiesce_ends"] = quiesceEnds
+	result["phase_quiesce_sequence_valid"] = quiesceValid && quiesceDepth == 0
+	result["phase_unlinked_success"] = unlinkedSuccess
+	result["phase_unlinked_failure"] = unlinkedFailure
+	result["phase_trace_mismatch"] = traceMismatch
+	result["phase_instrumentation"] = "bounded_channel_nonblocking_but_nonzero_overhead"
+	phaseValid := droppedPhases == 0 && shutdownErr == nil && quiesceValid && quiesceDepth == 0 && quiesceStarts >= cycleCount && quiesceStarts == quiesceEnds && unlinkedSuccess == 0 && unlinkedFailure == 0 && traceMismatch == 0
+	result["phase_observation_valid"] = phaseValid
+	result["p99_comparable"] = boundariesValid && phaseValid && len(latencies) >= 100
 	result["observation"] = localCompactionObservation(boundariesValid, overlaps, len(latencies))
 	if boundariesValid {
 		result["build_start_unix_ns"] = windows[0].begin.UnixNano()
@@ -221,22 +292,27 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	if reclaimErr != nil {
 		result["reclaim_error"] = reclaimErr.Error()
 	}
+	if shutdownErr != nil {
+		result["shutdown_error"] = shutdownErr.Error()
+	}
 	result["restore_mode"] = "graceful_shutdown_then_empty_data_dir"
 	data, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("LOCAL_COMPACTION_EVIDENCE %s", data)
+	if droppedPhases != 0 {
+		t.Errorf("phase observation dropped %d events", droppedPhases)
+	}
 	if reclaimErr != nil {
 		t.Fatalf("actual Local backup reclaim: %v", reclaimErr)
 	}
 	if !boundariesValid {
 		t.Fatal("compaction build boundaries not observed")
 	}
-	if err := n.Shutdown(); err != nil {
-		t.Fatal(err)
+	if shutdownErr != nil {
+		t.Fatalf("shutdown before restore: %v", shutdownErr)
 	}
-	n = nil
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
