@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -301,7 +302,13 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit("network:sql-postsubmit:before-receipt")
+	}
 	receipt, sqlResult, found, matches, err = s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
+	if err == nil && postSubmitMissingForTest(ctx, "sql", command.RequestID) {
+		found = false
+	}
 	if managedKVExecutionPolicy(s.expectedPolicy) {
 		if err != nil {
 			return ExecuteResponse{}, commitUnknown(submitSlot, command.RequestID, err)

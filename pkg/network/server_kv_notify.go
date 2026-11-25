@@ -222,6 +222,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		localtesthooks.Hit("network:kv-postsubmit:before-receipt")
 	}
 	receipt, found, matches, err := s.material.KVRequestStatus(ctx, intent)
+	if err == nil && postSubmitMissingForTest(ctx, "kv", req.RequestID) {
+		found = false
+	}
 	if err != nil {
 		return KVMutationResponse{}, commitUnknown(submitSlot, req.RequestID, err)
 	}

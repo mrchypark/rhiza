@@ -44,7 +44,8 @@ func (proposalAdmissionOverload) Error() string { return ErrOverloaded.Error() }
 func (proposalAdmissionOverload) Unwrap() error { return ErrOverloaded }
 
 // CommitUnknownError means a mutation may commit despite the failed call.
-// Retrying the same request ID resolves the outcome without duplicating it.
+// Resolve the outcome without resubmission. Retrying is unsafe unless the
+// receipt is guaranteed to remain retained when the retry is checked.
 type CommitUnknownError struct {
 	Slot             quepaxa.Slot
 	RequestID        string

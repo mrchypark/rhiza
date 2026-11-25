@@ -191,6 +191,15 @@ func (identity localCheckpointIdentity) ensureRootDir() error {
 }
 
 func (identity localCheckpointIdentity) Publish(ctx context.Context, files []materializer.CheckpointFile, slot uint64, prefix [32]byte, configIDs ...uint) (localCheckpointDescriptor, error) {
+	return identity.publish(ctx, files, slot, prefix, false, configIDs...)
+}
+
+// publishSnapshot accepts snapshots exclusively created by CheckpointFilesAt.
+func (identity localCheckpointIdentity) publishSnapshot(ctx context.Context, files []materializer.CheckpointFile, slot uint64, prefix [32]byte, configIDs ...uint) (localCheckpointDescriptor, error) {
+	return identity.publish(ctx, files, slot, prefix, true, configIDs...)
+}
+
+func (identity localCheckpointIdentity) publish(ctx context.Context, files []materializer.CheckpointFile, slot uint64, prefix [32]byte, snapshot bool, configIDs ...uint) (localCheckpointDescriptor, error) {
 	if slot == 0 || prefix == ([32]byte{}) || len(files) != 2 {
 		return localCheckpointDescriptor{}, fmt.Errorf("invalid Local checkpoint input")
 	}
@@ -213,7 +222,14 @@ func (identity localCheckpointIdentity) Publish(ctx context.Context, files []mat
 		if !ok || fd.Length != 0 || file.Path == "" {
 			return localCheckpointDescriptor{}, fmt.Errorf("invalid Local checkpoint file roles")
 		}
-		fd.Length, fd.SHA256, err = copyAndHashLocalFile(ctx, file.Path, filepath.Join(tmp, fd.Name), localCheckpointMaxBytes-total)
+		target := filepath.Join(tmp, fd.Name)
+		var cloned bool
+		if snapshot {
+			fd.Length, fd.SHA256, cloned, err = cloneAndHashLocalSnapshot(ctx, file.Path, target, localCheckpointMaxBytes-total)
+		}
+		if !cloned && err == nil {
+			fd.Length, fd.SHA256, err = copyAndHashLocalFile(ctx, file.Path, target, localCheckpointMaxBytes-total)
+		}
 		if err != nil {
 			return localCheckpointDescriptor{}, err
 		}

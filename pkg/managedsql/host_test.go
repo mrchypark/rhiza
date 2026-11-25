@@ -243,7 +243,11 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/xml")
-			_ = xml.NewEncoder(w).Encode(v)
+			mu.Unlock()
+			func() {
+				defer mu.Lock()
+				_ = xml.NewEncoder(w).Encode(v)
+			}()
 			return
 		}
 		b, exists := objects[key]
@@ -352,7 +356,12 @@ func sqlWireStore(t *testing.T) (*httptest.Server, *sqlWireControl) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 		if r.Method == http.MethodGet {
-			_, _ = w.Write(b)
+			// Stored bodies are immutable; a slow reader must not block other requests.
+			mu.Unlock()
+			func() {
+				defer mu.Lock()
+				_, _ = w.Write(b)
+			}()
 		}
 	}))
 	t.Cleanup(s.Close)
