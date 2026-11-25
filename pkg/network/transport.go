@@ -653,6 +653,12 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 		case peerErrorCompacted:
 			return nil, quepaxa.ErrCompacted
 		case peerErrorRetryable:
+			if request.Operation == peerfb.OperationReadIndex {
+				if err == nil {
+					return nil, fmt.Errorf("peer retryable response omitted error")
+				}
+				return nil, &readTipRetryableError{cause: err}
+			}
 			return nil, err
 		case peerErrorConfigurationLag:
 			if request.Operation == peerfb.OperationReadIndex {
@@ -842,6 +848,11 @@ func (t *Transport) retire() {
 	}
 }
 
+type readTipRetryableError struct{ cause error }
+
+func (e *readTipRetryableError) Error() string { return e.cause.Error() }
+func (e *readTipRetryableError) Unwrap() error { return e.cause }
+
 func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
 	peer, err := t.transportForCurrent()
 	if err != nil {
@@ -850,7 +861,45 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 	if peer != t {
 		return peer.ReadTip(ctx, to)
 	}
-	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex))
+	var response *peerfb.ResponseT
+	var lastRetryErr error
+	var retryCtx context.Context
+	delay := 10 * time.Millisecond
+	for {
+		callCtx := ctx
+		if retryCtx != nil {
+			callCtx = retryCtx
+		}
+		response, err = t.callQuorum(callCtx, to, t.request(peerfb.OperationReadIndex))
+		if retryCtx != nil && retryCtx.Err() != nil && ctx.Err() == nil {
+			return 0, lastRetryErr
+		}
+		var retryable *readTipRetryableError
+		if !errors.As(err, &retryable) {
+			break
+		}
+		lastRetryErr = err
+		if retryCtx == nil {
+			// Limit a transient refusal independently of the caller's deadline so
+			// an impossible quorum can still return promptly.
+			var cancel context.CancelFunc
+			retryCtx, cancel = context.WithTimeout(ctx, time.Second)
+			defer cancel()
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, err
+		case <-timer.C:
+		}
+		if delay < 160*time.Millisecond {
+			delay *= 2
+		}
+	}
 	if err != nil {
 		var diagnostic interface{ RPCDiagnostic() PeerRPCDiagnostic }
 		if ctx.Err() == nil && errors.As(err, &diagnostic) {

@@ -260,7 +260,7 @@ func (n *Node) reclaimLocalCheckpointGuarded(ctx context.Context, guard *quepaxa
 	if err := n.localStore.requireFreeBytes(n.config.DataDir, sourceBytes, graphBytes, uint64(max(int64(0), n.wal.Bytes()))); err != nil {
 		return fmt.Errorf("Local checkpoint space changed during capture: %w", err)
 	}
-	descriptor, err := n.localStore.Publish(ctx, files, index, prefix, n.core.ConfigIDForSlot(quepaxa.Slot(index)))
+	descriptor, err := n.localStore.publishSnapshot(ctx, files, index, prefix, n.core.ConfigIDForSlot(quepaxa.Slot(index)))
 	if err != nil {
 		return fmt.Errorf("publish Local checkpoint: %w", err)
 	}

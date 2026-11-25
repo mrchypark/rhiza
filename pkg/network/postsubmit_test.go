@@ -10,8 +10,8 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -133,15 +133,15 @@ func TestPostSubmitActualConflictRemainsConflict(t *testing.T) {
 	}
 }
 
-// Expire the actual applied receipt with certified control slots while the
-// successful submit is returning. Missing history is not a failed mutation.
-func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
+// A certified mutation may be applied even when its proposer exceeds the real
+// batcher deadline before returning; the caller must not infer failure.
+func TestPostSubmitRealBatcherDeadlineIsUnknown(t *testing.T) {
 	for _, kind := range []string{"sql", "kv"} {
 		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
 			ctx := context.Background()
-			const window = 1024
 			core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
-			m, err := materializer.Open(t.TempDir()+"/state.sqlite", 1, window)
+			m, err := materializer.Open(t.TempDir()+"/state.sqlite", 1, 1024)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,7 +151,7 @@ func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
 			if _, err := s.Execute(ctx, ExecuteRequest{RequestID: "setup", SQL: "CREATE TABLE counter (n INTEGER)"}); err != nil {
 				t.Fatal(err)
 			}
-			var slotApplied atomic.Uint64
+			var submitted atomic.Uint64
 			var calls atomic.Int32
 			wrap := func(original func(context.Context, []byte) (quepaxa.Slot, error)) func(context.Context, []byte) (quepaxa.Slot, error) {
 				return func(ctx context.Context, value []byte) (quepaxa.Slot, error) {
@@ -160,21 +160,17 @@ func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
 						return slot, err
 					}
 					calls.Add(1)
-					slotApplied.Store(uint64(slot))
-					barrier := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})
-					for core.Tip() < slot+window {
-						if _, _, err := core.Propose(ctx, barrier); err != nil {
-							return slot, err
-						}
-					}
-					if err := s.applyDecisions(ctx, core.Tip()); err != nil {
+					submitted.Store(uint64(slot))
+					if err := s.applyDecisions(ctx, slot); err != nil {
 						return slot, err
 					}
-					return slot, nil
+					<-ctx.Done()
+					return slot, ctx.Err()
 				}
 			}
-			id := kind + "-expired"
+			id := kind + "-deadline"
 			req := ExecuteRequest{RequestID: id, SQL: "INSERT INTO counter VALUES (1) RETURNING n", WantRows: true}
+			start := time.Now()
 			if kind == "sql" {
 				s.sqlBatcher.propose = wrap(s.sqlBatcher.propose)
 				_, err = s.ExecuteReturning(ctx, req)
@@ -182,34 +178,35 @@ func TestPostSubmitMissingReceiptIsUnknown(t *testing.T) {
 				s.kvBatcher.propose = wrap(s.kvBatcher.propose)
 				_, err = s.KVMutate(ctx, "put", KVMutationRequest{RequestID: id, Key: "key", Value: []byte("value")})
 			}
-			t.Logf("actual missing receipt: kind=%s originalSlot=%d currentTip=%d err=%v", kind, slotApplied.Load(), core.Tip(), err)
+			if elapsed := time.Since(start); elapsed < 29*time.Second {
+				t.Fatalf("batcher deadline expired too early: %v", elapsed)
+			}
 			var unknown *CommitUnknownError
-			if !errors.As(err, &unknown) || unknown.Cause == nil || unknown.RequestID != id || uint64(unknown.Slot) != slotApplied.Load() || errors.Is(err, ErrRequestConflict) {
-				t.Fatalf("missing post-submit receipt must be unknown: %v", err)
+			if !errors.As(err, &unknown) || !errors.Is(err, context.DeadlineExceeded) || unknown.RequestID != id || uint64(unknown.Slot) != submitted.Load() || unknown.Slot == 0 {
+				t.Fatalf("deadline must preserve unknown identity/slot/cause: %v", err)
 			}
-			assertPostSubmitHTTP(t, err, http.StatusServiceUnavailable, "commit_unknown", id, slotApplied.Load())
+			assertPostSubmitHTTP(t, err, http.StatusServiceUnavailable, "commit_unknown", id, submitted.Load())
 			before := core.Tip()
-			status, err := s.RequestStatus(ctx, RequestStatusRequest{Kind: kind, RequestID: id})
-			if err != nil || status.Receipt != nil {
-				t.Fatalf("receipt should have actually expired: %+v %v", status, err)
-			}
 			if kind == "sql" {
 				result, err := s.ResolveExecute(ctx, req)
-				if err != nil || result.State != ResolveExecuteUnknownOrExpired {
-					t.Fatalf("expired resolution: %+v %v", result, err)
+				if err != nil || result.State != ResolveExecuteRetained || result.Receipt == nil || result.Receipt.Slot != submitted.Load() {
+					t.Fatalf("resolve: %+v %v", result, err)
+				}
+				if len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0]) != 1 || result.Statements[0].Rows[0][0] != int64(1) {
+					t.Fatalf("resolved RETURNING row: %+v", result.Statements)
 				}
 				rows, err := s.Query(ctx, QueryRequest{SQL: "SELECT n FROM counter"})
-				if err != nil || len(rows.Rows) != 1 {
-					t.Fatalf("application effect missing/duplicated: %+v %v", rows, err)
+				if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
+					t.Fatalf("effect: %+v %v", rows, err)
 				}
 			} else {
 				value, err := s.KVGet(ctx, KVGetRequest{Key: "key"})
 				if err != nil || !value.Found || string(value.Value) != "value" {
-					t.Fatalf("expired receipt lost actual KV effect: %+v %v", value, err)
+					t.Fatalf("effect: %+v %v", value, err)
 				}
 			}
 			if calls.Load() != 1 || core.Tip() != before {
-				t.Fatal("resolution resubmitted application")
+				t.Fatalf("observation resubmitted: calls=%d tip=%d->%d", calls.Load(), before, core.Tip())
 			}
 		})
 	}
