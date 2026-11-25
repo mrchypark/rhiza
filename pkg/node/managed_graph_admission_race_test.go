@@ -29,6 +29,7 @@ import (
 // recorder quorum/certificate. No decision state is injected by the test.
 type graphAdmissionRaceTransport struct {
 	graphReviewTransport
+	unavailable  sync.Map
 	held         chan struct{}
 	release      chan struct{}
 	uncertified  bool
@@ -49,6 +50,9 @@ type graphAdmissionReadTipGate struct {
 }
 
 func (p *graphAdmissionRaceTransport) ReadTip(ctx context.Context, id quepaxa.NodeID) (quepaxa.Slot, error) {
+	if _, down := p.unavailable.Load(id); down {
+		return 0, fmt.Errorf("test voter unavailable")
+	}
 	p.readTipCalls.Add(1)
 	if gate := p.readTipGate.Load(); gate != nil && gate.calls.Add(1) <= gate.blockCalls {
 		gate.entered <- struct{}{}
@@ -62,6 +66,9 @@ func (p *graphAdmissionRaceTransport) ReadTip(ctx context.Context, id quepaxa.No
 }
 
 func (p *graphAdmissionRaceTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	if _, down := p.unavailable.Load(to); down {
+		return quepaxa.Summary{}, fmt.Errorf("test voter unavailable")
+	}
 	isHeldBarrier, err := types.DecodeReadBarrier(request.Proposal.Value)
 	if err != nil {
 		return quepaxa.Summary{}, err

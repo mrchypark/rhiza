@@ -135,6 +135,9 @@ func TestDurableSQLResultRetentionQuotaRestartAndExpiry(t *testing.T) {
 	if err != nil || !found || !matches || receipt.Status != types.MutationRejected || receipt.ErrorCode != types.MutationErrorCodeResultRetentionFull || len(returned.Statements) != 0 {
 		t.Fatalf("full receipt=%+v result=%+v found=%v matches=%v err=%v", receipt, returned, found, matches, err)
 	}
+	if target, err := m.SQLRetentionBarrierTarget(ctx); err != nil || target != 1026 {
+		t.Fatalf("retention recovery target=%d err=%v", target, err)
+	}
 	if got, err := m.QueryResult(ctx, "SELECT count FROM retained", nil); err != nil || got.Rows[0][0] != int64(maxRetainedSQLResultBytes/MaxMutationResultBytes+1) {
 		t.Fatalf("rejected mutation rollback/progress result=%v err=%v", got.Rows, err)
 	}
@@ -157,6 +160,9 @@ func TestDurableSQLResultRetentionQuotaRestartAndExpiry(t *testing.T) {
 	if err != nil || !found || !matches {
 		t.Fatalf("reopened retention-full retry found=%v matches=%v err=%v", found, matches, err)
 	}
+	if target, err := m.SQLRetentionBarrierTarget(ctx); err != nil || target != 1026 {
+		t.Fatalf("reopened retention recovery target=%d err=%v", target, err)
+	}
 
 	barrier := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{})
 	decisions := make([]quepaxa.DecidedValue, 0, 1020)
@@ -166,8 +172,15 @@ func TestDurableSQLResultRetentionQuotaRestartAndExpiry(t *testing.T) {
 	if err := m.ApplyBatch(ctx, decisions); err != nil {
 		t.Fatalf("advance through retry-window expiry: %v", err)
 	}
+	if target, err := m.SQLRetentionBarrierTarget(ctx); err != nil || target != 0 {
+		t.Fatalf("retention recovery did not stop: target=%d err=%v", target, err)
+	}
 	if got, want := m.sqlReceiptRetention.resultBytes, uint64(3*maxRetainedSQLResultBytes/4); got != want {
 		t.Fatalf("expired result bytes=%d want=%d", got, want)
+	}
+	rejected, _, found, matches, err := m.SQLRequestResultFingerprint(ctx, full.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || rejected.Status != types.MutationRejected || rejected.ErrorCode != types.MutationErrorCodeResultRetentionFull {
+		t.Fatalf("capacity recovery changed rejected request: receipt=%+v found=%t matches=%t err=%v", rejected, found, matches, err)
 	}
 	if _, _, found, _, err := m.SQLRequestResultFingerprint(ctx, "retained-0", [32]byte{}, true); err != nil || found {
 		t.Fatalf("expired receipt found=%v err=%v", found, err)

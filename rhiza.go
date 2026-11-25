@@ -628,3 +628,11 @@ func (db *DB) ResolveExecute(ctx context.Context, req ExecuteRequest) (ResolveEx
 func (db *DB) ObjectStoreStats() (ObjectStoreStats, bool) {
 	return db.node.ObjectStoreStats()
 }
+
+// SQLRetentionBarrierStatus is a local, eventually updated worker snapshot.
+type SQLRetentionBarrierStatus = node.SQLRetentionBarrierStatus
+
+// SQLRetentionBarriers reports retention maintenance, not quorum availability.
+func (db *DB) SQLRetentionBarriers() SQLRetentionBarrierStatus {
+	return db.node.SQLRetentionBarriers()
+}

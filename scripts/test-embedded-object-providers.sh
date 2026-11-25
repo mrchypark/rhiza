@@ -10,6 +10,10 @@ ffi_verify_log() {
  END {exit !(s3==1 && core==1 && !bad)}' "$1"
 }
 
+retention_verify_log() {
+ awk '/^--- PASS: TestManagedRetentionThreeProcessesRestart \(/ {p++} /^--- (SKIP|FAIL):/ {bad=1} END {exit !(p==1 && !bad)}' "$1"
+}
+
 ffi_owned_endpoint() {
  jq -er --arg id "$2" --arg network "$3" --arg name "$4" --arg owner "$5" '
  .[0] | select(.Id==$id and .State.Running==true and .Config.Labels["rhiza.embedded-test"]==$owner)
@@ -32,6 +36,7 @@ networks=""
 image_built=0
 result=1
 ffi_required=${RHIZA_EMBEDDED_FFI_REQUIRED:-0}
+retention_required=${RHIZA_EMBEDDED_RETENTION_REQUIRED:-0}
 ffi_child=''
 ffi_evidence=''
 ffi_wait() {
@@ -48,8 +53,29 @@ cleanup() {
  fi
  for id in $containers; do
   if docker inspect "$id" >/dev/null 2>&1; then
-   docker logs "$id" >"$run_dir/$id.log" 2>&1 || :
-   if ! docker rm -f "$id" >/dev/null; then cleanup_failed=1; fi
+   log_saved=1
+   mounts_saved=1
+   docker logs "$id" >"$run_dir/$id.log" 2>&1 || log_saved=0
+   if [ "$retention_required" -eq 1 ]; then
+    docker inspect "$id" --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' > "$run_dir/$id-volumes.txt" || mounts_saved=0
+   fi
+   if [ "$retention_required" -eq 1 ] && [ "$log_saved" -eq 1 ] && [ "$mounts_saved" -eq 1 ]; then
+    if ! docker rm -f -v "$id" >/dev/null; then cleanup_failed=1; fi
+    while IFS= read -r volume; do
+     [ -z "$volume" ] && continue
+     if docker volume inspect "$volume" >/dev/null 2>&1; then
+      printf '%s remains (named/shared or removal failed); inspect before removal\n' "$volume" >> "$run_dir/$id-volume-cleanup.txt"
+      echo "Test volume remains: $volume" >&2; cleanup_failed=1
+     else
+      printf '%s removed; data not recoverable from Docker volume\n' "$volume" >> "$run_dir/$id-volume-cleanup.txt"
+     fi
+    done < "$run_dir/$id-volumes.txt"
+   elif [ "$retention_required" -eq 1 ]; then
+    echo "Preserving container and volumes because log or mount capture failed: $id" >&2
+    cleanup_failed=1
+   else
+    if ! docker rm -f "$id" >/dev/null; then cleanup_failed=1; fi
+   fi
   fi
   if docker inspect "$id" >/dev/null 2>&1; then echo "Owned container remains: $id" >&2; cleanup_failed=1; fi
  done
@@ -76,6 +102,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 case "$ffi_required" in 0|1) ;; *) echo 'invalid FFI qualification mode' >&2; exit 1 ;; esac
+case "$retention_required" in 0|1) ;; *) echo 'invalid retention qualification mode' >&2; exit 1 ;; esac
+if [ "$retention_required" -eq 1 ] && [ "$ffi_required" -ne 0 ]; then
+ echo 'retention qualification must run separately from FFI qualification' >&2
+ exit 1
+fi
 case "$(docker info --format '{{.Architecture}}')" in aarch64|arm64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) echo "Unsupported Docker architecture" >&2; exit 1 ;; esac
 ffi_pattern='^(TestNotificationFFIThreeNode|TestManagedStartupBudgetKeepsRealCorePeerUntilClose)$'
 if [ "$ffi_required" -eq 1 ]; then
@@ -89,7 +120,11 @@ if [ "$ffi_required" -eq 1 ]; then
  awk '/^TestNotificationFFIThreeNode$/ {s3++} /^TestManagedStartupBudgetKeepsRealCorePeerUntilClose$/ {core++} END {exit !(s3==1 && core==1)}' "$ffi_evidence/selected-tests.txt"
  { git rev-parse HEAD; go version; printf 'CGO_ENABLED=1\n'; shasum -a 256 "$run_dir/ffi.test"; } > "$ffi_evidence/source.txt"
 fi
-CGO_ENABLED=0 GOOS=linux GOARCH="$arch" TMPDIR=/tmp go test -c -o "$run_dir/embedded.test" .
+if [ "$retention_required" -eq 1 ]; then
+ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" TMPDIR=/tmp go test -tags rhiza_local_testhooks -c -o "$run_dir/embedded.test" .
+else
+ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" TMPDIR=/tmp go test -c -o "$run_dir/embedded.test" .
+fi
 cat >"$run_dir/Dockerfile" <<'DOCKERFILE'
 FROM mirror.gcr.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 COPY embedded.test /embedded.test
@@ -99,6 +134,11 @@ docker build --platform "linux/$arch" -t "$image" "$run_dir"
 image_built=1
 # Includes TestEmbeddedObjectStorageGC* after the real GC engine is integrated.
 pattern=${RHIZA_EMBEDDED_TEST_PATTERN:-'^TestEmbeddedObjectStorage'}
+providers='s3 gcs azure'
+if [ "$retention_required" -eq 1 ]; then
+ pattern='^TestManagedRetentionThreeProcessesRestart$'
+ providers='s3'
+fi
 list_id=$(docker create --label rhiza.embedded-test="$run_name" --network none "$image" -test.list "$pattern")
 containers="$containers $list_id"
 docker start "$list_id" >/dev/null
@@ -110,7 +150,7 @@ if ! grep -E '^Test[[:alnum:]_]+$' "$run_dir/selected-tests.txt" >/dev/null; the
 fi
 cat "$run_dir/selected-tests.txt"
 failed=0
-for provider in s3 gcs azure; do
+for provider in $providers; do
  case "$provider" in
   s3) emulator_image=floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9; port=4566 ;;
   gcs) emulator_image=floci/floci-gcp:0.11.0@sha256:eae9683d806ceb643bcb36aee97cdb8cad13c3e2959cd053bf40e481994fde12; port=4588 ;;
@@ -138,6 +178,12 @@ for provider in s3 gcs azure; do
  if [ "$(docker wait "$test_id")" -ne 0 ]; then failed=1; fi
  docker logs "$test_id" >"$run_dir/$provider-tests.log" 2>&1
  cat "$run_dir/$provider-tests.log"
+ if [ "$retention_required" -eq 1 ]; then
+  if ! retention_verify_log "$run_dir/$provider-tests.log"; then
+   echo 'required managed retention process test did not PASS without SKIP' >&2
+   failed=1
+  fi
+ fi
  awk -v provider="$provider" '/^--- PASS:/{p++} /^--- FAIL:/{f++} /^--- SKIP:/{s++} END {printf "%s top-level tests: pass=%d fail=%d skip=%d\n", provider,p,f,s}' "$run_dir/$provider-tests.log"
  if [ "$provider" = s3 ] && [ "$ffi_required" -eq 1 ]; then
   docker inspect "$id" > "$ffi_evidence/owned-s3.json"

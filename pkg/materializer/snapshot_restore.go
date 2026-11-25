@@ -590,6 +590,7 @@ func (m *Materializer) adopt(source *Materializer) {
 	m.recentSQLReceipts = source.recentSQLReceipts
 	m.sqlReceipts = source.sqlReceipts
 	m.sqlReceiptRetention = source.sqlReceiptRetention
+	m.sqlRetentionPlan = sqlRetentionBarrierPlan{}
 	m.graphNodePropertyIndexes = slices.Clone(source.graphNodePropertyIndexes)
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -50,9 +51,9 @@ func ManagedApplicationPolicy(protocol string) (sqlpolicy.MaterializationPolicy,
 	case "", ManagedApplicationProtocolSQLKV:
 		return 0, 0, fmt.Errorf("managed application profiles 7/8 are retired; select an explicit append-only profile for a new cluster")
 	case sqlpolicy.ManagedRequestAppendOnlyApplicationProtocol:
-		return sqlpolicy.ManagedRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+		return sqlpolicy.ManagedRequestMaterializationPolicy, localtesthooks.RetentionWindow(DefaultIdempotencyWindowSlots), nil
 	case sqlpolicy.ManagedGraphRequestAppendOnlyApplicationProtocol:
-		return sqlpolicy.ManagedGraphRequestMaterializationPolicy, DefaultIdempotencyWindowSlots, nil
+		return sqlpolicy.ManagedGraphRequestMaterializationPolicy, localtesthooks.RetentionWindow(DefaultIdempotencyWindowSlots), nil
 	default:
 		return 0, 0, fmt.Errorf("unsupported managed application protocol")
 	}

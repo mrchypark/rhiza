@@ -188,7 +188,24 @@ reserves the maximum actual ROWID and excludes persistent virtual-table writes
 Durable SQL result blobs are capped at 1 MiB per command and 256 MiB across the
 retry window. When the aggregate pool is full, a result-returning command is
 rolled back and retained as a `result_retention_full` receipt; later slots still
-advance and expire old receipts normally.
+advance and expire old receipts normally. While such a rejection is retained
+and less than 1 MiB of logical result capacity remains, each ready voter may
+propose at most one maintenance read barrier per second. Voters prefer the
+agreed proposer order but do not use exclusive ownership, so up to one attempt
+per live voter per second may occur. The worker stops proposing once sufficient
+capacity is logically available and never retries the rejected mutation. A
+quorum is still required. These additional slots incur consensus and storage
+cost and can shorten other receipts' wall-clock retention, but do not change
+their 65,536-slot retention window. When no other work advances the log, up to
+65,536 barriers can be needed: at one per second this is about 18 hours and
+12 minutes, excluding quorum and execution delays. In managed mode, physical removal of expired
+results occurs with the next application value. `DB.SQLRetentionBarriers()`
+reports the local worker's last target and attempt, completion and error counts;
+these are eventually updated and do not establish quorum availability.
+For Local mode, an accepted maintenance barrier and any WAL reclamation it
+triggers run until completion or database shutdown rather than inheriting the
+worker's short admission deadline. A stalled storage operation can therefore
+delay that one maintenance worker; foreground writes retain their own limits.
 
 Replicated execution rejects explicit transaction control, attachment, and
 known nondeterministic functions. Use `Execute` for one mutation,

@@ -413,12 +413,19 @@ type managedAppendOnlyAdmissionGate struct {
 
 type managedAppendOnlyAdmissionTransport struct {
 	graphReviewTransport
-	mu    sync.Mutex
-	gates map[quepaxa.Slot]*managedAppendOnlyAdmissionGate
+	mu          sync.Mutex
+	gates       map[quepaxa.Slot]*managedAppendOnlyAdmissionGate
+	unavailable map[quepaxa.NodeID]bool
 }
 
 func newManagedAppendOnlyAdmissionTransport() *managedAppendOnlyAdmissionTransport {
-	return &managedAppendOnlyAdmissionTransport{graphReviewTransport: graphReviewTransport{}, gates: make(map[quepaxa.Slot]*managedAppendOnlyAdmissionGate)}
+	return &managedAppendOnlyAdmissionTransport{graphReviewTransport: graphReviewTransport{}, gates: make(map[quepaxa.Slot]*managedAppendOnlyAdmissionGate), unavailable: make(map[quepaxa.NodeID]bool)}
+}
+
+func (p *managedAppendOnlyAdmissionTransport) setUnavailable(id quepaxa.NodeID, unavailable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.unavailable[id] = unavailable
 }
 
 func (p *managedAppendOnlyAdmissionTransport) addGate(slot quepaxa.Slot) {
@@ -457,7 +464,11 @@ func (p *managedAppendOnlyAdmissionTransport) waitEntered(ctx context.Context, s
 func (p *managedAppendOnlyAdmissionTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	p.mu.Lock()
 	gate := p.gates[request.Slot]
+	unavailable := p.unavailable[to]
 	p.mu.Unlock()
+	if unavailable {
+		return quepaxa.Summary{}, fmt.Errorf("test voter %s unavailable", to)
+	}
 	if gate == nil {
 		return p.graphReviewTransport[to].Record(ctx, request)
 	}
