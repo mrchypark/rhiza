@@ -70,63 +70,64 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
-	expectedPolicy       sqlpolicy.MaterializationPolicy
-	managedProfile       *ManagedPeerProfile
-	core                 *quepaxa.Core
-	material             *materializer.Materializer
-	cluster              types.ClusterID
-	mux                  *http.ServeMux
-	ready                func() bool
-	learnReady           func() bool
-	writable             bool
-	sqlBatcher           *mutationBatcher[types.SQLCommand]
-	graphBatcher         *mutationBatcher[types.GraphCommand]
-	kvBatcher            *mutationBatcher[types.KVCommand]
-	transport            *Transport
-	applyMu              sync.Mutex
-	requestLocks         [4096]chan struct{}
-	mutationMu           sync.Mutex
-	mutationAdmission    mutationAdmission
-	durability           func(context.Context, quepaxa.Slot) error
-	proposeMu            sync.Mutex
-	admissionChanged     chan struct{}
-	admissionEpoch       uint64
-	admissionWaiters     int
-	inflight             map[[32]byte]*proposalCall
-	proposalCtx          context.Context
-	proposalStop         context.CancelFunc
-	proposalWG           sync.WaitGroup
-	logicalWG            sync.WaitGroup
-	closeOnce            sync.Once
-	closing              bool
-	quiescing            bool
-	localMode            bool
-	lifecycleFailure     error
-	localFailureHandler  func(error)
-	localReclaimHandler  func(context.Context) error
-	operationCap         chan struct{}
-	localCap             chan struct{}
-	operationB           int
-	localB               int
-	objectStats          func() (map[string]uint64, bool)
-	replicaStatus        func() ReplicaStatus
-	voterRecoveryStatus  func(context.Context) VoterRecoveryStatus
-	recoveryArchiveToken string
-	membershipToken      string
-	membershipChange     func(context.Context, MembershipChange) error
-	membershipAbort      func(context.Context, MembershipChange) error
-	recoveryArchive      func(context.Context) error
-	terminalDrain        func(context.Context, TerminalDrainRequest) (any, error)
-	handlerMu            sync.Mutex
-	handlerWG            sync.WaitGroup
-	handlerClosing       bool
-	syncLimit            chan struct{}
-	syncMu               sync.Mutex
-	syncSources          map[quepaxa.NodeID]chan struct{}
-	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
-	compactedHandler     func()
-	readAdmissionMu      sync.RWMutex
-	readAdmission        *readAdmission
+	expectedPolicy           sqlpolicy.MaterializationPolicy
+	managedProfile           *ManagedPeerProfile
+	core                     *quepaxa.Core
+	material                 *materializer.Materializer
+	cluster                  types.ClusterID
+	mux                      *http.ServeMux
+	ready                    func() bool
+	learnReady               func() bool
+	writable                 bool
+	sqlBatcher               *mutationBatcher[types.SQLCommand]
+	graphBatcher             *mutationBatcher[types.GraphCommand]
+	kvBatcher                *mutationBatcher[types.KVCommand]
+	transport                *Transport
+	applyMu                  sync.Mutex
+	requestLocks             [4096]chan struct{}
+	mutationMu               sync.Mutex
+	mutationAdmission        mutationAdmission
+	durability               func(context.Context, quepaxa.Slot) error
+	proposeMu                sync.Mutex
+	admissionChanged         chan struct{}
+	admissionEpoch           uint64
+	admissionWaiters         int
+	inflight                 map[[32]byte]*proposalCall
+	proposalCtx              context.Context
+	proposalStop             context.CancelFunc
+	proposalWG               sync.WaitGroup
+	logicalWG                sync.WaitGroup
+	closeOnce                sync.Once
+	closing                  bool
+	quiescing                bool
+	localCheckpointQuiescing bool
+	localMode                bool
+	lifecycleFailure         error
+	localFailureHandler      func(error)
+	localReclaimHandler      func(context.Context) error
+	operationCap             chan struct{}
+	localCap                 chan struct{}
+	operationB               int
+	localB                   int
+	objectStats              func() (map[string]uint64, bool)
+	replicaStatus            func() ReplicaStatus
+	voterRecoveryStatus      func(context.Context) VoterRecoveryStatus
+	recoveryArchiveToken     string
+	membershipToken          string
+	membershipChange         func(context.Context, MembershipChange) error
+	membershipAbort          func(context.Context, MembershipChange) error
+	recoveryArchive          func(context.Context) error
+	terminalDrain            func(context.Context, TerminalDrainRequest) (any, error)
+	handlerMu                sync.Mutex
+	handlerWG                sync.WaitGroup
+	handlerClosing           bool
+	syncLimit                chan struct{}
+	syncMu                   sync.Mutex
+	syncSources              map[quepaxa.NodeID]chan struct{}
+	checkpointPrepare        func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+	compactedHandler         func()
+	readAdmissionMu          sync.RWMutex
+	readAdmission            *readAdmission
 }
 
 // ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
@@ -717,6 +718,39 @@ func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *
 		}
 	}
 	s.proposeMu.Lock()
+	// Only batches arriving after Local checkpoint admission closes may wait;
+	// pre-existing waiters still fail on an epoch change and are never replayed.
+	for s.localMode && admissionBudget > 0 && s.quiescing && s.localCheckpointQuiescing && !s.closing && s.lifecycleFailure == nil {
+		if err := ctx.Err(); err != nil {
+			s.proposeMu.Unlock()
+			return 0, err
+		}
+		if !time.Now().Before(admissionDeadline) {
+			s.proposeMu.Unlock()
+			return 0, proposalAdmissionOverload{}
+		}
+		changed := s.admissionChanged
+		s.admissionWaiters++
+		if trace != nil {
+			trace.MarkWait()
+		}
+		s.proposeMu.Unlock()
+		timer := time.NewTimer(time.Until(admissionDeadline))
+		select {
+		case <-changed:
+		case <-ctx.Done():
+		case <-s.proposalCtx.Done():
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		s.proposeMu.Lock()
+		s.admissionWaiters--
+	}
 	epoch := s.admissionEpoch
 	for {
 		if err := ctx.Err(); err != nil {
@@ -870,12 +904,25 @@ func (s *Server) retainProposalLease(call *proposalCall, lease *mutationLease) b
 // Quiesce drains proposals and excludes decision application while a certified
 // checkpoint replaces local consensus and materialized state.
 func (s *Server) Quiesce(ctx context.Context) (func(), error) {
+	return s.quiesce(ctx, false)
+}
+
+// QuiesceLocalCheckpoint permits only fresh, bounded Local batches to wait.
+func (s *Server) QuiesceLocalCheckpoint(ctx context.Context) (func(), error) {
+	if !s.localMode {
+		return nil, ErrNotReady
+	}
+	return s.quiesce(ctx, true)
+}
+
+func (s *Server) quiesce(ctx context.Context, localCheckpoint bool) (func(), error) {
 	s.proposeMu.Lock()
 	if s.closing || s.quiescing || s.lifecycleFailure != nil {
 		s.proposeMu.Unlock()
 		return nil, ErrNotReady
 	}
 	s.quiescing = true
+	s.localCheckpointQuiescing = localCheckpoint
 	s.signalAdmissionLocked(true)
 	s.proposeMu.Unlock()
 	done := make(chan struct{})
@@ -890,6 +937,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 			s.proposeMu.Lock()
 			if !s.closing {
 				s.quiescing = false
+				s.localCheckpointQuiescing = false
 				s.signalAdmissionLocked(true)
 			}
 			s.proposeMu.Unlock()
@@ -909,6 +957,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 		s.proposeMu.Lock()
 		if !s.closing {
 			s.quiescing = false
+			s.localCheckpointQuiescing = false
 			s.signalAdmissionLocked(true)
 		}
 		s.proposeMu.Unlock()

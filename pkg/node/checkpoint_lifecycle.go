@@ -182,7 +182,7 @@ func (n *Node) reclaimLocalCheckpointGuarded(ctx context.Context, guard *quepaxa
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: canceled before Local maintenance admission", network.ErrLocalMaintenanceRefused)
 	}
-	resume, err := n.server.Quiesce(ctx)
+	resume, err := n.server.QuiesceLocalCheckpoint(ctx)
 	if err != nil {
 		if errors.Is(err, network.ErrNotReady) {
 			return network.ErrNotReady
@@ -282,7 +282,7 @@ func (n *Node) reclaimLocalCheckpointGuarded(ctx context.Context, guard *quepaxa
 		resume()
 		resume = nil
 		buildErr := build()
-		nextResume, drainErr := n.server.Quiesce(ctx)
+		nextResume, drainErr := n.server.QuiesceLocalCheckpoint(ctx)
 		if drainErr != nil {
 			return errors.Join(buildErr, fmt.Errorf("drain Local foreground after WAL rewrite: %w", drainErr))
 		}
@@ -345,7 +345,7 @@ func (n *Node) resumePreparedLocalCheckpointGuarded(ctx context.Context, guard *
 	if err := n.localCheckpointSpacePreflight(); err != nil {
 		return err
 	}
-	resume, err := n.server.Quiesce(ctx)
+	resume, err := n.server.QuiesceLocalCheckpoint(ctx)
 	if err != nil {
 		return err
 	}
