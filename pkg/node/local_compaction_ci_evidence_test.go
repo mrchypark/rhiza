@@ -88,22 +88,26 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var samples []sample
-	var begin, end time.Time
+	type window struct{ begin, end time.Time }
+	var windows []window
 	reset := localtesthooks.Set(func(name string) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch name {
 		case "qlog:before-compaction-build":
-			begin = time.Now()
+			windows = append(windows, window{begin: time.Now()})
 		case "qlog:after-compaction-build-synced-before-manifest":
-			end = time.Now()
+			if len(windows) > 0 {
+				windows[len(windows)-1].end = time.Now()
+			}
 		}
 	})
 	defer reset()
 	stop := make(chan struct{})
 	var workers sync.WaitGroup
-	ready := make(chan struct{}, 4)
-	for worker := 0; worker < 4; worker++ {
+	const workerCount, cycleCount = 8, 32
+	ready := make(chan struct{}, workerCount)
+	for worker := 0; worker < workerCount; worker++ {
 		workers.Add(1)
 		go func(worker int) {
 			defer workers.Done()
@@ -121,20 +125,47 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 				mu.Lock()
 				samples = append(samples, sample{start: start, end: finished, id: id, err: err})
 				mu.Unlock()
-				time.Sleep(5 * time.Millisecond)
+				time.Sleep(time.Millisecond)
 			}
 		}(worker)
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < workerCount; i++ {
 		<-ready
 	}
 	reclaimStart := time.Now()
-	err := n.reclaimLocalCheckpoint(ctx)
+	var reclaimErr error
+	completed := 0
+	for cycle := 0; cycle < cycleCount; cycle++ {
+		id := 256 + cycle
+		_, reclaimErr = n.server.Execute(ctx, network.ExecuteRequest{RequestID: fmt.Sprintf("cycle-%d", cycle), SQL: fmt.Sprintf("INSERT INTO samples VALUES (%d, '%s')", id, payload)})
+		if reclaimErr != nil {
+			break
+		}
+		reclaimErr = n.reclaimLocalCheckpoint(ctx)
+		if reclaimErr != nil {
+			break
+		}
+		completed++
+	}
 	reclaimEnd := time.Now()
 	close(stop)
 	workers.Wait()
-	reclaimErr := err
-	boundariesValid := !begin.IsZero() && !end.IsZero() && !end.Before(begin)
+	boundariesValid := len(windows) == cycleCount && completed == cycleCount
+	var buildTime time.Duration
+	for i, w := range windows {
+		valid := !w.begin.IsZero() && !w.end.IsZero() && !w.end.Before(w.begin)
+		if !valid || (i > 0 && w.begin.Before(windows[i-1].end)) {
+			boundariesValid = false
+		}
+		if valid {
+			buildTime += w.end.Sub(w.begin)
+		}
+		cycleData, marshalErr := json.Marshal(map[string]any{"cycle": i, "valid": valid, "build_start_unix_ns": w.begin.UnixNano(), "build_end_unix_ns": w.end.UnixNano()})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		t.Logf("LOCAL_COMPACTION_CYCLE %s", cycleData)
+	}
 	var latencies []float64
 	var acknowledged []int
 	errors := 0
@@ -145,10 +176,16 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 			status = s.err.Error()
 		}
 		var overlap any
+		var overlapCycles []int
 		if boundariesValid {
-			overlap = s.start.Before(end) && s.end.After(begin)
+			for i, w := range windows {
+				if s.start.Before(w.end) && s.end.After(w.begin) {
+					overlapCycles = append(overlapCycles, i)
+				}
+			}
+			overlap = len(overlapCycles) > 0
 		}
-		raw, err := json.Marshal(map[string]any{"id": s.id, "start_unix_ns": s.start.UnixNano(), "end_unix_ns": s.end.UnixNano(), "latency_ns": s.end.Sub(s.start).Nanoseconds(), "status": status, "overlap": overlap})
+		raw, err := json.Marshal(map[string]any{"id": s.id, "start_unix_ns": s.start.UnixNano(), "end_unix_ns": s.end.UnixNano(), "latency_ns": s.end.Sub(s.start).Nanoseconds(), "status": status, "overlap": overlap, "overlap_cycles": overlapCycles})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +193,7 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 		if s.err == nil {
 			acknowledged = append(acknowledged, s.id)
 		}
-		if boundariesValid && s.start.Before(end) && s.end.After(begin) {
+		if boundariesValid && len(overlapCycles) > 0 {
 			overlaps++
 			if s.err != nil {
 				errors++
@@ -172,18 +209,14 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 		}
 		return latencies[((len(latencies)-1)*p)/100]
 	}
-	result := map[string]any{"reclaim_ms": float64(reclaimEnd.Sub(reclaimStart)) / float64(time.Millisecond), "overlap_requests": overlaps, "overlap_success": len(latencies), "overlap_errors": errors, "p50_ms": percentile(50), "p99_ms": percentile(99), "acknowledged": len(acknowledged), "seed": 256, "workers": 4, "boundaries_valid": boundariesValid}
+	result := map[string]any{"cycles_total_ms": float64(reclaimEnd.Sub(reclaimStart)) / float64(time.Millisecond), "overlap_requests": overlaps, "overlap_success": len(latencies), "overlap_errors": errors, "p50_ms": percentile(50), "p99_ms": percentile(99), "acknowledged": len(acknowledged), "seed": 256, "workers": workerCount, "cycles_planned": cycleCount, "cycles_completed": completed, "boundaries_valid": boundariesValid}
 	result["metrics_present"] = boundariesValid && overlaps > 0
 	result["p99_comparable"] = boundariesValid && len(latencies) >= 100
 	result["observation"] = localCompactionObservation(boundariesValid, overlaps, len(latencies))
-	if !begin.IsZero() {
-		result["build_start_unix_ns"] = begin.UnixNano()
-	}
-	if !end.IsZero() {
-		result["build_end_unix_ns"] = end.UnixNano()
-	}
 	if boundariesValid {
-		result["build_ms"] = float64(end.Sub(begin)) / float64(time.Millisecond)
+		result["build_start_unix_ns"] = windows[0].begin.UnixNano()
+		result["build_end_unix_ns"] = windows[len(windows)-1].end.UnixNano()
+		result["build_ms"] = float64(buildTime) / float64(time.Millisecond)
 	}
 	if reclaimErr != nil {
 		result["reclaim_error"] = reclaimErr.Error()
@@ -217,8 +250,8 @@ func TestLocalCompactionCIEvidence(t *testing.T) {
 			t.Fatalf("ACK %d absent after restore: rows=%v err=%v", id, rows.Rows, err)
 		}
 	}
-	seedRows, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT count(*) FROM samples WHERE id < 256"})
-	if err != nil || len(seedRows.Rows) != 1 || len(seedRows.Rows[0]) != 1 || fmt.Sprint(seedRows.Rows[0][0]) != "256" {
+	seedRows, err := n.server.Query(ctx, network.QueryRequest{SQL: fmt.Sprintf("SELECT count(*) FROM samples WHERE id < %d", 256+completed)})
+	if err != nil || len(seedRows.Rows) != 1 || len(seedRows.Rows[0]) != 1 || fmt.Sprint(seedRows.Rows[0][0]) != fmt.Sprint(256+completed) {
 		t.Fatalf("seed ACKs absent after restore: rows=%v err=%v", seedRows.Rows, err)
 	}
 	t.Logf("LOCAL_COMPACTION_RESTORE mode=graceful_shutdown_then_empty_data_dir verified_acknowledgements=%d separate_crash_test=TestLocalBackupConcurrentCompactionHardKillPreservesACK", len(acknowledged))

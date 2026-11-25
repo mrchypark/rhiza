@@ -1,14 +1,15 @@
 length == 1 and
 (.[0] |
   type == "object" and
-  ((["boundaries_valid", "metrics_present", "p99_comparable", "observation", "restore_mode", "overlap_requests", "overlap_success", "overlap_errors", "acknowledged", "seed", "workers", "reclaim_ms", "p50_ms", "p99_ms"] - keys) | length == 0) and
+  ((["boundaries_valid", "metrics_present", "p99_comparable", "observation", "restore_mode", "overlap_requests", "overlap_success", "overlap_errors", "acknowledged", "seed", "workers", "cycles_planned", "cycles_completed", "cycles_total_ms", "p50_ms", "p99_ms"] - keys) | length == 0) and
   (.boundaries_valid | type == "boolean") and
   (.metrics_present | type == "boolean") and
   (.p99_comparable | type == "boolean") and
   (.observation | type == "string") and
   (.restore_mode == "graceful_shutdown_then_empty_data_dir") and
-  ([.overlap_requests, .overlap_success, .overlap_errors, .acknowledged, .seed, .workers] | all(type == "number" and . >= 0 and . == floor)) and
-  (.reclaim_ms | type == "number" and . >= 0) and
+  ([.overlap_requests, .overlap_success, .overlap_errors, .acknowledged, .seed, .workers, .cycles_planned, .cycles_completed] | all(type == "number" and . >= 0 and . == floor)) and
+  (.cycles_planned == 32 and .cycles_completed <= .cycles_planned) and
+  (.cycles_total_ms | type == "number" and . >= 0) and
   ((.p50_ms == null) or (.p50_ms | type == "number" and . >= 0)) and
   ((.p99_ms == null) or (.p99_ms | type == "number" and . >= 0)) and
   (if .overlap_success == 0 then .p50_ms == null and .p99_ms == null else .p50_ms != null and .p99_ms != null end) and
@@ -24,7 +25,8 @@ length == 1 and
     else "p99_sample_sufficient" end)) and
   (if .boundaries_valid then
     ([.build_ms, .build_start_unix_ns, .build_end_unix_ns] | all(type == "number" and . >= 0)) and
+    (.cycles_completed == .cycles_planned) and
     (.build_end_unix_ns >= .build_start_unix_ns) and
-    (((.build_end_unix_ns - .build_start_unix_ns) / 1000000 - .build_ms) | if . < 0 then -. else . end) <= 0.002
+    (.build_ms <= ((.build_end_unix_ns - .build_start_unix_ns) / 1000000 + 0.002))
    else .overlap_requests == 0 end)
 )
