@@ -173,9 +173,15 @@ func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
 	if n.config == nil || !n.config.Local || n.server == nil || n.core == nil || n.material == nil || n.localStore == nil {
 		return network.ErrLocalMaintenanceRefused
 	}
-	return n.core.WithLocalCheckpoint(ctx, func(guard *quepaxa.LocalCheckpointGuard) error {
+	entered := false
+	err := n.core.WithLocalCheckpoint(ctx, func(guard *quepaxa.LocalCheckpointGuard) error {
+		entered = true
 		return n.reclaimLocalCheckpointGuarded(ctx, guard)
 	})
+	if !entered && err != nil && ctx.Err() != nil {
+		return fmt.Errorf("%w: canceled waiting for Local checkpoint gate: %v", network.ErrLocalMaintenanceRefused, err)
+	}
+	return err
 }
 
 func (n *Node) reclaimLocalCheckpointGuarded(ctx context.Context, guard *quepaxa.LocalCheckpointGuard) (resultErr error) {

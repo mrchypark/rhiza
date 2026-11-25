@@ -34,7 +34,7 @@ for name in base candidate; do
   # Observe quiesce and proposal-admission rejection at their actual decision
   # points. The test hook records timestamps only; it never waits on a gate.
   awk '
-    /^func \(s \*Server\) Quiesce\(/ { q=1 }
+    /^func \(s \*Server\) [Qq]uiesce\(/ { q=1 }
     /^func \(s \*Server\) proposeWithAdmission\(/ { p=1 }
     (q || p) && /^}/ { q=0; p=0 }
     p && /hash := sha256.Sum256\(value\)/ { print; print "\tlocaltesthooks.RecordCIPhase413(\"proposal-enter\", hash, \"\", false, false, false, false)"; pin++; next }
