@@ -65,6 +65,19 @@ func (r *ReadReplica) startLearnerCheckpointProbe() {
 
 func (r *ReadReplica) verifyLearnerCheckpoint(ctx context.Context, job *learnerCheckpointJob) {
 	defer close(job.done)
+	if err := r.archive.Load(ctx); err != nil {
+		job.result <- learnerCheckpointResult{err: err}
+		return
+	}
+	seal, _, ok := r.archive.RecoveryBase()
+	if !ok {
+		job.result <- learnerCheckpointResult{err: fmt.Errorf("published archive has no recovery checkpoint base")}
+		return
+	}
+	if seal.Index <= r.core.CompactionFloor() {
+		job.result <- learnerCheckpointResult{}
+		return
+	}
 	owner, err := replicaOwner(r.config.ReplicaID)
 	if err != nil {
 		job.result <- learnerCheckpointResult{err: err}
