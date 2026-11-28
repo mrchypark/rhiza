@@ -194,3 +194,38 @@ func BenchmarkReadReplicaIdleSync(b *testing.B) {
 	b.ReportMetric(float64(after.Gets-before.Gets)/float64(b.N), "GET/op")
 	b.ReportMetric(float64(after.Uploads-before.Uploads)/float64(b.N), "PUT/op")
 }
+
+func TestReadReplicaLearnerIdleCheckpointProbeOnlyHeads(t *testing.T) {
+	ctx := context.Background()
+	bucketDir := t.TempDir()
+	source := newLearnerCheckpointSource(t, bucketDir)
+	source.execute(t, "CREATE TABLE items (id INTEGER PRIMARY KEY)")
+	_, sealed := source.publishCheckpoint(t, true)
+	config := learnerReplicaConfig(t.TempDir(), bucketDir, "r1")
+	r := openTestLearner(t, config, source)
+	if sealed.Index == 0 || r.core.CompactionFloor() != sealed.Index {
+		t.Fatalf("initial floor=%d want=%d", r.core.CompactionFloor(), sealed.Index)
+	}
+	before := r.ObjectStoreStats()
+	r.nextCheckpointProbe = time.Now().Add(-time.Second)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if r.checkpointJob == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for idle learner checkpoint probe")
+		}
+		time.Sleep(10 * time.Millisecond)
+		if err := r.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := r.ObjectStoreStats()
+	if after.Heads-before.Heads != 1 || after.Gets != before.Gets || after.Uploads != before.Uploads || after.Lists != before.Lists || after.Deletes != before.Deletes {
+		t.Fatalf("idle learner checkpoint probe should only HEAD unchanged archive: before=%+v after=%+v", before, after)
+	}
+}
