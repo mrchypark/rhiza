@@ -207,13 +207,22 @@ func TestReadReplicaLearnerIdleCheckpointProbeOnlyHeads(t *testing.T) {
 		t.Fatalf("initial floor=%d want=%d", r.core.CompactionFloor(), sealed.Index)
 	}
 	before := r.ObjectStoreStats()
+	r.syncMu.Lock()
 	r.nextCheckpointProbe = time.Now().Add(-time.Second)
+	r.syncMu.Unlock()
 	if err := r.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if r.checkpointJob == nil {
+		r.syncMu.Lock()
+		done := r.checkpointJob == nil
+		failures := r.checkpointProbeFailures
+		r.syncMu.Unlock()
+		if done {
+			if failures != 0 {
+				t.Fatalf("expected 0 probe failures, got %d", failures)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
@@ -223,6 +232,9 @@ func TestReadReplicaLearnerIdleCheckpointProbeOnlyHeads(t *testing.T) {
 		if err := r.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if status := r.Status(); status.LastError != "" {
+		t.Fatalf("unexpected status error after idle probe: %s", status.LastError)
 	}
 	after := r.ObjectStoreStats()
 	if after.Heads-before.Heads != 1 || after.Gets != before.Gets || after.Uploads != before.Uploads || after.Lists != before.Lists || after.Deletes != before.Deletes {
